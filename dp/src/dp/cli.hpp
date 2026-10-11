@@ -1213,6 +1213,8 @@ inline int cliMainOnce(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--dashground")) g_dashGround = true;
         if (!std::strcmp(argv[i], "--no-dashground")) g_dashGround = false;
         if (!std::strcmp(argv[i], "--fixgravthr")) g_fixGravThr = true;
+        if (!std::strcmp(argv[i], "--expinzero")) g_expInZero = true;
+        if (!std::strcmp(argv[i], "--no-expinzero")) g_expInZero = false;
         if (!std::strcmp(argv[i], "--spiderpad")) g_spiderPad = true;
         if (!std::strcmp(argv[i], "--gravtoggle")) g_gravToggle = true;
         if (!std::strcmp(argv[i], "--touchoff")) g_touchOwnOff = true;
@@ -1315,6 +1317,8 @@ inline int cliMainOnce(int argc, char** argv) {
         // --spdsameonce: a second speed portal of one speed on a tick is not marked (speed.hpp)
         if (!std::strcmp(argv[i], "--spdsameonce")) g_spdSameOnce = true;
         if (!std::strcmp(argv[i], "--no-spdsameonce")) g_spdSameOnce = false;
+        if (!std::strcmp(argv[i], "--p1soloend")) g_p1SoloEnd = true;
+        if (!std::strcmp(argv[i], "--no-p1soloend")) g_p1SoloEnd = false;
         if (!std::strcmp(argv[i], "--flydashring")) g_flyDashRing = true;
         if (!std::strcmp(argv[i], "--no-flydashring")) g_flyDashRing = false;
         if (!std::strcmp(argv[i], "--flyspiderring")) g_flySpiderRing = true;
@@ -1425,6 +1429,8 @@ inline int cliMainOnce(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--p2xoff")) g_p2xOff = true;
         if (!std::strcmp(argv[i], "--no-p2xoff")) g_p2xOff = false;
         if (!std::strcmp(argv[i], "--startp2dx") && i + 1 < argc) g_startP2dx = std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--p2solo")) g_p2Solo = true;
+        if (!std::strcmp(argv[i], "--no-p2solo")) g_p2Solo = false;
         // --dualendrot: a wave that ends the dual as the second body hands over its angle (constants.hpp)
         if (!std::strcmp(argv[i], "--dualendrot")) g_dualEndRot = true;
         if (!std::strcmp(argv[i], "--no-dualendrot")) g_dualEndRot = false;

@@ -1,7 +1,41 @@
 // PlayLayer hook: attempt boundaries, checkpoints, death / completion, cleanup.
 #include "mod/playlayer_helpers.hpp"
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/EndLevelLayer.hpp>
 
 using namespace p1;
+
+// Leaving the level, however it is left: PlayLayer::onQuit, and the two ways back to the editor that
+// never reach it (the goEdit hooks at the end of this file). `why` is the session end's reason,
+// `censusWhy` the memory census's label.
+static void leaveLevelCleanup(const char* why, const char* censusWhy) {
+    // Exiting from the pause menu = session aborted. endSession alone is not enough:
+    // if bookkeeping leftovers remain, hooks that do not check !g_sessionOver keep
+    // running during subsequent normal play and break behaviour. Full reset on exit
+    // The seek bar's checkpoints belong to this layer (cfg seekcp): let them go with it.
+    seekcp::resetSession();
+    if (g_started) {
+        if (!g_sessionOver) {
+            log::info("session ended by {}", censusWhy);
+            endSession(why);
+        }
+        // The solving's memory, if the session end had to leave it (a search was still
+        // running then): asked again before the reset forgets that a solve ran.
+        if (g_solveMemHeld) dpsolve::releaseSolveMemory(censusWhy);
+        resetSessionState();
+        dpsolve::memCensus(censusWhy);   // cfg memcensus (print only), before g_cfg is reset
+        g_cfg = Config{};
+    } else {
+        dpsolve::memCensus(censusWhy);   // ...and when the player leaves a level they played
+    }
+    // Hand the audio engine back untouched: a pitch left over from the spectating notch
+    // would follow the player into the menu music
+    audio::neutral();
+    // ...and take our notification with us. Leaving the level is a scene swap, and one of
+    // ours still on screen would follow the player into the menu -- Geode draws them off the
+    // director, not the scene -- with nothing left to explain what it refers to.
+    notify::clear();
+}
 
 // cfg persistworld (config.hpp): put the world's kept items in place before a head reset copies them
 // into the live counts. The first lines say what the table held before (what the last attempt left).
@@ -198,32 +232,7 @@ class $modify(PlayLayer) {
     }
 
     void onQuit() {
-        // Exiting from the pause menu = session aborted. endSession alone is not enough:
-        // if bookkeeping leftovers remain, hooks that do not check !g_sessionOver keep
-        // running during subsequent normal play and break behaviour. Full reset on exit
-        // The seek bar's checkpoints belong to this layer (cfg seekcp): let them go with it.
-        seekcp::resetSession();
-        if (g_started) {
-            if (!g_sessionOver) {
-                log::info("session ended by level exit");
-                endSession("level_exit");
-            }
-            // The solving's memory, if the session end had to leave it (a search was still
-            // running then): asked again before the reset forgets that a solve ran.
-            if (g_solveMemHeld) dpsolve::releaseSolveMemory("level exit");
-            resetSessionState();
-            dpsolve::memCensus("level exit");   // cfg memcensus (print only), before g_cfg is reset
-            g_cfg = Config{};
-        } else {
-            dpsolve::memCensus("level exit");   // ...and when the player leaves a level they played
-        }
-        // Hand the audio engine back untouched: a pitch left over from the spectating notch
-        // would follow the player into the menu music
-        audio::neutral();
-        // ...and take our notification with us. Leaving the level is a scene swap, and one of
-        // ours still on screen would follow the player into the menu -- Geode draws them off the
-        // director, not the scene -- with nothing left to explain what it refers to.
-        notify::clear();
+        leaveLevelCleanup("level_exit", "level exit");
         PlayLayer::onQuit();
     }
 
@@ -1334,5 +1343,24 @@ class $modify(PlayLayer) {
             // handling (results screen)
             endSession("level_complete");
         }
+    }
+};
+
+// Back to the editor, from the pause menu or the end screen. Neither reaches PlayLayer::onQuit:
+// PauseLayer::onEdit stops the layer and schedules goEdit, and both goEdits only start the scene
+// transition (GJGameLoadingLayer::transitionToLoadingLayer). Without these the session outlived its
+// level -- g_started stayed set, so botDriving() kept the next level's record from being saved.
+// Not PlayLayer::onExit: a level slice swaps the layer mid-session, and onExit runs then too.
+class $modify(PauseLayer) {
+    void goEdit() {
+        leaveLevelCleanup("editor_exit", "editor exit");
+        PauseLayer::goEdit();
+    }
+};
+
+class $modify(EndLevelLayer) {
+    void goEdit() {
+        leaveLevelCleanup("editor_exit", "editor exit");
+        EndLevelLayer::goEdit();
     }
 };

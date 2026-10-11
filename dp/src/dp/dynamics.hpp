@@ -198,8 +198,13 @@ inline double gdEase(int kind, double rate, double u) {
         // of a percent SHORT of the offset it was given, forever. The model
         // reached 1.0, i.e. it overshot. cocos has no u==0 guard either (it
         // returns -0.0000234 there), so the guard goes too: match the binary,
-        // not the tidier curve.
-        case 11: return std::pow(2.0, 10.0 * (u - 1.0)) - 0.001;
+        // not the tidier curve. (Wrong for 2.2081, see below.)
+        // --expinzero (on by default since 2026-10): ...but the binary has the
+        // guard. PR #2 read 2.2081's GameToolbox::getEasedValue (0x68b70) as
+        // returning 0 at u == 0 before the exponential, and so does the decompile
+        // (case 0xb: 0.0 unless u != 0.0, then powf(2, (u - 1) * 10) - 0.001). The
+        // difference is 0.0000234 of the move's offset, on the move's first tick only.
+        case 11: return (g_expInZero && u == 0.0) ? 0.0 : std::pow(2.0, 10.0 * (u - 1.0)) - 0.001;
         // ExpOut: GD special-cases t==1 to land exactly. Without it the curve
         // stops at 1 - 2^-10 = 0.9990234, 0.0977% short. Six moves in lv22 use
         // this, the largest 51 px, so the model was parking them ~0.05 px low.

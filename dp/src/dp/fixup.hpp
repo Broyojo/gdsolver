@@ -361,7 +361,9 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     const double preBtnY = g_preBtnY;
     const bool p1Tapped = g_ballTapped;   // --repelland, likewise
     const uint8_t p1HitG = g_hitGRepel;   // --repela0c, likewise
-    if (!s.dual) {
+    // --p1soloend (constants.hpp): player 1's own pass ended the dual, so there is no second body
+    // to step on this tick.
+    if (!s.dual || (g_p1SoloEnd && !c.dual)) {
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0,
                     input != 0 && s.action == 0, &s, input != 0);
@@ -444,6 +446,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
     g_bandPortalWrote = false;
     if (g_dualBand) g_dualOtherMode = (int)c.mode;
+    g_p2SoloHalf = g_p2Solo;   // --p2solo
+    g_p2SoloFired = false;
     t_followHalf2 = 1;   // --followy: player 1's y is sb's y2
     t_p2RingFresh = -1;  // --rtlp2ring
     // --p2xoff: the second body steps where IT is, dx2 from player 1 (the windows cover it: model.hpp
@@ -460,6 +464,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     t_followHalf2 = 0;
     const int p2RingFresh = t_p2RingFresh;
     t_p2RingFresh = -1;
+    g_p2SoloHalf = false;
+    const bool p2Solo = g_p2SoloFired;
     g_dualOtherMode = -1;
     const bool p2WroteBand = g_bandPortalWrote;
     g_halfNow = 0;
@@ -676,9 +682,32 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
             }
         }
     }
+    // --p2solo: the second body took a solo portal (step.hpp, the portal pass), and the game ends
+    // the dual there with player 1's copyAttributes from it (0x3a04a0): the position, the gravity
+    // (an unlinked flipGravity), the seven mode bytes, the speed, the size, then vy (setYVelocity,
+    // last), and +0x985 / +0x986. Not the ground byte (+0x9c1), the rotation or anything else, so
+    // player 1 keeps its own; only the model's ride bookkeeping, which names a support at the old
+    // position, is dropped. The speed is the pair's already (`dx` above).
+    if (p2Solo && s.dual) {
+        c.y = cb.y2;
+        c.vy = cb.vy2;
+        c.flip = cb.flip2;
+        c.mode = cb.mode2;
+        c.mini = cb.mini2;
+        c.pressSpent = cb.pressSpent2;
+        // --dualendrot (constants.hpp): ...but a wave takes the second body's angle, as it eased this tick
+        if (g_dualEndRot && cb.mode2 == 4) c.rot = cb.rot2;
+        c.dual = 0;
+        c.onSlope = 0;
+        c.slopeM = 0.f;
+        c.snapObj = nullptr;
+        c.snapDist = 0.f;
+        // --p2xoff: ...the position includes x, which is the second body's own once they ran apart
+        if (g_p2xOff && s.frame == 0 && s.dx2 != 0.f) c.xAbs = cb.xAbs;
+    }
     if (g_p2xOff && !c.dual) c.dx2 = 0.f;   // --p2xoff: the dual ended, the offset with it
     // --ballscaleair: a ball whose gravity a partner call or the repel turned after its own step
-    if (g_ballScaleAir) {
+    if (g_ballScaleAir && !p2Solo) {
         if (c.mode == 2 && c.flip != ballF1Own) c.ball728 = (uint8_t)((c.ball728 & ~3u) | 1u);
         if (c.dual && c.mode2 == 2 && c.flip2 != ballF2Own)
             c.ball728 = (uint8_t)((c.ball728 & ~12u) | 4u);

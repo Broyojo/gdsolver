@@ -439,6 +439,14 @@ constexpr double kWideScanHw = 40.0;
 inline bool g_p2xOff = true;
 // --startp2dx X: the anchor's dx2 (GD's p2x - x), read only under --p2xoff and only for a dual anchor.
 inline double g_startP2dx = 0.0;
+// --p2solo: the second dual body ends the dual on a solo portal the way the game does -- player 1
+// takes the second body's attributes at that point of its pass (fixup.hpp stepBoth; step.hpp, the
+// portal pass). On by default since 2026-10-07 (--no-p2solo is the off arm, where the second half's solo
+// touch is dropped). GD: toggleDualMode 0x2168d0 with the second body as the toucher calls player 1's
+// copyAttributes 0x3a04a0 from it. Measured on a custom level at t=10,012: p1 comes out at p2's y
+// (1,279.130) wherever p1 itself is (GD probe, p1's y injected to 1,252 / 1,256 / 1,272: the same y).
+// kitref A/B on 223 kits (2,162 episodes): 13 fail -> pass, no pass -> fail; quick unchanged.
+inline bool g_p2Solo = true;
 // --dualendrot (default on since 2026-10): ...and a WAVE hands over its sprite angle too. copyAttributes leaves the rotation
 // alone, but toggleDualMode's last block sets player 1's rotation to the second body's (vt +0x150 with vt +0x158)
 // when player 1 -- a wave once the second body's mode bytes are copied -- did not end the dual itself and the
@@ -448,6 +456,14 @@ inline double g_startP2dx = 0.0;
 // where the model kept player 1's 33.0 and eased it to +36.04; three ticks later a 747 turned 45 degrees met the
 // model's square turned the other way and teleported it a tick early.
 inline bool g_dualEndRot = true;
+// --p1soloend: a solo portal player 1 takes ends the dual before the second body's collisions
+// (fixup.hpp stepBoth): the game checks player 2 only while the dual is on, so that body's portals,
+// its gravity reaching player 1, and its death do not happen on the tick. A custom level t=10,012
+// (a cube pair, p1 upside down, p2 upright): p1 enters the solo, inverse
+// gravity and robot portals at x=17,665 together; GD's player 1 stays upside down with vy -0.862,
+// where the model also ran p2's pass, whose inverse gravity portal set p1 upright and halved its vy.
+// On by default since 2026-10-06; --no-p1soloend is the off arm.
+inline bool g_p1SoloEnd = true;
 // --gravtrig: the gravity trigger (id 2066) scales gravity from the tick after the one whose move
 // crosses it: every mode's gravity step, not what a press does (modifiers.hpp, GravTrig). On by
 // default since 2026-10-07 (kitref 62 FAIL->PASS and 0 PASS->FAIL, all on the four 2.2 levels with a
@@ -562,6 +578,9 @@ inline bool g_headBandFresh = true;
 // acceleration with the upright threshold (step.hpp, thrFlip). On by default;
 // --no-fixgravthr is the off arm.
 inline bool g_fixGravThr = true;
+// --expinzero: ExpIn easing returns 0 at u == 0 (dynamics.hpp gdEase). From PR #2. On by default since
+// 2026-10; --no-expinzero is the off arm.
+inline bool g_expInZero = true;
 // --touchoff: a touch-triggered trigger does not fire while an x-crossing Toggle has switched off
 // a group it sits in (step.hpp markTouched, TouchTrig::ownTog). GD (2.2081): toggleGroup
 // (0x223bc0) keeps a per-object count of the groups switched off and sets the byte at +0x28e

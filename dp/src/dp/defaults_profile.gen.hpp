@@ -107,6 +107,7 @@ inline std::string defaultsProfile() {
     put(s, "g_spiderOrbFace", g_spiderOrbFace);
     put(s, "g_dashGround", g_dashGround);
     put(s, "g_fixGravThr", g_fixGravThr);
+    put(s, "g_expInZero", g_expInZero);
     put(s, "g_spiderPad", g_spiderPad);
     put(s, "g_bandOwnTrack", g_bandOwnTrack);
     put(s, "g_bandTrackSeen", g_bandTrackSeen);
@@ -204,6 +205,7 @@ inline std::string defaultsProfile() {
     put(s, "g_wideScan", g_wideScan);
     put(s, "g_p2xOff", g_p2xOff);
     put(s, "g_startP2dx", g_startP2dx);
+    put(s, "g_p2Solo", g_p2Solo);
     put(s, "g_dualEndRot", g_dualEndRot);
     put(s, "g_gravTrig", g_gravTrig);
     put(s, "g_followYOn", g_followYOn);
@@ -350,6 +352,7 @@ inline std::string defaultsProfile() {
     put(s, "g_recStall", g_recStall);
     put(s, "g_portSeenX", g_portSeenX);
     put(s, "g_spdSameOnce", g_spdSameOnce);
+    put(s, "g_p1SoloEnd", g_p1SoloEnd);
     put(s, "g_flyDashRing", g_flyDashRing);
     put(s, "g_flySpiderRing", g_flySpiderRing);
     put(s, "g_flyPadHead", g_flyPadHead);

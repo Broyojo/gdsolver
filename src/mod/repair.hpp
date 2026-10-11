@@ -7788,7 +7788,10 @@ inline void onDeath(long long dt, float deathX) {
     const bool flownClaimedGoal = g_planClaimsGoal;
     // Once the solve is over, a death is just a death: the showing of the solution is a plain
     // replay and must not restart the search behind it
-    if (!g_cfg.dpSolve || g_dpShowSolution || g_stop) return;
+    // ...and so is a death after the session ended: a refusal (unsupported level, platformer,
+    // removed cfg, run carry-over) holds the level still without g_stop, and the probe's resume
+    // lets it run on, so its next death came here and spawned a repair for a session that was over.
+    if (!g_cfg.dpSolve || g_dpShowSolution || g_stop || g_sessionOver) return;
     // A session whose start is still queued (see start()) has no rounds yet.
     if (g_pendingLayer) return;
     // cfg cpflightprobe: the deaths of the probe and its control are kept and compared, never booked.

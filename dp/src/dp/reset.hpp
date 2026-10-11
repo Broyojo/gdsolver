@@ -121,6 +121,7 @@ inline void resetInvocationState() {
     g_spiderOrbFace = true;
     g_dashGround = true;
     g_fixGravThr = true;
+    g_expInZero = true;
     g_spiderPad = true;
     g_bandOwnTrack = false;
     g_bandTrackSeen = true;
@@ -221,6 +222,7 @@ inline void resetInvocationState() {
     g_wideScan = true;
     g_p2xOff = true;
     g_startP2dx = 0.0;
+    g_p2Solo = true;
     g_dualEndRot = true;
     g_gravTrig = true;
     g_followYOn = true;
@@ -463,6 +465,7 @@ inline void resetInvocationState() {
     g_recStall = true;
     g_portSeenX = true;
     g_spdSameOnce = true;
+    g_p1SoloEnd = true;
     g_flyDashRing = true;
     g_flySpiderRing = true;
     g_flyPadHead = true;

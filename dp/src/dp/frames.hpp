@@ -428,6 +428,11 @@ inline bool g_dualBand = true;
 // to the second half's height (GD runs p1's collisions first); -1 = read s.mode2 as before.
 inline thread_local bool g_bandPortalWrote = false;
 inline thread_local int g_dualOtherMode = -1;
+// --p2solo's two per-step channels (constants.hpp g_p2Solo), thread_local for the same reason.
+// g_p2SoloHalf: stepBoth is running the SECOND body's step. g_p2SoloFired: that step's portal pass
+// took a solo portal, so stepBoth hands player 1 the second body's attributes.
+inline thread_local bool g_p2SoloHalf = false;
+inline thread_local bool g_p2SoloFired = false;
 // --dualslide (on by default since 2026-10-07; --no-dualslide is the off arm): each dual body keeps its own DART SLIDE arm (State::slideT2 beside
 // slideT; modifiers.hpp slideBoxTouch). GD's is per player: collisionCheckObjects sets THAT body's
 // +0xb78 to 2 when it touches an id-1755 box (0x215ab7), PlayerObject::update steps it down, and

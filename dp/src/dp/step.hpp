@@ -14458,6 +14458,26 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // followed by gravity portal uid7028 (flip + halve), giving -8.000. With the
     // model's fixed order (portal -> pad) it becomes flip=0 first, takes +16, and
     // flies opposite to GD from then on.
+    // --p2solo: a solo portal the SECOND body enters ends the dual inside that body's pass.
+    // toggleDualMode (0x2168d0) with the second body as the toucher calls player 1's
+    // copyAttributes (0x3a04a0) from it, and the pass goes on in ascending uid acting on a body that
+    // is no longer played. So on the second half's step nothing whose uid is above the lowest-uid
+    // solo portal it overlaps fires here; stepBoth hands the result to player 1.
+    // Custom level, t=10,012 (a mini cube pair, p1 upside down at y 1,299.4, p2 upright at
+    // 1,278.9): the moving solo portal uid 24194, the inverse gravity portal 24196 and the robot
+    // portal 24199 cover both bodies. GD's player 1 comes out at p2's y 1,279.130 with vy 0.862,
+    // upright, full size, a cube: p2 as it was after its update and before the gravity portal
+    // (0.862 halves to the 0.431 p2 itself shows). Player 1 then takes the gravity and robot
+    // portals on 10,013 from there (vy (0.862 - 0.216) / 2 = 0.323).
+    int p2SoloUid = -1;
+    if (g_p2Solo && g_p2SoloHalf && c.dual) {
+        for (const Obj* p : *K.ports) {
+            if (p->type != 24 || p->oriented) continue;
+            if (std::fabs(x - p->cx) > p->hw + pHalfPortal) continue;
+            if (std::fabs((double)yFree - p->cy) > p->hh + pHalfPortal) continue;
+            if (p2SoloUid < 0 || p->uid < p2SoloUid) p2SoloUid = p->uid;
+        }
+    }
     auto runPortalPass = [&](int pport) {
     for (const Obj* p : *K.ports) {
         if (spiderWarpedThisTick) break;
@@ -14474,6 +14494,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     }
             if (!fires) continue;
         }
+        if (p2SoloUid >= 0 && p->uid > p2SoloUid) continue;   // --p2solo (above)
         // --portalslopeorder: the nested step dealt with this one ahead of the ramps.
         if (g_prePortalUid >= 0 && p->uid == g_prePortalUid) continue;
         // --tporder: a larger uid the pass does not reach after the teleport is next tick's.
@@ -15183,6 +15204,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (p->type == 23 || p->type == 24) {
                 const uint8_t wantDual = (p->type == 23) ? 1 : 0;
                 if (c.dual == wantDual) continue;
+                if (!wantDual && g_p2Solo && g_p2SoloHalf) g_p2SoloFired = true;   // --p2solo
                 if (wantDual) {
                     // --dualunlink (frames.hpp): toggleDualMode gives the new body player 1's own
                     // gravity and vy while the layer's +0x860 is up, the inverse and the negation
