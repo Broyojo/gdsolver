@@ -4,30 +4,33 @@
 // Narrow on purpose, and free of BOTH Geode and dp types. dp/ is compiled in its own
 // translation unit with no cocos or Windows headers in scope -- their macros (min, max, near,
 // far, small) do not survive contact with it -- and in return the mod never sees a dp:: type.
-// Everything crosses this boundary as plain C++.
+// Everything crosses this boundary as plain C++: the types below are dp/src/dpcore.hpp's, the
+// core's own face, which names no dp:: type either.
 //
 // This is the seam Stage B is built on: the mod hands the solver the very same objrects CSV it
 // writes to disk for the CLI, so the two share one parser and one model.
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "dpcore.hpp"
+
 namespace dpbridge {
 
-// What the parser made of an objrects CSV. Counts and extents only -- enough to compare "the
-// level the mod built in memory" with "the level the CLI reads from the dump" without either
-// side knowing the other's types.
-// The fields are the ones the CLI prints in its own `level:` line, so the two can be compared
-// term by term (that comparison is the Stage B acceptance).
-struct LevelStats {
-    bool ok = false;
-    std::size_t objs = 0, portals = 0, pads = 0, orbs = 0, moving = 0;
-    double maxX = 0.0;
-    // Non-empty when the parser refused the level (dp Level::unsupported, e.g. more
-    // gravity portals than the latch holds). Nothing may be solved on it then.
-    std::string unsupported;
-};
+// What the parser made of an objrects CSV (dpcore.hpp has the fields).
+using dpcore::LevelStats;
+// Where a running search has got to (dpcore.hpp).
+using dpcore::SolveProgress;
+// What the last solveInProcess call concluded, and its verdicts (dpcore.hpp).
+using dpcore::SolveOutcome;
+using dpcore::OutcomeFailed;
+using dpcore::OutcomePartial;
+using dpcore::OutcomeSolved;
+using dpcore::OutcomeCancelled;
+// A lineage to fly while the search is still running (dpcore.hpp).
+using dpcore::SolveCheckpoint;
 
 // Parse a CSV held in memory (the same bytes that go into objrects.txt).
 LevelStats statsFromCsv(const std::string& csv);
@@ -39,6 +42,21 @@ LevelStats statsFromCsv(const std::string& csv);
 // It is the CLI's entry point that runs, not a copy of it -- see dp/cli.hpp. Blocking and
 // long: call it from a worker thread, never from GD's main thread.
 int solveInProcess(const std::string& csv, const std::vector<std::string>& args);
+// The caller's content signature per file argument (repair.hpp fileSig of a recording the mod
+// wrote, taken while writing it): dp's groups cache skips reading a file whose signature matches
+// the one it parsed. Set before a call, for both core copies; an empty map is the CLI's behaviour.
+void setFileSigHints(const std::unordered_map<std::string, std::string>& hints);
+
+// Let go of what both core copies keep from one call to the next (the parsed recordings, the level
+// text's tables, the last --replay's level): for when the solving is over, so a solved level does
+// not hold them for the rest of the game. Refused (false) while a search is in flight in either
+// copy -- the caller asks again later; true when both were emptied.
+bool releaseCaches();
+// Roughly how many bytes those caches hold allocated, both copies together (dp cli.hpp
+// crossCallCacheBytes). The same rule: not while a search beside the ladder may be running -- then 0.
+std::size_t cacheBytes();
+// ...the moving-geometry recordings' part of them (dp cli.hpp crossCallGroupBytes); the same rule.
+std::size_t groupCacheBytes();
 
 // One line naming the build of the solver core that is linked in. Written to result.txt at
 // session start so a run can always say which solver produced it.
@@ -51,100 +69,9 @@ std::string defaultsProfile();
 // Where the search has got to, sampled from another thread while solveInProcess runs. The CLI
 // shows the same three numbers by printing a line every 500 ticks; on screen they have to be
 // readable at any moment, so they are polled instead.
-struct SolveProgress {
-    bool running = false;
-    // `from` is where this search resumed, so the span it has to cover is horizon - from. A
-    // tail solve does not start at tick 0 and a bar that assumes it does opens a third full.
-    long long from = 0, tick = 0, horizon = 0;
-    double x = 0.0;
-    std::size_t alive = 0;
-};
 SolveProgress progress();
 
-// What the last solveInProcess call concluded. The CLI prints this and the Python driver parses
-// it back out of stdout; in the mod there is no pipe, so the core publishes it directly (see
-// dp/progress.hpp). Read after solveInProcess returns.
-//
-// The repair loop needs all four: `verdict` decides whether the tail can be spliced, `deepT`
-// is how far the model thinks it gets (a doomed tail that reaches past the current wall is
-// still progress), and `capHits` says whether a bigger capacity could change the answer.
-// OutcomeCancelled is NOT "this anchor has nothing": the caller stopped the search itself
-// (cancelSearch below) because the game refuted one of its checkpoints. No plan file is
-// written for it, and a caller that reads it as a failure would escalate or give up on an anchor
-// that was never answered.
-enum { OutcomeFailed = 0, OutcomePartial = 1, OutcomeSolved = 2, OutcomeCancelled = 3 };
-
-struct SolveOutcome {
-    int verdict = OutcomeFailed;
-    // OutcomeSolved by outliving --horizon rather than by reaching the end (dp progress.hpp).
-    bool horizonCut = false;
-    long long deepT = -1;
-    double deepX = -1.0;
-    long long capHits = -1;
-    long long workStates = 0;   // dp's SearchOutcome::workStates: the search's own work
-    // OutcomeCancelled only: the layer the search was on when it saw the cancel. -1 otherwise.
-    long long cancelT = -1;
-    // Ticks of the emitted plan on which the model itself fired a kill, counted
-    // on the plan's own walk. -1 = the walk never ran, which is NOT zero.
-    long long resimDead = -1, resimFirst = -1;
-    const char* resimWhy = nullptr;   // string literal; dp is linked in here
-    // ...and the killer at that tick. A cause is a category; this is an object,
-    // so a row can be joined to the dump and to another walk's row. uid is the
-    // LEVEL's, not this build's ordinal. -1 = the walk found no death.
-    int resimUid = -1;
-    float resimObjX = 0.f, resimObjY = 0.f;
-    // WIDE ON PURPOSE. This mirrors dp's touch mask, whose width is a single
-    // constant over there (kTouchBits). This header deliberately includes no
-    // dp/ header, so it cannot name that type -- and a 32-bit field here would
-    // truncate the moment the constant moves, on the far side of a boundary
-    // where nothing would say so.
-    unsigned long long resimTrig = 0;
-    int resimFrame = -1;              // the frame resimObjX/Y are read in
-    long long replayDiedT = -1;   // --replay only: where the model died, -1 = it survived
-    long long rejoinT = -1;       // --rejoinuse: where the search joined, -1 = no
-    long long rejoinBadT = -1;    // ...and where the joined walk left the old plan's, -1 = never
-    const char* rejoinBadWhy = nullptr;
-    // Touch boxes the call required, and those the anchor already sits past. A required box
-    // behind the anchor can never be entered, so the frontier is empty before the first tick --
-    // which looks exactly like an impassable level unless you can see this.
-    unsigned long long needTrigMask = 0, needTrigPassed = 0;   // wide: see resimTrig
-    // --seeddump only: the ready-made `--startrotq` argument for the dumped
-    // tick. Empty unless the call asked for a dump and the level has a queue.
-    // It crosses here rather than being re-derived on this side because the
-    // bit->uid inversion depends on buildRotQueue's ordering, which only dp
-    // holds -- a caller reproducing it would be keeping a copy of a proxy.
-    std::string seedRotQ;
-    // The queue in dp's own order and --startrotq's read-back (dp progress.hpp
-    // has what each field means). Same reason as seedRotQ: the ordering lives in
-    // dp, and the mod has no pipe to read dp's `startrotq:` line.
-    std::string rotQOrder;
-    // Where a tap-gated coin is lost for good (dp progress.hpp, coinGates).
-    std::string coinGates;
-    // The coins dp does not call missed when passed (dp progress.hpp, coinNoPrune).
-    std::string coinNoPrune;
-    int startRotHit = -1, startRotGiven = -1;
-    std::string startRotMiss;
-    // What the touch window did on this call (dp progress.hpp has what each
-    // field means). Here because dp's stdout does not reach this side: the
-    // coverage line and the auto-window's own printf are invisible in-process,
-    // and a grep of result.txt for either returns 0 whether it fired or not.
-    // trigWinTouch is -1 when the call had no touch boxes -- not 0.
-    int trigWinTouch = -1;
-    long long trigTotal = 0, trigRelevantN = 0, trigKept = 0,
-              trigDroppedRelevant = 0;
-    // ...and which side of the window they fell off. Only Ahead is a world the
-    // call cannot see; Behind is the anchor window working as designed.
-    long long trigDroppedBehind = 0, trigDroppedAhead = 0;
-    double trigMaxKeptX = 0.0;
-    unsigned long long trigMapSig = 0;   // over the kept uids IN BIT ORDER
-    // The load refused the level (dp Level::unsupported); the call returned 2 and
-    // searched nothing. Empty otherwise.
-    std::string unsupported;
-    // The cap ladder's account of the call (dp progress.hpp SearchOutcome::ladder): its
-    // attempts, how many never bound their cap, the plain search's plan hash and the chosen
-    // plan's. Empty for a call that was not a ladder.
-    std::string ladder;
-};
+// What the last solveInProcess call concluded. Read after solveInProcess returns.
 SolveOutcome outcome();
 // Seconds into the last call at the end of each part of its preparation (dp::g_prepMark: arguments,
 // group recordings, touch/auto triggers, the level, the rest of the tables; -1 = not reached).
@@ -158,14 +85,6 @@ std::vector<double> prepMarks();
 // when the game killed it strictly inside. The search does not return an answer until every
 // checkpoint it published has been judged, so nothing about the outcome depends on which thread
 // got there first. No arena index crosses this seam; a checkpoint is ticks and input edges.
-struct SolveCheckpoint {
-    unsigned long long call = 0;   // the solve call that published it
-    std::size_t index = 0;         // its position in that call's order
-    long long t0 = 0;              // the anchor the call searches from
-    long long tick = 0;            // the last tick its inputs cover
-    // `input=press,level`, through the plan writer's own per-mode latency conversion.
-    std::vector<std::pair<long long, int>> edges;
-};
 
 // Turn the channel on for this process. With it off the search does no extra work, waits for
 // nothing and prints nothing, so the CLI's output is what it was without any of this.
@@ -199,14 +118,36 @@ void plainBeside(int mode);
 // The last comparison's line under plainBeside(2), taken (empty when this call made none).
 std::string besideCheckTaken();
 
+// The run: one level's solve, across its calls (dp search_dp.hpp SearchRun). Both copies of the
+// core are told, so neither can carry a run into the next level. runBegin refuses (false, `why`)
+// while a run is open in either copy. runVerified reports a flight of `flown` (its input edges):
+// died at `deathT` / `x`, or cleared; `divT` the first tick the recorder saw the model and GD part,
+// -1 for none. runEnd closes it. Each returns or fills the line the caller logs.
+bool runBegin(int level, unsigned long long seed, std::string& why);
+std::string runVerified(const std::vector<std::pair<long long, int>>& flown, long long deathT,
+                        double x, bool cleared, long long divT);
+std::string runEnd();
+// The section search spliced a plan in (all of its edges, press / level) from tick `t0` on: a flight
+// of it is reported as the section search's (`via=secsolve`), not as a plan the core emitted.
+void runNoteSplice(const std::vector<std::pair<long long, int>>& edges, long long t0);
+
 // The second copy of the core (dp_bridge2.cpp). Nothing but plainBeside's hooks calls it.
 namespace second {
 int solve(const std::string& csv, const std::vector<std::string>& argv);   // argv[0] included
+void setFileSigHints(const std::unordered_map<std::string, std::string>& hints);
 SolveOutcome outcome();
 // What it printed since the last call, taken: its stdout is held rather than interleaved with the
 // first copy's (dp_bridge2.cpp).
 std::string takeOutput();
 void cancel(bool on);
 long long envKillsTotal();
+void releaseCaches();
+std::size_t cacheBytes();
+std::size_t groupCacheBytes();
+bool runBegin(int level, unsigned long long seed, std::string& why);
+std::string runVerified(const std::vector<std::pair<long long, int>>& flown, long long deathT,
+                        double x, bool cleared, long long divT);
+std::string runEnd();
+void runNoteSplice(const std::vector<std::pair<long long, int>>& edges, long long t0);
 }  // namespace second
 }  // namespace dpbridge

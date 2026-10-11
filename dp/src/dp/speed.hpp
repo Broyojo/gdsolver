@@ -72,6 +72,15 @@ inline double speedMulForDx(double dxF) {
     if (dxF > 1.15) return 0.9;
     return 0.7;
 }
+// --seatspeed: a speed as one byte (State::seatSpd), 1..5 for 0.7 .. 1.6, 0 for none.
+inline uint8_t speedCodeForDx(double dxF) {
+    const double mul = speedMulForDx(std::fabs(dxF));
+    return (uint8_t)(mul < 0.8 ? 1 : mul < 1.0 ? 2 : mul < 1.2 ? 3 : mul < 1.45 ? 4 : 5);
+}
+inline float dxForSpeedCode(uint8_t code) {
+    static const double kMul[6] = {0.9, 0.7, 0.9, 1.1, 1.3, 1.6};
+    return dxForSpeedMul(kMul[code < 6 ? code : 0]);
+}
 inline float dxForSpeedId(int id) {
     switch (id) {
         case 200: return 251.16f / 240.0f;   // 0.7  slow      UNVERIFIED
@@ -284,6 +293,9 @@ inline int g_fixGravityBug = 0;
 inline int g_fixNegativeScale = 0;
 inline int g_fixRobotJump = 0;
 inline int g_dynamicLevelHeight = 0;
+// platformerMode is LevelSettingsObject+0x155. GJBaseGameLayer::loadLevelSettings (0x23ad00) copies
+// it to the layer (+0x309e) and to both players (+0xb70). Its one reader here is --movelockx.
+inline int g_platformerMode = 0;
 // --maxplayy <y>: GD's MAX GAMEPLAY Y, the world-y bound above which
 // checkCollisions declares the player out of bounds and (after two consecutive
 // ticks, latch at player+0xc38) destroys it with a NULL object
@@ -309,6 +321,20 @@ inline double g_maxPlayY = 1e18;
 inline constexpr int kDefGoalSpare = 1;
 inline int g_goalSpare = kDefGoalSpare;
 inline double g_goalX = 1e18;   // the search's goal, L.maxX + 60 (cli.hpp)
+// --goalgd (default off): the goal is where GD ends the level. PlayLayer::checkForEnd (0x3b4cf0) finishes it on the
+// tick the player's x reaches EndPortalObject::getSpawnPos (0x1381a0): the end portal's x - 300 / the camera zoom
+// (the layer's +0x1a8), plus instead of minus for a portal flipped in x (m_flippedX). L.maxX + 60 is past the last
+// object, and objects can lie well past the portal: one custom level completes at x 23,466.17 against its portal's
+// 23,765 where the model's goal was 26,056, another at 4,803.66 against 5,103 (both 300 short of the portal to
+// within a tick), the replay of its solution dying 15 ticks after GD's end in the pit the level ends over.
+// The portal comes from the mod's levelsettings dump (endPortalX, endPortalFlipX). With no portal (an older
+// dump, or a level without one) or a flipped one (this goal test runs rightward), the goal stays L.maxX + 60.
+// An End trigger (id 3600) can finish a level earlier; the portal's rule still holds as a point GD does not
+// pass, so the model then asks for more than GD does, never less. The zoom is unwitnessed: every completion
+// measured ended at camscale 1.
+inline bool g_goalGd = false;
+inline double g_endPortalX = 0.0;   // levelsettings endPortalX (0 = not in the dump)
+inline int g_endPortalFlipX = 0;    // levelsettings endPortalFlipX
 inline bool reachesGoalUnderMaxPlayY(double x, double y, double vy, double dx, bool rev) {
     if (!g_goalSpare || g_maxPlayY >= 1e17 || g_goalX >= 1e17) return false;
     if (rev || dx <= 1e-6) return false;
@@ -346,6 +372,15 @@ inline bool reachesGoalUnderMaxPlayY(double x, double y, double vy, double dx, b
 // The single fixGravityBug=0 drop (a custom level t=19,481, a mini ball) had its head 1.1 px under the
 // band's top, not under an object; it is not covered here.
 inline int g_upsideCoyote = 1;
+// --lingerlaunch: ...and a ramp's launch ends the window (step.hpp, the uphill launch). The launch
+// goes through boostPlayer, which clears m_isOnGround in the collision pass, after updateJump kept it;
+// the linger is that og, so it goes with it. On by default since 2026-10-06; --no-lingerlaunch is the
+// off arm.
+inline bool g_lingerLaunch = true;
+// --ceilgracecube (on by default since 2026-10-07; --no-ceilgracecube is the off arm): the
+// ceiling-ramp push's exit-side grace is the rider's only for a cube as well as a ship (step.hpp,
+// the --ceilgracerider note).
+inline bool g_ceilGraceCube = true;
 // --rawvalues (EXPERIMENT): the gravity step BEFORE the 0.001 grid. The literals the cube branch
 // uses (0.216 / 0.215 / 0.212, the ball's 0.129, the robot's 0.194 / 0.195) are GD's steps as
 // they show on the grid, and they are right whenever vy is already on it. From an off-grid vy
@@ -440,6 +475,162 @@ inline double padTableVy(int type, int mode, bool mini) {
 // It also gives the pink ring its ship and UFO ratios (ringJump: ship 0.37, UFO 0.42) in place of
 // the cube's 0.72: a custom level t=8,678 and another custom level t=11,196, mini ship, GD -3.309 = 11.18 x 0.37 x 0.8.
 inline thread_local int g_flyRingNested = 0;
+// --flydashring: ...the dash rings (37, and 38 that also turns gravity) take that path too. A custom level's
+// gravity dash ring uid 68437 (id 1751, rot -70) and a UFO, the plan's press swept one tick at a time in GD:
+// it fires for presses on 10,460..10,464 and not on 10,459 or 10,465, and the row after the press already
+// carries the turned gravity at the y the press found -- the buttons phase of that tick, as the impulse
+// rings. The model fired it through the late loop a tick later, from the row the flap had moved, for
+// presses on 10,458..10,461. On by default since 2026-10-06; --no-flydashring is the off arm.
+inline bool g_flyDashRing = true;
+// --flyspiderring (default on since 2026-10): ...and the spider orb (43, id 3004), whose ringJump branch runs the spider's
+// surface search and moves the body there in that same buttons phase. A custom level, t=6,580: a ship presses with
+// spider orb uid 2877 in contact since 6,579 (0.2 px), and GD's row 6,581 already has it on the ceiling above
+// (1,301.25 = the underside 1,316.25 - 15, vy 1, upside down), the next row running its update from there; the model
+// fired it through the late loop a row later, and the whole-run replay of the clearing plan left GD there and died
+// at 7,011. The search is the late loop's, from the position the press's tick ended at.
+inline bool g_flySpiderRing = true;
+// --flypadhead (on by default since 2026-10): a pad that sends a ship, UFO or swing toward its head side hands GD's solid pass
+// that vy, and the solid whose head-side face the head has crossed within the flight modes' reach (6 px, now or
+// at the previous position) takes the head there: on the face, vy 0. collisionCheckObjects fires the pads in its
+// object loop and resolves the solids only after it (the pass-order note), while the model ran its flying
+// solids first, on the vy from before the pad, which pointed away from the face. A custom level, t=6,581: a ship
+// a spider orb has just moved under the ceiling, upside down, its lower-left corner 0.68 x 3.26 px into block
+// 3930; the upside-down yellow pad 2880 above sets vy -16 (GD's padfire), and GD's hitboxtrace has 3930 hit=1:
+// y 1,304.75 = the block's top + 15, vy 0 -- then it sits under the ceiling slabs until the next pad, 4 ticks on.
+// The model let the pad's -16 carry it away at once. A face that moves on the tick is left alone (unmeasured).
+inline bool g_flyPadHead = true;
+// --earlyring: ...and the press on foot. pushButton (0x397f40) has no mode test: a press finds
+// m_touchedRings (the rings the previous tick's collision pass touched) not empty, fires them through
+// ringJump and returns, and only an empty array reaches the grounded updateJump(0). ringJump then
+// leaves nothing for the update's updateJump: an impulse ring clears can-jump (+0x9c1), a dash ring
+// starts the dash. So a cube, ball, robot, spider or swing that presses with a ring in that array
+// takes the ring, not its jump, tap, teleport or flip, whichever ring this tick's contact finds. The
+// model had this as separate rules (the spawn ring's ringTookPress, --spiderringfirst, the teleport
+// orb's) and otherwise jumped and fired the ring in the late loop, undoing part of the jump. A custom
+// level, t=13,565: an upside-down cube on a ceiling inside dash ring uid 875 (rot -90) presses; GD's
+// next row has the dash's rotation, y and vy unchanged, and no jump (probed for presses on 13,545
+// and 13,565, held and released). The model jumped, fired the ring after it, and reported the jump's
+// vy (-11.23) as the dash's. Only a ring the previous tick touched is taken, as --flydashring's dash
+// rings: one the array still carries from the tick before does not fire (step.hpp flyEarlyRing).
+// The wave keeps its own ring box (--waveringbox) and is left out; the teleport orb keeps its contact
+// path (calib_teleportorb) and the spider orb its surface search.
+inline bool g_earlyRing = true;
+// --dashclamp: the line a dash ring sets, as PlayerObject::startDashing (0x395910) builds it from the
+// ring's rotation: the angle -rot (+180 for a ring flipped in x), wrapped to [-180, 180], turned into
+// the forward half when it points back (|a| > 90: +-180 - a) and held inside +-70; the slope is the
+// direction's y over |x|. The model took tan(-rot), which is infinite for a ring at -90 and has the
+// wrong sign past 90. The same custom level's ring uid 875 (rot -90): GD's dash rotation reads -70.00
+// and the body climbs 5.3575 px a tick at 1.9492 px of x. A classic level on an unturned frame only:
+// GD applies the frame's offset (+0x9c3 -90, +0x9c2 +180) around the clamp, and a platformer dash
+// keeps the raw angle. The anchor's slope (the mod's tan(-rot)) is clamped the same way, but a ring
+// pointing back cannot be told from its slope, so that case still needs the mod.
+inline bool g_dashClamp = true;
+// --mpushside: which face of a moving solid a flying body met, as PlayerObject::collidedWithObjectInternal
+// (0x391a70) decides it, for the moving push-out (step.hpp mpushGeom). The tolerance is 6.0 for the
+// flying modes plus |dy| / dt of an object that moved toward the body; upright the contact is the top
+// face's when the object's bottom is below foot + tol and below the start-of-tick foot + tol, and it is
+// then resolved onto the top when either foot + tol reaches it (the reach mpushReach already has). The
+// model asked instead that the body's centre be above the face. A custom level, t=13,976: a mini ship
+// floating at the band floor is caught from below by a block rising 9.05 px a tick; its centre ends
+// 0.07 px under the new top, GD seats it there (y = top + 9, vy 0) and carries it, and the model, past
+// the push, took the overlap as a side hit and killed it. Adds to the centre test, never removes it.
+inline bool g_mpushSide = true;
+// --bluepadpost: the blue (gravity) pad's vy for a spider or a swing is the ball's. The pad calls
+// PlayerObject::propellPlayer(0.8) (0x39f850): vy = 0.8 x 16 (x 0.8 mini), then x 0.6 for the ball,
+// the spider and the swing alike (0x39f8b7, the three mode bytes +0x9bb / +0x9be / +0x9c4); the
+// layer's flipGravity halves it after. The model took the 0.6 for the ball only. A custom level,
+// t=3,665: a spider teleported onto a row of blue pads flips with vy 3.840 in GD (= 6.4 x 0.6) and
+// 6.400 in the model. propellPlayer's only other caller is PlayerObject::bumpPlayer (0x39f7e8), for the
+// yellow, pink and red pads, whose values --padtable already scales for all three modes.
+inline bool g_bluePadPost = true;
+// --ringrotbox: the contact a fly ring is fired from (step.hpp flyRingContact, the previous tick's end)
+// tests a rotated ring against the player's own rotated box -- GD's collision pass rebuilds the player's
+// oriented box for an object that has one (the portal pass's pHalfLive note). The same sweep: with the
+// player's rotation (3.4 to 4.1 degrees) the two boxes overlap on exactly the five rows GD fired from
+// (tightest margins +0.08 and -0.21 at the two ends); without it the window moves a row early.
+// On by default since 2026-10-06; --no-ringrotbox is the off arm.
+inline bool g_ringRotBox = true;
+// --balltaplag (on by default since 2026-10): the ball's sprite on the row of a tap off the floor turns by the roll's
+// ground step and sign, as on the row of a ring's flip (the ring lag in step.hpp's ball rotation); the
+// air step the flip writes starts on the next row. The reference dumps of lv1-22: 185 of 188 taps off
+// the floor do so (131 full size, +-2.5 at 0.9; 54 mini), e.g. lv9 t=7,212 +2.5 then +1.771 and
+// t=7,488 -2.5 then -1.771; the model turned at the air step on the tap row, 0.729 deg short a tap.
+// A custom level t=5,988: a ball that tapped at t=5,905 meets a rotated ship portal (rot 39, 0.81x)
+// whose two-box test passes on that row only with GD's angle (+0.130 there), and the model, 0.735 deg
+// short since the tap, became a ship a tick late.
+inline bool g_ballTapLag = true;
+// --ringrotground (on by default since 2026-10): ...and the late ring loop (every mode but the fly rings' early
+// press) does the same, where it projected an unturned player square onto the ring's axes, and it
+// places that box where the player was at the previous tick's end, as the fly rings' contact does.
+// Two airborne cubes spinning past a dash ring (id 1704, 36 x 36) that does not move (GD's ccl orect
+// is its load position), the press swept one tick at a time in GD with the rest of the plan kept:
+//   a custom level, ring rot -70, sprite ~254 deg: presses 7,960..7,964 dash (the sprite snaps to the
+//     ring on the next row), 7,965 and 7,966 do not
+//   another, ring rot -11, sprite ~147 deg: presses 1,095..1,098 dash, 1,099..1,101 do not
+// Scored on GD's own rows, only the turned box at the previous row fits all four edges (+0.43 / -1.72
+// and +1.77 / -1.43 px with the start-of-tick rotation); at the fire row it misses both last dashes
+// (-1.59, -1.50). The unturned square at the previous row fires a tick late on the second (+3.01) and
+// misses the first's last dash (-1.19), at the fire row that one too (-3.21). The model without the
+// flag fell past the first ring and died on a hazard 20 ticks later.
+// NOT the wave: --waveringbox's sweep (below) wants a turned half in (5.86, 6.50], which the wave's own
+// 10 x 10 (half 5) misses, so the wave keeps that measured unturned square of half 6 rather than having
+// the two rules stacked.
+inline bool g_ringRotGround = true;
+// --slopelandtol (on by default since 2026-10): a flying body that was on a ramp last tick lands on a solid face from
+// as far as 6 + pHalf * (1/cos(theta) - 1) inside it, theta the angle of the ramp it was seated on, and
+// lands climbing as well, with vy 0. collidedWithObjectInternal (0x391a70) builds its face tolerance as
+// 6 for the four flight flags, plus, while m_wasOnSlope (+0x9b1), the double at +0x680
+// (0x391c54..0x391c6d), which collidedWithSlopeInternal writes on every seat as h/(2 cos theta) - h/2
+// (0x38f810, the store after the slope map insert); the face's arms have no velocity gate, and a body
+// that was on a slope takes hitGround's (vy 0) rather than the climbing seat. The model's flight gate
+// used 0.001 on a ramp and wanted the body falling. A custom level t=6,164: an upside-down ship that a
+// 30 x 60 ceiling ramp (m -2) seated at t=6,163 is 19.06 px inside a 22 x 22 block's underside with
+// vy -2.086; GD puts it at the block's bottom - 15 (229.000), vy 0, on the ground (tolerance
+// 6 + 15 * (sqrt 5 - 1) = 24.54), and the model left it on the ramp's line at 245.93.
+inline bool g_slopeLandTol = true;
+// --ringpobb (default on since 2026-10): ...and the late ring loop's rotated ring too, for every mode but the wave
+// (step.hpp, its ring box was swept against the unturned test). GJBaseGameLayer::collisionCheckObjects
+// (0x214960), after the rect test: when the object's latch (+0x2e8) is set it asks OBB2D::overlaps1Way both
+// ways between the object's getOrientedBox and the player's, which updateOrientedBox has just turned by
+// the player's rotation. The late loop projected an unturned player square onto the ring's axes. A custom
+// level's dash ring (id 1751, rot 26.94, own box 36) and a cube in the air at 116.06 degrees, the model's
+// angle equal to GD's: on the ring's axis the cube's turned box reaches 15.2, the unturned square 20.2, and
+// the cube's centre is 37.39 out. The model dashed and GD did not, the same death ten attempts running.
+inline bool g_ringPobb = true;
+// --waveringbox: a full-size wave meets a ROTATED ring (the SAT on the ring's own axes, step.hpp's ring
+// loop) with a square of half kWaveRingHalf rather than its 10 x 10 object rect. A custom level's gravity
+// dash ring (id 1751, 36 x 36 turned -45) and a wave crossing it, the press swept one tick at a time in
+// GD with the rest of a cleared plan unchanged: the dash fires from rows whose offset across the ring's
+// axis is 24.25 (entering) and 25.38 (leaving), and not from rows at 27.01 or 28.14. With half 5 the
+// test stops at 18 + 5 sqrt 2 = 25.07 and the leaving row misses; any half in (5.22, 6.37] fits all four
+// (unturned square; turned with the sprite, (5.86, 6.50]). The model kept the wave flying the other way
+// and the loop paid a fixup a tick for seven iterations. Unturned rings, where GD's test is the object
+// rect alone, keep 5; the mini wave is unmeasured. On by default since 2026-10; --no-waveringbox turns it off.
+inline bool g_waveRingBox = true;
+constexpr double kWaveRingHalf = 6.0;
+// --wavedash: a wave a dash ring took runs the dash -- the straight line at the ring's angle, vy 0, the
+// sprite turned to it -- while the button it came in with stays down, as the cube's dash branch does
+// (step.hpp, the wave branch). The ring loop already started the dash for a wave and the wave branch
+// ignored it. Same dash ring as above: GD's wave goes up the ring's 45 degrees by dx a tick at vy 0,
+// rot -45.0, from the row after the ring's through the row after the release, then zig-zags again
+// (flipped, the ring being a gravity one). On by default since 2026-10; --no-wavedash turns it off.
+inline bool g_waveDash = true;
+// --waveringmini: the mini wave meets a ring's box (the ring loop's AABB gate) with its 6 x 6 object rect,
+// half kWaveHazHalfMini -- the box --wavepadhalf measured for the pads, which GD's same collision pass
+// tests against the same player->getObjectRect() -- not kWaveHalfMini's 2. A custom level's mini wave
+// passes a gravity orb (37 x 37) 21.0 px off its centre in y: GD fires it (vy +11.4 against the model's,
+// then the direction alternating against the model's for the next twelve ticks); 18.54 + 2 refuses it
+// and 18.54 + 3 takes it. On by default since 2026-10; --no-waveringmini turns it off.
+inline bool g_waveRingMini = true;
+// --waveringminibox (default on since 2026-10): ...and the MINI wave meets a TURNED ring (the SAT on the ring's own axes)
+// with --waveringbox's square at the mini scale, kWaveRingHalf * 0.6 = 3.6, rather than its pHalf 2.
+// A custom level, t=13,108: a mini wave presses (plan 13,107) by the gravity dash ring uid 122468 (id 1751,
+// 36 x 36 turned -45) and GD dashes from the row after the fire row, whose ring-axis offset is 22.58 --
+// inside 18 + h sqrt 2 only for h >= 3.24. The model's 2 missed it and flew the wave the other way; the full
+// size's bracket (5.22, 6.37] at 0.6 is (3.13, 3.82]. ONE WITNESS: the corpus has no other press of a mini
+// wave by a turned ring (the three rows near one are releases), so the upper side is unmeasured.
+inline bool g_waveRingMiniBox = true;
+constexpr double kWaveRingHalfMini = kWaveRingHalf * 0.6;
 // --portalslopeorder's re-run (frames.hpp; the end of stepOne): the uid of the gravity portal
 // the nested step fires ahead of the ramp pass, -1 when no re-run is in progress.
 inline thread_local int g_prePortalUid = -1;
@@ -462,6 +653,30 @@ inline thread_local int g_ballTapLaunch = 0;
 // and GD stays full size at y=135; the model fired 2359 and 2356 again and re-seated to 141. It
 // remembers one tick of overlaps (State::portSeen), not a run-long latch, so a portal left and
 // re-entered fires again.
+// --portseenx: ...but a body still inside the portal's x window keeps it as seen when it leaves the
+// box only in y (step.hpp, the portal pass's y gate), so leaving and coming back over the same x
+// does not fire it again -- GD's mark is the object's own, per player and attempt. A custom level
+// t=9,979..9,982 (dual mini cubes): player 1 takes mini portal uid 24070 at 9,979, its foot rises
+// 1.1 px clear of the box on 9,980..9,981 and comes back on 9,982, the tick it also enters the
+// normal portal uid 24068 beside it. GD comes out full size; the model fired 24068 and then 24070
+// again and stayed mini, which put the dual solo / robot / gravity cluster at x=17,665 three ticks
+// late for player 1. On by default since 2026-10-06; --no-portseenx is the off arm. A portal
+// re-entered after the body's x has left its window (reverse play) still fires again.
+inline bool g_portSeenX = true;
+// --spdsameonce (on by default since 2026-10): State::spdFired holds the last two speed portals a body fired,
+// and two portals side by side pushed out an older one the body was still inside, which then fired
+// again; GD's mark is the object's own and never lets it: playerTouchedTrigger (0x217f50) activates
+// a speed portal only when GJEffectManager's triggered-ID set (+0x558) lacks the (object, player) key
+// and stores the key as it does, so every portal touched is marked, a stacked pair on the same tick.
+// With the flag the memory is four deep (State::spdMore), every activated portal is marked, and a
+// full memory gives up the oldest portal the body has left, else the oldest. A custom level
+// t=10,508: a wave inside 1x portal uid 63774 (74 px tall) enters 2x portals 67297 and 67428, one
+// tick apart; the model fired 63774 again and flew on at 1x where GD keeps 2x (x 1.614 a tick),
+// and the cold run died at the same wall six times. (The flag's first form let a portal of the same
+// speed as a marked one the body was inside stand for it unmarked; another custom level stacks two
+// portals per speed, and once the body left the first 0.9x the second fired on its own at t=14,633
+// and took the 1.1x back.)
+inline bool g_spdSameOnce = true;
 // Hold latch (was --holdlatch, always on since 2026-09-26):
 // a ship thrusts on GD's m_jumpBuffered (+0x985), not on the button.
 // updateJump's ship arm reads +0x985, and a ball's tap ends with `flipGravity, vy *= 0.6,
@@ -473,6 +688,57 @@ inline thread_local int g_ballTapLaunch = 0;
 // ringHold: a ring a cube fires leaves +0x985 set (a custom level t=12,551, GD re-jumps after yellow ring
 // uid 2314), and a spider orb or the spider's own tap clears it (spiderTestJumpInternal) -- the
 // lv22 t=10,352 case ringHold was built on. The robot keeps ringHold (its arm needs +0x986 too).
+// --holdseed (on by default since 2026-10): an anchor seeds holdDead from GD's own +0x985 (the hist payload's
+// version 6, `jumpBuf` / `jumpBuf2`): the button down at t0 (the --start hold field) with +0x985 at 0
+// is a dead hold, and the button's level is 1 there, so the first tick is not a fresh press that would
+// make it live again. Before, an anchor started every hold live. A custom level t=2,294: a ball that
+// tapped with the button held enters a ship portal, and an anchor at t=2,275 between the two thrust
+// the ship (-0.0865 a tick flipped) where GD flies as released (+0.1035) until the press at 2,304.
+inline bool g_holdSeed = true;
+// The --start hold field (its 7th, held_before(plan, t0)); -1 when no --start was given.
+inline int g_startHoldField = -1;
+// --portseatorder (on by default since 2026-10): a portal's y test reads the body after a ramp that moved it this tick
+// only when GD's collision pass reaches the portal after that ramp (cells x-major, y only with
+// dynamicLevelHeight, then ascending uid); before it, the free y. The model chose by portal type: the
+// free y for a mode portal, the moved y for a gravity portal (--gravportalseat). lv20 t=17,108: the dual
+// portal uid 13879 comes before every ceiling ramp in its x window (uids 13905 / 13913 / 13915, the cell
+// is the same), and GD fires from the free y (as the model does). A custom level t=6,199: the size portal uid 5614 (id 99, normal
+// size) comes after the ceiling ramp uid 5596 pressing a mini UFO down 3.1 px a tick; GD's row 6,199 is
+// already full size from the pressed y (0.303 px short from the free y), and the model a tick later.
+inline bool g_portSeatOrder = true;
+// --flyhazdefer (on by default since 2026-10): a ship's or UFO's hazard hit after the solids waits for the ramp pass.
+// GD's hazard stage runs after the whole object pass, ramps included (checkCollisions, 0x2147c0, the rect
+// re-read at 0x214752), so a ramp that moves the body moves it out of a hazard too. The model killed
+// where the solids left the body and only tested again after a moving ramp pass (--flyhazafterslope).
+// Now the hit stands when the ramps left the body where it was tested, and when they moved it the walk
+// after them is the only test. The custom level of --portseatorder at t=6,200: the mini UFO turned full
+// size overlaps a turned hazard (uid 5630) where the solids leave it, the ceiling ramp then pushes it
+// 13.4 px down and off it; GD flies on to t=6,377, the model died there.
+inline bool g_flyHazDefer = true;
+// --dualbornpress (on by default since 2026-10): the body a dual portal creates is born with the first body's press
+// state (step.hpp, the dual portal: State::pressSpent2 / holdDead2 from pressSpent / holdDead), not with
+// none. GJBaseGameLayer::toggleDualMode calls the second player's copyAttributes, whose last two writes
+// copy +0x985 and +0x986 from player 1 (0x3a04a0); only a two-player level clears them after it. So a
+// press player 1 has already spent is spent for player 2 too. A custom level, t=4,869 (a branch that
+// holds a cube's press from 4,866 to 4,869): player 1 jumps on 4,866, the dual portal makes player 2 on
+// 4,868 inside a yellow ring, and GD's player 2 does not take it with the button still down; the
+// model's did (vy -11.205 against GD's -10.775) and died on a saw at 4,911. Two-player levels are not
+// modelled here.
+inline bool g_dualBornPress = true;
+// --dualpadflip (on by default since 2026-10): a gravity pad's flip reaches a dual partner (step.hpp, the gravity pad
+// sets stepOne's linkFlip; fixup.hpp stepBoth, --dualcouple). collisionCheckObjects runs propellPlayer and
+// then GJBaseGameLayer::flipGravity for the pad, the call a gravity portal makes, whose partner call sets
+// the other body to the inverse polarity and halves its vy; the model passed on only portals and rings.
+// A custom level, t=24,904: dual cubes, a gravity pad launches player 1 at +6.4 and flips it;
+// GD's player 2 turns upright on the same tick with vy 1.696 x 0.5 - 0.212 = 0.636 (halved before
+// its own step) and falls, the model's stayed flipped, rose 16 px and died on a spike at 24,921.
+inline bool g_dualPadFlip = true;
+// --flyhaztele (default on since 2026-10; with --flyhazdefer): ...and the hit held back waits for the teleports too. The
+// same hazard stage comes after the teleport portals of the object pass, so a body a portal moved on this tick
+// is tested where the portal put it. A custom level's ship at y 207.5 grazes a round hazard at (13365, 240) on
+// the tick a 747 moves it to y 285; GD flies on, the model died on the hit it took before the teleport. With
+// no teleport the held hit stands as before; with one, the hazards are tested again at the new position.
+inline bool g_flyHazTele = true;
 // Ring first (was --ringfirst, always on since 2026-09-26):
 // a press that finds a ring is the ring's. pushButton fires the touched
 // rings and returns; it calls updateJump only when there are none. The model runs the grounded
@@ -529,7 +795,7 @@ inline thread_local int g_ballTapLaunch = 0;
 // quick_regress section from t=13,000 anchors in a robot section with the button down, the robot
 // never rewrites held, and at the robot -> wave portal (t=14,391) the model climbs at +6.457 where
 // GD dives at -6.457 with the button up. The ship's release re-clamp (holdRelU) reads it too.
-inline int g_heldAll = 0;
+inline int g_heldAll = 1;
 // --heldcellcap (EXPERIMENT, only with --heldall): the alive cap counts CELLS, not states. Under
 // --heldall a cell whose states differ only in the button (held, jumpBuf) keeps them apart, as it
 // should, but each twin then takes a slot of the cap and the water-fill's stride runs over twins
@@ -552,6 +818,144 @@ inline int g_heldCellTwins = 0;
 // 1007 at x=4,759 (section 47) and mini portal uid 1079 at x=4,815 (section 48) on one tick; the
 // full-size box touches the pad by a pixel, and GD launches the ship at 5.6 (full) where the model
 // gave 4.48 (mini).
+// --padoldbox (default on since 2026-10): ...but the CONTACT on that tick is judged with the box from before the
+// portal, whichever side of it the pad's cell and uid fall on. The pass's gate is the player's
+// getObjectRect (and its oriented box for a turned object), and togglePlayerScale hands the new scale
+// to a CCScaleTo action and skips its own setScale -- the write that would mark the player's box dirty
+// -- so every object of the tick still meets the old one (the --portorder note, for portals). The
+// strength keeps the order rule above: propellPlayer reads +0x9f0, which is written at once.
+// Measured on a custom level, a ball that a normal-size portal (uid 610) grows on t=6,711 with a turned
+// yellow pad (uid 611, 4 x 25, uid and cell after the portal) 13 px ahead, by injecting x in GD:
+//   size tick, full box 1.9 px into the pad, mini box clear       no launch (the replay itself)
+//   size tick, full box 5 px into the pad, mini box clear         no launch; launched on the next tick
+//   size tick, the mini box reaching the pad                      launched (vy 9.6)
+//   the tick after, the same 1.9 px edge with the full box        launched
+// The model launched the first case with the new box and ran on 7 px a tick above GD.
+inline bool g_padOldBox = true;
+// --sametick (default on since 2026-10): a replayed plan's press and release on ONE press tick are read as GD's button
+// pass takes them, not as the tick's last level. The mod feeds both to handleButton in that tick, in order.
+// pushButton (0x397f40) sets the hold bytes (+0x985/+0x986) and acts AT ONCE: ringJump on each touched
+// ring, or -- none touched -- updateJump(0) when the body is on the ground (+0x9c1) and is the ball
+// (+0x9bb), or is none of ship (+0x9b9), UFO (+0x9ba), wave (+0x9bc) and swing (+0x9c4). releaseButton
+// (0x3981d0) clears the hold bytes (and stops a dash) before the update, and updateJump's flap, thrust and
+// climb all read them, so nothing else of the press survives. Here a tap holds for its effect tick only
+// when a trial step shows that work (a ring used, or a grounded ball's, cube's, robot's or spider's jump);
+// otherwise the old reading (no press) stands. A release then a press while held is a fresh press, seen
+// as a rising edge on the effect tick.
+// Measured in GD: a custom level t=16,500 (a loop splice left a mini UFO's press and the tail's seam
+// release, written a latency early, on one tick): GD jumps one row after the tap wherever it is put
+// (16,499 / 16,500 / 16,502), through an orb that moves with the player. Two custom levels whose mini UFO
+// taps touch no ring (one at t=11,678, one at 4,387, both upside down): GD does not flap. The trunk
+// solutions' pairs are a ship's: no thrust (lv20 t=14,095).
+inline bool g_sameTick = true;
+inline bool sameTickTapMode(uint8_t mode) { return mode == 0 || mode == 2 || mode == 5 || mode == 6; }
+// --togglescale (default on since 2026-10): on a tick a mode portal changes the mode AND a size portal the size, GD's
+// hazard stage meets the NEW size. --hazafterportal keeps the size the body came in with, which holds for a
+// size portal alone (togglePlayerScale hands the scale to a CCScaleTo action, tag 6, and skips setScale).
+// But a mode's toggler calls updatePlayerScale (0x3a0220), which stops that action and calls setScale with
+// +0x9f0 at once: toggleFlyMode, toggleBirdMode, toggleDartMode, toggleRobotMode and toggleSpiderMode do
+// (its 7 direct call sites); toggleRollMode and toggleSwingMode do not, and the cube has no toggler.
+// A custom level t=16,507: a cube portal and a normal-size portal at one spot turn a mini UFO into a full
+// cube next to a turned spike (OBB 24 x 311 at 99.2 deg). Injecting y in GD puts its kill threshold
+// between y 1118.5154 (dies) and 1118.5453 (lives); the full box gives 1118.5436, the mini box cannot
+// reach the spike at all, and the model lived. Only that UFO exit is measured; the other togglers are
+// read from the call sites.
+inline bool g_toggleScale = true;
+inline bool toggleScalesNow(uint8_t mode) {   // ship, UFO, wave, robot, spider
+    return mode == 1 || mode == 3 || mode == 4 || mode == 5 || mode == 6;
+}
+// --forcecircle (default on since 2026-10): a force block 3645 with neither target mode nor range pushes like a 2069 --
+// m_force along (flipY ? 180 : 0) + 90 - rot at the mode's unit, a tick after the contact -- and its
+// contact is GD's circle test, gated by the collision sections. collisionCheckObjects sends 0x815 (2069)
+// and 0xe3d (3645) down one branch (m_stateForce = 2, calculateForceToTarget 0x4c1ec0); the falloff there
+// only runs with +0x74d (range) set. An object with m_objectRadius > 0 is met through playerCircleCollision
+// (0x211df0): with the level's fixRadiusCollision, centre distance <= player width / 2 + radius * the
+// larger scale; without it, the circle's centre inside the player's rect or a corner of the rect inside the
+// circle. And the pass reaches the object only from the 3 x 3 cells around its centre's (--bigsection).
+// A custom level t=17,650: uid 23888 (radius 15, scale 9 x 1, m_force 1.5, rot 0) under a falling cube;
+// GD adds a constant +0.337 per tick from the tick the player's cell reaches the block's, at any height
+// up to the circle's edge (a y sweep: 5 of 6 heights start on the same tick, the sixth two ticks later at
+// 148.36 / 150.76 from the centre). The model's field started 7 ticks early and weakened with height.
+inline bool g_forceCircle = true;
+// --forcelive (default on since 2026-10): a constant 3645 (--forcecircle) is met where the moving-geometry recording has it on the
+// tick, not where the level put it. A custom level t=21,135..21,167: uid 26764 (rot 180, scale 1 x 4, m_force 5),
+// carried by a Lock to Player X Move from x 41,265 and lifted 75 px, pushes a falling cube to vy -16.125 (= the -15
+// cap - 5 x 0.225) while its circle (15 + 60) holds the player's centre; the model met it at its load position, 186 px
+// behind, and fell at -15, 6 px high by the landing, where it took a jump GD never had. ...and only while the recording
+// has it on (modifiers.hpp forceFieldAt has the rows it reads): at t=15,447 a Toggle turns uid 12729 off as the cube it
+// follows leaves its floor, and GD pushes once (vy -1.341) and then lets it fall at plain gravity.
+inline bool g_forceLive = true;
+// --ringpresseat (default on since 2026-10): a cube's or ball's fresh press inside ANY toggle ring (1594) that the recording has on
+// goes to the ring -- pushButton hands a press to the touched rings and makes no jump of it -- including the rings the
+// activator construction leaves out because their effect is not modelled (--orbspawn's ring takes the press only when
+// it is taken). The held button does not jump either (holdDead, as --orbspawn has it). A custom level t=21,176: a cube
+// carried on a rising block presses inside spawn ring uid 26528 (on; its Toggles reach a spike, so the model left it
+// out); GD's y follows the block with vy 0 through the hold (21,176..21,177) and after, where the model jumped 11.23.
+// ...and only a ring THIS body has not fired: its uid goes into the body's ring memory (usedOrbOld / usedOrbHist,
+// per body through swapHalves, seeded at an anchor from --spentorb / --spentorb2 in their order; a Multi Activate
+// ring never). GD marks a fired ring used per player -- activatedByPlayer (0x1a4a90) sets +0x5b4 for the player
+// whose m_uniqueID is 1 and +0x5b5 for the other -- and collisionCheckObjects skips a ring
+// hasBeenActivatedByPlayer (0x1a4af0) answers yes for before playerTouchedRing. A custom level's dual
+// balls: toggle ring uid 13578 rides beside p2; p1 fired it at t=7,736 and p2 with a tap at 10,625 that shows
+// nothing else. GD's p2 then flips on its presses inside the ring at 11,575 and 11,607; with the 10,625 tap taken
+// out of the plan, GD's p2 press at 11,575 goes to the ring and the flip comes a tick late.
+// The cost: a toggle ring takes a place in the same five-deep memory as the rings proper, so on a level that fires
+// toggle rings the oldest ring proper is forgotten one fire sooner. A ring firing twice there is the first thing to
+// suspect when this change turns a replay from passing to failing.
+inline bool g_ringPressEat = true;
+// --spawnringon (default on since 2026-10): the toggle rings (1594) take presses the way the recording says GD's did.
+// pushButton hands a press to the rings the previous tick's collisions touched, and a fired ring's Toggles switch
+// the next ring on after that, in the row the fire is recorded in (the press step's own K.t). So:
+//  - a ring the recording has OFF on row K.t-1 takes no press, as a spawn ring (--orbspawn, --acthazoff) or under
+//    --ringpresseat (which read its "on" from row K.t+1);
+//  - a spawn ring takes a held press (markTouched) only with the button down on this step and the press not spent
+//    (it took the parent's button, a tick after a release, and every overlapping box at once);
+//  - its jump (--spawnringjump) is the held press's own, a tick late: given only to a cube that pressed from the
+//    ground, and not while another ring the recording has on in the fire's row holds the body.
+// A custom level x 41,355 .. 41,520: three rings stacked per spot, A ("A off, B on"), B ("B off, C on") and C (opens
+// the spike wall at x 41,685). GD's cube fires A on the press at 21,165 in the air (row 21,166: A off, B on) and B on
+// the press at 21,175 on a rising block (row 21,176: B off, C on), never leaves its line, presses no more and dies on
+// the wall at 21,225. The model fired all three boxes when it entered them at 21,162, a tick after the release, then C
+// on the second press, jumped both times and lived. With the flag the anchored replay agrees with GD on every column
+// to the death.
+inline bool g_spawnRingOn = true;
+// --acthazoff (default on since 2026-10): a spawn ring (--orbspawn) whose spawned Toggles switch hazards OFF is taken as an activator;
+// activatorTargetSafe refuses a hazard because switching one ON can kill later, which a Toggle with togon 0 cannot do.
+// A custom level x 41,355 .. 41,520: three stacked toggle rings per spot, each press turning the next one on; the third,
+// uid 26528, spawns group 317, whose Toggle uid 26957 switches group 340 -- the spike wall at x 41,685 (uids 26960 ..
+// 26965) -- off. Left out, the ring could not open the wall, and every search from anchors back to t=19,724 ended on it
+// (t=21,224, "doomed") or took the fall route down to the floor.
+inline bool g_actHazOff = true;
+// --formulanolock (default on since 2026-10): an object both a touch box and an autonomous controller move is placed by
+// the formula (Dynamics, formula-driven) -- unless its autonomous chain also locks it to the player, which
+// the formula has no term for (level_loader: "the formula does not implement the lockToPlayer term"); such
+// an object stays on its recording. A custom level t=6,402: a row of blocks (group 3) is moved by a 20 s
+// Lock-to-Player-X, a spawn-looped +-9 bob, two instant +-150 x moves and, later, -150 / +24 y moves and a
+// touch box's -15; the formula summed the y moves into one -126 over 360 ticks from the first crossing
+// (t=5,672) and put the row 120 px under the recorded one, so a mini swing GD landed on fell through.
+inline bool g_formulaNoLock = true;
+// --swingseatpress (default on since 2026-10): a swing pressed while it rides a MOVING floor stays on the moved face on the
+// press tick; the flip (pending, as always) lands on the next tick from rest. The model sent the press tick down
+// the airborne swing branch, which steps one gravity step off the seat: on a static floor the solids pass
+// lands it back, but a floor that sinks faster than that step leaves it in the air. A custom level t=6,441:
+// a mini swing riding a block row that sinks 0.07 px a tick (Lock-to-Player-X, see --formulanolock) is
+// pressed; GD reads vy 0 on the row seated on the block at 6,442 and the flip at 6,443 (vy +0.129, y +0.029),
+// where the model left the block at 6,442 (vy -0.129) and flipped 0.103 slower.
+inline bool g_swingSeatPress = true;
+// --swingheadceil (default on since 2026-10): an UPRIGHT swing that rises head first into the band's top is clamped
+// there like any flyer (y = top - half, vy 0) where the band's Free Mode byte is known and clear --
+// --swingbandceil took only the flipped swing, which lands there. checkCollisions clamps the swing like
+// any flyer whenever +0x311 is clear (0x2139b8). A custom level t=6,712: an upright mini swing reaches
+// the band [630, 930] at vy 6.0; GD stops it at 921.000 (vy 0, onGround2 1) and lets its gravity take it
+// down from there (vy -0.129 at 6,713), where the model flew on through to 926.8.
+inline bool g_swingHeadCeil = true;
+// --swingceilmoved (default on since 2026-10): what the band's top does to a swing's vy, as checkCollisions writes it --
+// hitGround (vy 0) only when vy points into the top, and for an upside-down body the pre-clamp vy given back,
+// rounded to 1e-3, when the top moved since the last check (maxPortalY - layer +0x764 != 0, 0x2139b8).
+// --swingbandceil kept vy on every tick after the arrival, which is the moving top's case only: GD's mini swing
+// seated at 921 under a static top [630, 930] (a custom level t=6,749) reads vy 0 tick after tick, where the
+// model integrated 0.129 a tick; under the top at t=7,218, which rises 0.0002 .. 0.04 px, GD integrates.
+inline bool g_swingCeilMoved = true;
 // Ground-grow (was --groundgrow, always on since 2026-09-26):
 // a cube or ball that a size portal grows while it stands on the WORLD
 // ground is lifted to the new seat on the NEXT tick, by the ground clamp, not on the portal's own
@@ -784,6 +1188,15 @@ inline long long g_solidOrdDbgT0 = -1, g_solidOrdDbgT1 = -1;
 // t=986: a cube rising at 7.08 touches blue pad uid 340, which sits inside breakable block 429
 // (270..300); GD's row is upsideDown 1, y=255 (underside 270 - 15), vy 0, onGround 1. The model
 // flew on at 6.4 with its box 10 px into the block.
+// --padundoflip (default on since 2026-10): a ball's tap that a pad undoes is undone for these two landing
+// passes as well. Both compare the gravity with the one before the pads, which the model reads
+// after the tap has flipped it; GD's collision pass runs before its buttons, so the gravity before
+// the pads is the one from before the tap. A custom level t=14,058: a ball resting on a block taps
+// as its box enters a floor blue pad (25 x 6, 0.46 px of overlap). GD's row is upsideDown 1,
+// vy 3.84, onGround 0, y 0.029 under the face (the pad released the landing). The model undid the
+// tap and fired the pad, and pad-then-land then saw the gravity unchanged and vy along it and put
+// the ball back on the block with vy 0, so it rose a tick late at the ball's own gravity.
+inline bool g_padUndoFlip = true;
 // --spentorb uid,uid,... : the rings GD fired earlier in the attempt, oldest first, seeded into the
 // anchor state through noteRingFired. A ring fires once per attempt, but an anchored state starts
 // with usedOrb empty, so the model re-fired a ring GD had spent just before t0. Old custom level
@@ -791,6 +1204,15 @@ inline long long g_solidOrdDbgT0 = -1, g_solidOrdDbgT1 = -1;
 // GD fired a ring at 2,555..2,558 and, on the next press, the one beside it; the model fired the
 // spent one again. The mod's cfg dpspentorb passes the list (ringseed).
 inline std::vector<int> g_spentOrb;
+// --spentp2 (default on since 2026-10): ...and --spentorb2, the second body's, into its own ring memory (usedOrb2 /
+// usedOrbOld2 / usedOrbHist2, the halves swapHalves trades). GD keeps a ring's "fired" per body
+// (EnhancedGameObject::hasBeenActivatedByPlayer: +0x5b4 for p1, +0x5b5 for p2), and collisionCheckObjects
+// skips a ring that answers yes. --spentorb carried p1's alone, so an anchored model's p2 fired a ring GD's
+// p2 had spent: a custom level's dual cube took yellow ring 18683 at t=12,912 in GD (its act / actP went
+// 0 -> 1 that tick, on the ring's edge), and after the 12,918 anchor the model took it again at 12,938.
+// The mod passes --spentorb2 only to a call that does not carry --no-spentp2.
+inline std::vector<int> g_spentOrb2;
+inline bool g_spentP2 = true;
 // --histstat <file> (print only): after a replay, one line appended to <file> with how full the
 // fixed-length histories got and how often one dropped an entry: touchRing
 // (4 slots, --ringorder), portSeen (3, --portalonce), usedPad (4) and the fired-ring memory

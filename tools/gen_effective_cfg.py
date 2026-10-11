@@ -43,6 +43,10 @@ PARSERS = ("loadConfig", "loadDpCfg", "loadTraceCfg")
 # Keys whose branch sets nothing that could be printed, and why.
 UNRESOLVED = {
     "dpspentorb": "accepted and ignored (always on)",
+    "regionbox": "four floats into itermap::g_regionBox (print only, cfg regionat)",
+    "batchlog": "two ticks into itermap::g_batchFrom / g_batchTo (print only)",
+    "objwatch": "a uid list into itermap::g_objWatch (print only)",
+    "planfile": "a plan file (plan_io.hpp loadInputsFile): its last block into g_cfg.inputs, the earlier blocks into g_prelude",
 }
 # Keys that share one branch with others (`key == "a" || key == "b"`, the parser is at MSVC's
 # nesting ceiling) or set their variable through a helper: which variable each one sets. Every
@@ -62,6 +66,7 @@ SHARED = {
     "coins": ["g_cfg.coinMode"],
     "coinroute": ["g_cfg.coinRoute"],
     "coinwatch": ["g_cfg.coinWatch"],
+    "worldgates": ["g_cfg.worldGates"],
     "watchspeed": ["g_watchIdx"],
 }
 SHARED_REACH = 600   # characters after the key's test in which its variable must be named

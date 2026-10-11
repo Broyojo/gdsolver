@@ -1,6 +1,6 @@
 // seqcall -- call dp::cliMain more than once in one process.
 //
-// The mod does this (src/mod/dp_bridge.cpp): one GD process solves a level over dozens of
+// The mod does this (dp/src/dpcore.cpp): one GD process solves a level over dozens of
 // invocations, where the CLI gets a fresh process every time. Anything the solver leaves in a
 // namespace-scope global therefore reaches the mod's NEXT call and nobody else's, which makes
 // leaked state look exactly like a level the in-process loop cannot solve.
@@ -17,7 +17,7 @@
 //   seqcall --inproc <objrects> -- <args> [-- <args> ...]
 //
 // ...and the same with the level handed over the way the mod hands it: the file's bytes go into
-// dp::g_levelCsv before every call (dp_bridge.cpp's solveInProcess), so the caches that key on the
+// dp::g_levelCsv before every call (dpcore.cpp's solveInProcess), so the caches that key on the
 // level text are exercised as they are in the game. Give the groups "(in-process level)" as their
 // level argument, as the mod does.
 #include <cstdio>

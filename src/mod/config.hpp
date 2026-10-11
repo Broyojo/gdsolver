@@ -1,6 +1,7 @@
 #pragma once
 // Session configuration (autorun.cfg keys), data root, shared session state.
 #include "mod/prelude.hpp"
+#include <memory>
 
 namespace p1 {
 
@@ -144,6 +145,17 @@ struct Config {
     // (dphorizon) for when the run is stuck -- the inverse of the old habit. 0 = the old habit.
     // The no-death recording pass and the restart from the start still use the whole level.
     int dpStepHorizon = 3000;
+    // cfg `dpseed`: the seed handed to the search at the start of a level's run (dp_bridge
+    // runBegin). Part of the host's promise to a search: a method that draws random numbers draws
+    // them from this, so the same seed gives the same plan (dpsearch=montecarlo does; dp does not).
+    long long dpSeed = 0;
+    // cfg `dpsearch`: the search a call's answer comes from -- `dp` (the layer DP, the default),
+    // `beam` (the best states by the rules' score each tick, deterministic) or `montecarlo`
+    // (random rollouts; both in dp search_dp.hpp). The play menu's Options offers the same three.
+    // baseArgs passes it as --search. The cap ladder is the DP's own (it re-runs the search at
+    // other caps), so it is not passed for another method: montecarlo ignores the cap, and each
+    // re-run would draw another random sequence.
+    std::string dpSearch = "dp";
     // cfg `dpfastveto`: a round that flew EXACTLY the plan the round before flew, and died on the
     // same tick, drops the veto box at once instead of waiting for the fourth hit -- the search is
     // deterministic, so the repeat is not new evidence. Always on since the flag clean-up.
@@ -174,6 +186,22 @@ struct Config {
     // 3,210 while the band stays 90/414 for 112 ticks, and the credit fired at the teleport while
     // GD flew on (see offBoardTick).
     bool offBoardTp = true;
+    // cfg `offboardfree` (on by default since 2026-10-06; 0 = off): the off-board credit skips the
+    // rows recorded in Free Mode, where GD's band bounds no mode and says nothing about where the
+    // player is (see offBoardTick).
+    bool offBoardFree = true;
+    // cfg `offboardband` (on by default since 2026-10; 0 = off): the off-board credit also disarms on a
+    // row whose band moved by more than kOffBoardTpDy at either edge while the player did not -- a
+    // cutscene's zoom rewrites GD's band around the camera (see offBoardTick).
+    bool offBoardBand = true;
+    // cfg `anchorboardarm` (on by default since 2026-10; 0 = off): a ladder rung is "off the board" only by the
+    // test the off-board death credit uses (repair.hpp offBoardTick: the band counts once the
+    // player has been inside it in this attempt, a teleport disarms it, Free Mode rows are skipped),
+    // not by the raw band of the anchor's row. GD's band survives resetLevel, so an attempt can
+    // carry the band of a later section of an earlier one -- a custom level's anchors at
+    // t=2,469..3,990 (UFO, y 756..1,230) were all refused against a band of 3,180..3,450, the
+    // ladder fell back before a teleport at t=1,760, and the loop ran out of rungs there.
+    bool anchorBoardArm = true;
     // cfg `dpadaptivehorizon` (needs dpstephorizon): choose the next plan length from where the
     // game ended the last one. Killed within the step of its anchor = the model is wrong here, plan
     // the step; alive past it = the model is right here, plan the level. Always on since the flag clean-up.
@@ -382,6 +410,13 @@ struct Config {
     // SubZero, dpsecauto off: 16 of 20 walls on 4001 and 13 of 24 on 4002 took one round, at
     // 6.7 and 15.8 s a round, against a rung of about 12.5 s search plus its replays).
     bool dpSecSolved = false;
+    // cfg `dpsecrecaway` (on by default since 2026-10, needs dpsecauto; 0 = off): when the deepest wall's section solve
+    // is due on a round whose own death is away from that wall, the death's fixup recorder runs
+    // first and the section solve after it (the same record-then-rung path as dpsecsolved), instead
+    // of the section solve returning before the job that records. Off, a solved tail that dies
+    // short of the wall is never recorded while the wall keeps firing rungs: a custom level went
+    // four times round the same anchor, the same SOLVED tail and the same death before the veto.
+    bool dpSecRecAway = true;
     // cfg `dpsecreuse` (on; 0 = off): the rest of the plan a rung was fired from stays the rejoin target
     // of the search after the splice (g_rjKeepTarget in repair.hpp), so the next plan can come
     // back onto it and keep its inputs. Not pasted after the window: see the rung in
@@ -403,6 +438,22 @@ struct Config {
     // a clock. Spent, the loop's further rungs there are refused and the fixup loop carries on
     // (repair.hpp g_secEpisodeWork).
     double dpSecWallBudget = 0.0;
+    // cfg `dpunseenfirst` (off): when the rent first asks for a section solve and the search has
+    // not been told to enter the doors whose effect it has not seen (repair.hpp g_needUnseen), the
+    // loop turns that on and plays one more round instead; a wall that still holds then gets its
+    // rung. The two answers to a stalled wall were ordered by their triggers, not their cost.
+    bool dpUnseenFirst = false;
+    // cfg `dpseedpickups` (on; dpseedpickups=0 is the off arm): dp's --touchseed names the pickups
+    // (objrects type 30) the attempt had overlapped by t0 as well as the touch Toggles, so an anchor
+    // past a key that switches a group on opens that box (repair.hpp touchSeedArg).
+    bool dpSeedPickups = true;
+    // cfg `obbnolatch` (on; obbnolatch=0 is the off arm): the level export's obb.txt pass leaves every
+    // rotated object as it found it -- rect latch (m_shouldUseOuterOb), oriented box, both dirty bits
+    // and the cached rect -- and its oob column is the latch from before the pass (solver.hpp,
+    // buildPois). Off, a session that ran the export played every rotated object latched, which GD
+    // itself does only for what its load or a transform action latches: a rotated saw on SubZero
+    // 4002 killed seven ticks later than in a plain replay of the same plan.
+    bool obbNoLatch = true;
     // cfg `dpseccoinrung` (on; 0 = off; with dpsecauto, under coinroute): the rung's wall is the COIN WALL --
     // the last cut for a coin, on the plan that was cut there -- until GD credits that coin, and the
     // search there must take it (repair.hpp g_coinWall). Off, the rung goes to
@@ -446,6 +497,12 @@ struct Config {
     // placeholder that takes the same uids, so the copy numbers its objects as the level does
     // (slice.hpp "HOLDING THE UIDS"). Off removes it, which renumbers every object after it.
     bool sliceUids = true;
+    // cfg `slicekeepgroups` (on by default; `=0` restores the old copy): the placeholders keep their
+    // objects' groups and parent groups, so the copy's groups have the level's members, order and
+    // parents (slice.hpp g_placeholderGroups). Without it the copy runs the game's group logic on
+    // other groups than the level's: a plan lived past a spike in the copy and died on it in the
+    // level. Placeholders then move with their groups, which costs time on group-heavy levels.
+    bool sliceKeepGroups = true;
     // cfg `slicefirstref` (on by default since 2026-10; 0 = off): before a wall check's death is
     // read as the cut's, the plan is flown on a fresh copy and the level's flight is compared with
     // that first attempt instead of the copy's deepest attempt (level_slice.hpp onRefFlightEnd).
@@ -631,6 +688,13 @@ struct Config {
     // (-1): the settings menu's "Solve faster" decides between 3 and 0, and it is off by default
     // (repair.hpp start()).
     int dpPlainBeside = -1;
+    // cfg `dpsigcheck` (debug, 0 = off): every signature fileSig takes from g_sigKnown is checked
+    // against a scan of the file, and dp checks its groups-cache signature hits against the bytes
+    // (--groupsigcheck); a disagreement is printed. Measures nothing, slows every call.
+    int dpSigCheck = 0;
+    // cfg `gtrollcheck` (debug, 0 = off): at each grouptrace roll, the bytes the old copy would have
+    // written (hashed before the rename) against grouptrace_last.txt after it, one log line each.
+    int gtRollCheck = 0;
     // cfg `dpinputgrid` (1 = off): pass --inputgrid <n> to the searches, so the button changes only
     // on every n-th tick; repair.hpp baseArgs lifts it again once the loop escalates to a
     // capacity tier or restarts. 2 by default, measured with dpcapladder above.
@@ -638,6 +702,13 @@ struct Config {
     // cfg `dpphaseprof` (print only): time every call into dp (`dpcall:`) and pass --phaseprof to
     // the searches (`phaseprof: ... prep=`) -- repair.hpp timedSolve.
     bool dpPhaseProf = false;
+    // cfg `memcensus` (print only): a `memcensus:` line -- the process's private bytes and working set, and
+    // what the mod's main containers and the solver's caches hold allocated (MB), with the wall clock --
+    // after every round's [fp] line, at every session's start and end, when a section search is dropped,
+    // and when the level is left (repair.hpp memCensus). To result.txt and the Geode log: result.txt
+    // starts afresh at every session, the log keeps the whole game, so a growth can be traced to what
+    // the player was doing.
+    bool memCensus = false;
     // cfg `dpwatchfired=<uid>[,<uid>...]`: the dump's `firedw` column carries each listed
     // object's +0x28e byte (the flag checkSpawnObjects tests before it calls triggerObject)
     // on every tick. Empty by default, and then the column reads "-". Print only.
@@ -790,6 +861,8 @@ struct Config {
     // suites (coins on and off) came out identical to the key off -- the paths they take
     // do not reach such an anchor, so that is safety, not a measured gain.
     // With it off the payload is version 3, byte for byte, and the consumer is off.
+    // Version 5 (repair.hpp histPayload) adds the second body's dash to version 4, under
+    // this key too: a pair taking one dash ring together dashes both.
     bool histRide = true;
     // Seed an anchored solve's history values that --start does not carry
     // (dp's --anchor-state owns=hist; version 1 = the press latch ->
@@ -801,6 +874,78 @@ struct Config {
     // Observe the stair snap (checkSnapJumpToObject). For measuring the phenomenon where x
     // advances extra on the landing tick
     bool snapTrace = false;
+    // cfg snapnodesync (on by default; snapnodesync=0 is the off arm): with the visibility pass
+    // skipped (screen off), put the object a stair snap reads at its real position first
+    // (hooks_player, checkSnapJumpToObject). The convention is the real position, not the node a
+    // 1x run would show (that one lags by up to a render frame and so depends on the refresh rate).
+    // Scope: it acts only on a screen-off snap (visibilityPassOff()). With the screen on, nothing is
+    // synced, and an object caught mid-move is still read at the node the last render left, so a
+    // screen-on snap keeps depending on the render cadence.
+    bool snapNodeSync = true;
+    bool snapNodeLog = false;   // cfg snapnodelog=1: print a snap whose object's node is off its real position
+    // cfg singlereset (ON by default since 2026-10-07; singlereset=0 is the off arm): a reset that arrives when no physics has run since the layer's last
+    // reset does not rebuild the level again (the mod's own bookkeeping still runs). GD's death handler
+    // resets the level and the mod's next flight resets it again in the same frame, so one attempt cost two
+    // resets: a persistent item counted twice (Item Edit on a kept item), and a start trigger (x <= 0:
+    // Item Compare, Toggle) did not fire on the second one -- its group went back to its saved state and
+    // a custom level's start spike killed at t=1 on every flight (hooks_playlayer, resetLevel). A head reset
+    // also starts with the spawn bookkeeping cleared (m_spawnTuples, m_spawnTriggerActions): one that
+    // follows a checkpoint flight inherited the flight's, and the reset did not clear it.
+    bool singleReset = true;
+    // cfg resetlog (off; 1 = on): one result.txt line per PlayLayer::resetLevel, before and after the engine's
+    // reset: the attempt, what kind of reset it was, the persistent item table and each of its items' live
+    // value, the spawn bookkeeping (m_spawnTuples, m_spawnTriggerActions), and how many objects have their
+    // group disabled. Read-only (first 2000 resets). The instrument for "what does an attempt start from",
+    // to set a fast-mode attempt beside a person's (resets, persistent items, attempt sequences).
+    bool resetLog = false;
+    // cfg resetdump (off; print only): after each head reset, player 1's whole PlayerObject (`rdump:`), the layer's
+    // GJBaseGameLayer part (`rdumpL:`) and the GameObject part of the objects cfg resetdumpuids=a,b,c names
+    // (`rdumpO:`), as raw bytes, with every member's name, offset and size once (`rdmem:`) -- the state an attempt
+    // inherits before its first tick, for diffing two histories by name.
+    bool resetDump = false;
+    std::vector<int> resetDumpUids;
+    // cfg headbandfresh (on by default since 2026-10; 0 = off): a head reset sets the band top
+    // checkCollisions kept from its last pass (layer+0x764, m_gameState+0x5bc) to a fresh layer's 0. checkCollisions takes getMaxPortalY() minus it
+    // (0x213c4f) and treats the band as moved when that is not 0, so a fresh attempt's first pass sees the band
+    // move. resetLevel leaves the last attempt's value: on a custom level whose ship starts on its band floor, an
+    // attempt after a flight cut inside the start's band (390) holds the ship at vy 0 on t=2 where a fresh
+    // attempt, or one after a death in another band (570), keeps -0.069 -- the same inputs part from there.
+    // The dp flag --headbandfresh is the model's side of the same first pass.
+    bool headBandFresh = true;
+    // cfg persistworld=k (off = -1): every head reset starts from one fixed table of kept items. An
+    // Item Persistence trigger (3641) writes an item's value into GJEffectManager's kept table
+    // (m_persistentItemCountMap, +0x370; timers in m_persistentTimerItemSet, +0x3b0) when it fires
+    // (activatePersistentItemTrigger, 0x234a40), and every reset copies that table into the live counts
+    // (resetEffects -> transferPersistentItems, 0x262ed0). So an attempt starts with whatever the
+    // attempts before it left, the bootstrap record and every flight included, and a level that reads
+    // its kept items is a different level on each of them. With this cfg the table is replaced before
+    // each head reset by a fresh game's after k empty attempts: empty for k = 0, `persistitems` for
+    // k > 0 (that table as k empty attempts leave it -- cfg resetlog's `persistent{...}` on attempt
+    // k + 1 of a fresh game). A clear made this way is judged from a fresh game with the same k empty
+    // attempts first. The attempt count (item type 5) is not a kept item and is not fixed here (cfg
+    // attemptone fixes both, for k = 0, by not copying the table back at all); checkpoint restores are
+    // left as GD does them.
+    int persistWorld = -1;
+    // cfg persistitems=id:v,id:v (with persistworld=k > 0): the kept items of that world.
+    std::string persistItems;
+    // cfg voidband (on by default since 2026-10; 0 = off): a death at the end of a long run over EMPTY
+    // floor closes that run to the search (repair.hpp checkVoidRun). The ground plane under a level is
+    // alive in GD, so a body that falls out of the level's lane can run on it for thousands of ticks,
+    // and the loop's deepest-first takes that as progress until a catch at the end of the stretch
+    // kills it.
+    bool voidBand = true;
+    // cfg recprovchain (default off): --recprov names one attempt for the recording and the anchor's
+    // rows also when they are two attempts whose worlds agree up to a tick -- a checkpoint flight
+    // carries the world of the attempt that took the checkpoint up to its tick (repair.hpp,
+    // recProvArg) -- with the reach cut at that tick.
+    bool recProvChain = false;
+    // cfg cpfollowsection (on by default since 2026-10; 0 = off): a checkpoint restore puts each Follow Player Y object back in
+    // the collision section cell the flight had it in when the checkpoint was taken
+    // (hooks_gamelayer cpRestoreState). processPlayerFollowActions moves such an object without
+    // re-bucketing it, so a run from the head meets it only through the cell it was last bucketed in;
+    // the checkpoint load re-buckets it where it stands, and a flight from a checkpoint then met
+    // objects a run from the head does not.
+    bool cpFollowSection = true;
     bool hitboxTrace = false;   // record the hitboxes GD actually uses (cfg hitboxtrace=1)
     // cfg killersite=1: with every `killer:` line, where in GD the call came
     // from. `killer:` names the OBJECT, and an object-free death names nothing
@@ -864,6 +1009,13 @@ struct Config {
     // is flown again from its own latest checkpoint while the solve runs and compared with the head
     // flight (`cpflight: probe` lines). Print only.
     bool cpFlightProbe = false;
+    // cfg `cpactivation` (off by default): a checkpoint restore of the loop, the takeover and the seek
+    // bar puts every object's activation and the layer's active list back as the flight had them
+    // (cp_flight.hpp, AreaState).
+    // cfg `cpvisafter` (off by default): a checkpoint restore skips the visibility pass inside its reset
+    // and runs one after the camera is put back (hooks_playlayer updateVisibility, cpRestoreState).
+    bool cpVisAfter = false;
+    int cpActivation = 0;   // 1 = the flag only, 2 = through GD's transitions + the list (crashes the draw)
     // cfg `cpflightobj=<uid>` (print only): that object's area offsets, stamp and rect around each
     // checkpoint and restore of cfg cpflight (`cpflight: obj` lines).
     int cpFlightObj = -1;
@@ -955,16 +1107,32 @@ struct Config {
     // credited is ended there (hooks_gamelayer.cpp), the same verdict the search's miss prune
     // gives. Implies coinMode: GD's own pickup (the pickupItem hook) is what it reads.
     bool coinRoute = false;
+    // cfg `worldgates=1` (a measurement, default off): the level's item gates (Count, Tap, Item
+    // Compare and the pickups that feed them) are part of the model's world without coinroute too
+    // (dp --worldgates): the searches and the fixup replay get --worldgates and items.txt, and the
+    // anchors carry GD's item counters (--itembase). The coins themselves stay coinroute's.
+    bool worldGates = false;
     // cfg `coinwatch=1`: repeat the `coinlive:` line every 1,200 ticks. For the
     // question "when does this coin's collision rect move", which the once-per
     // -coin default cannot answer.
     bool coinWatch = false;
-    // cfg `areaenv=0` turns off the recording of where GD's own random numbers can put an Area
-    // Move's objects (solver/areaenv.hpp); the recording then holds this game's rects, as before.
-    // A diagnostic switch: without it the plan depends on the seeds of the game that recorded it.
-    bool areaEnv = true;
+    // cfg `areaenv=1` turns on the recording of where GD's own random numbers can put an Area
+    // Move's objects (solver/areaenv.hpp), which the model then treats as deadly. Off by default since
+    // 2026-10: the seeds are fixed while the mod drives (cfg rngfix), so the recording holds this
+    // game's rects and every attempt and replay meets the same ones. A plan played without the mod
+    // (another bot, no fixed seeds) can meet other positions.
+    bool areaEnv = false;
     // Music handling. continuous=keep the song playing / mute=silent / normal=untouched
     std::string music = "continuous";
+    // The human takeover (mod/takeover.hpp): fly the plan to a point, put the strict checkpoint
+    // there, and give the input to a person. cfg `takeover=<tick>` hands over at the first update
+    // boundary at or past that tick, cfg `takeoverx=<x>` once player 1's x has passed it (either
+    // arms it; neither = off). cfg `takeoverwait=<s>` is the stop before the person's run starts,
+    // after the checkpoint is taken and after every restore. A debugging instrument: what the
+    // person plays is measured, never solved from.
+    long long takeoverAt = -1;
+    float takeoverX = 0.f;
+    double takeoverWait = 1.0;
     std::vector<InputCmd> inputs;
     std::vector<ToggleCmd> toggles; // for verification D: switch mode at the given tick (calls
                                     // the same function a portal does)
@@ -1138,6 +1306,9 @@ inline void restoreProgress() {
 // into the session log)
 inline long long g_bgBlocked = 0, g_resignBlocked = 0;
 inline int g_attempt = 0;
+// ...and a serial that never restarts (g_attempt does, per level): which attempt a recording and an
+// anchor's rows came from, told apart across levels of one session (--recprov, repair.hpp).
+inline long long g_attemptSerial = 0;
 inline size_t g_nextInput = 0;
 // The input cursor as an attempt's first tick on the active layer found it (processCommands), and
 // whether that tick has come yet (cleared by the attempt's reset). 0 unless something took the
@@ -1158,6 +1329,88 @@ inline bool g_injecting = false;
 // still down. A gate on "is the player pressing" has to read this one.
 inline bool g_btnDown = false;
 inline std::chrono::steady_clock::time_point g_attemptStart;
+
+// The human takeover's state (the record writing is mod/takeover.hpp). Here, ahead of everything
+// that has to ask: the input block, the hotkeys, the HUD and the session reset. While a person
+// has the input the session stays open, so botDriving() -- and every block hung on it -- holds.
+namespace cpflight { struct Rec; }
+namespace takeover {
+inline bool armed() { return g_cfg.takeoverAt >= 0 || g_cfg.takeoverX > 0.f; }
+inline bool g_live = false;            // a person has the input (from the take to the mode's end)
+inline bool g_done = false;            // the mode has ended in this session (it does not re-arm)
+inline bool g_restoring = false;       // the reset that loads the checkpoint is running
+inline bool g_restorePending = false;  // a reset GD asked for, to be a restore at the frame boundary
+inline bool g_waiting = false;         // the stop before the person's run (cfg takeoverwait)
+inline std::chrono::steady_clock::time_point g_waitUntil{};
+// One strict checkpoint of the mode: the record (cp_flight.hpp), the inputs every attempt started
+// from it flies before it -- the plan up to it, and a release there if the button was held --,
+// where it was taken (a restore must land exactly there), and the lineage its per-tick rows come
+// from.
+struct Cp {
+    std::shared_ptr<cpflight::Rec> rec;
+    std::vector<InputCmd> before;
+    long long tick = -1;
+    float x = 0.f, y = 0.f, vy = 0.f;
+    int n = 0;             // 1 = the start point's, which is never removed
+    int dumpAttempt = 0;   // the session attempt that took it (dump.csv's attempt column)
+    int parent = 0;        // n of the checkpoint that attempt started from (0: the plan's flight)
+    const char* source = "";
+    // The game's own checkpoint this one stands for (compared, never dereferenced): when the game
+    // takes that one back, this one goes too.
+    const void* gdSrc = nullptr;
+};
+enum class TakeKind { Start, Now, Pending };
+inline std::vector<Cp> g_cps;          // the stack; [0] is the start point's
+inline int g_from = 0;                 // n of the checkpoint the attempt in progress started from
+inline int g_nextN = 0;                // the next checkpoint's n
+inline bool g_cpWanted = false;        // the game stored one of its own at once (Z, a checkpoint
+                                       // in the level, its on-ground auto checkpoint): a strict one
+                                       // at the next update boundary
+inline const void* g_wantedSrc = nullptr;   // ...the one it stored (compared, never dereferenced)
+// The game's auto checkpoints are two-step (PlayerObject::tryPlaceCheckpoint): created where it
+// judges the player safe and kept pending on the player (m_pendingCheckpoint), then stored only
+// once the player has outlived it for a while. A restore of it is a restore to the safe moment, so
+// the strict one is taken when the pending one appears and kept aside until the game stores that
+// one (committed) or lets it go (dropped).
+inline Cp g_pending;
+inline bool g_hasPending = false;
+inline const void* g_pendingSrc = nullptr;   // the game's pending checkpoint g_pending was taken for
+inline bool g_commitPending = false;         // ...which the game has just stored
+inline long long g_T = -1;             // the start point's tick
+inline std::vector<InputCmd> g_human;  // this attempt's own presses (jump, player 1)
+inline int g_other = 0;                // presses the plan format cannot carry (other buttons, 2P)
+inline int g_attemptNo = 0;            // the mode's attempts: 1 is the one that took the checkpoint
+inline int g_deaths = 0, g_restores = 0, g_missed = 0;
+inline std::string g_dir;              // this session's folder for the records ("" until the take)
+inline bool g_written = false;         // the attempt in progress has been written out
+inline std::string g_endWhy;           // why the mode ended (the HUD says so)
+// Still flying the plan towards the point (armed, not yet taken, not over).
+inline bool approaching() { return armed() && !g_live && !g_done && g_started && !g_sessionOver; }
+// A person, not the plan, is pressing now (the input block is lifted for them).
+inline bool personDriving() { return g_live && g_started && !g_sessionOver; }
+// GD asked for a reset while a person plays: it becomes a restore of the checkpoint.
+inline bool takesReset() { return g_live && !g_restoring && g_started && !g_sessionOver; }
+// The batch of update calls stops here: the checkpoint has just been taken or loaded, and the
+// person's run starts after the stop, at the next frame.
+inline bool stopsBatch() { return g_live && g_waiting; }
+inline void resetState() {
+    g_live = g_done = g_restoring = g_restorePending = g_waiting = g_cpWanted = false;
+    g_T = -1;
+    g_cps.clear();
+    g_pending = Cp{};
+    g_hasPending = g_commitPending = false;
+    g_pendingSrc = nullptr;
+    g_wantedSrc = nullptr;
+    g_from = g_nextN = 0;
+    g_human.clear();
+    g_other = g_attemptNo = g_deaths = g_restores = g_missed = 0;
+    g_dir.clear();
+    g_written = false;
+    g_endWhy.clear();
+}
+// Defined in mod/takeover.hpp (the key is polled in session_hotkeys.hpp, ahead of it).
+inline void endByKey();
+}  // namespace takeover
 
 // Live commands (data/cmd.txt): pause / resume / step N
 inline bool g_paused = false;
@@ -1382,6 +1635,33 @@ inline void rngFixApply() {
     *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva) =
         g_rngSeedSet ? g_rngSeedEF8 : kRngFixEF8;
 }
+// cfg `attemptone` (off; 1 = on): while the mod drives, every attempt is the level's first.
+// A level can read how many attempts have been made -- an Item Compare or Item Edit with an item
+// of type 5, which GJBaseGameLayer::getItemValue (0x2341c0) answers from the layer's attempt count
+// (+0x3084); its only callers are activateItemEditTrigger (0x234250) and
+// activateItemCompareTrigger (0x234630) -- and Item Persistence (3641) keeps chosen items across
+// attempts: GJEffectManager::resetEffects (0x25c020) copies the kept values (+0x378) back into
+// the live item map (+0x330) through transferPersistentItems (0x262ed0), and a checkpoint restore
+// (loadFromState, 0x2644a0) does the same. The loop records the moving geometry on one attempt and
+// flies its plans on later ones, and a solution is replayed as a session's first attempt, so such
+// a level is a different level on each of them. With this on, getItemValue answers the attempt
+// count a first attempt reads (0: the layer counts the attempts before the current one) and the
+// kept values are not copied back: every attempt, and every checkpoint
+// restore, sees the items a first attempt does (hooks_attempt.cpp, Windows only). A level that
+// opens only after dying in the right places cannot be solved this way; the play menu says the
+// solver takes the level as its first attempt. Playing a level yourself is untouched.
+inline bool g_attemptOne = false;
+// cfg `attemptcount=k` (off: -1): while the mod drives, getItemValue answers the attempt count as k on every
+// attempt (k counts the attempts before the current one, so k=1 reads as a session's second attempt) and leaves
+// Item Persistence alone. A level whose Item Compare reads the attempt count is then one level on every attempt,
+// including the first flight on the level itself after a slice swap, where the layer's own count starts over: on a
+// custom level the copy's flights read a later attempt and lived, and the level's first flight read 0 and died on
+// tick 1 to a spike the compare switches. k=1 is the world a judge with prelude 1 replays in. attemptone wins.
+inline long long g_attemptCount = -1;
+inline long long g_attemptReadsPinned = 0;     // attempt-count reads answered as on attempt 1 (or as k)
+inline long long g_attemptReadsSeen = 0;       // attempt-count reads this session (first 20 printed)
+inline long long g_persistTransfersSkipped = 0;   // kept-item copies not made
+inline bool attemptPinActive() { return botDriving() && g_attemptOne; }
 inline long long g_areaT0 = 0, g_areaT1 = -1;
 inline std::vector<int> g_areaUids;
 inline std::vector<GameObject*> g_areaObjs;
@@ -1400,6 +1680,11 @@ inline bool g_lagFired = false;
 inline long long g_visitSkips = 0;   // times the game-layer draw was skipped
 inline long long g_visitDraws = 0;   // times it actually drew
 inline long long g_pcCalls = 0;      // times processCommands was called (the physics entry point)
+// cfg singlereset: the layer and the g_pcCalls value of the last real PlayLayer::resetLevel, and how many
+// resets it skipped.
+inline const void* g_resetMarkLayer = nullptr;
+inline long long g_resetMarkPc = -1;
+inline long long g_resetsSkipped = 0;
 // Whether to stop all actions when toggling with F8 (cfg `watchpurge`). For A/B
 inline bool g_watchPurge = true;
 // Whether to remove all actions in endSession (cfg `endpurge`). Default 0.
@@ -1466,3 +1751,5 @@ inline void purgeDanglingActions() {
 }
 
 }  // namespace p1
+
+#include "mod/phase.hpp"   // the loop's named phases; needs writeResult's declaration above

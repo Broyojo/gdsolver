@@ -554,10 +554,6 @@ inline double slopeExitVy(double m, uint8_t mode, float dxF, bool mini) {
         // table at :436 and this branch, and stopping there, concluded that the
         // ship was unresolved and proposed measuring it. It is not unresolved;
         // it is two screens further down. The full list is at :529.
-        if (g_oldSlope) {
-            if (mini) return cubeExit * 0.625;
-            return ballFlipFor(dxF) + 0.598 * a;
-        }
         return cubeExit * 0.75;
     }
     // ...and the SWING is a non-cube mode, so it gets the same 0.75 the ball
@@ -642,7 +638,6 @@ inline double slopeExitVy(double m, uint8_t mode, float dxF, bool mini) {
 // `rideTicks` is the tick count at the EXIT tick: state.slopeT + 1 (the
 // counter is 0 on the contact tick, diff = exitTick - contactTick).
 inline double slopeRampFactor(int rideTicks) {
-    if (g_oldSlope) return 1.0;
     const double diff = rideTicks / 240.0;
     if (diff >= 0.1) return 1.0;
     return std::max(0.4, diff * 10.0);

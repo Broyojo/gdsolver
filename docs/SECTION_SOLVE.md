@@ -157,7 +157,19 @@ game's own checkpoint keeps it, so the group commands in progress (a Keyframe
 Animation's among them) come back with it (`secsnapem`); each body's buffered press
 as that point had it, rather than the one a held restore raises on both
 (`secjbkeep`); and at the head, a dash in progress from the plain flight, which the
-head's checkpoint load never has (`secheaddash`). Under snapshots, every 20 layers
+head's checkpoint load never has (`secheaddash`), and the plain flight's boost
+accumulator and pad flag, which the load leaves at a robot's "boost over" and at the
+run before's (`secheadaccel`). Where objects move, it also puts
+back the ones that can reach the player (`secwsnapauto`): what moved or changed pose
+under three input patterns at the head, and the grouped objects in reach that are
+not decoration, the reach carried to the window's horizon (`secwsnapset`, 5). Without
+them a node is expanded in the world the last stepped node left behind, and the
+plan's own branch can die on the snapshot before it did in the game. Over
+`secmaxmov` objects the set is dropped and the search runs on the player's snapshot
+alone; the `secsolve: wsnap set` line says which. The set makes every restore dearer,
+so a rung holds it back on its first ask and searches on the player's snapshot alone;
+only when that finds nothing is the same window asked again with the set put back
+(`secwsnapgate`). Under snapshots, every 20 layers
 each frontier node is replayed from the last checkpoint and dropped if it does not
 match: the snapshot's only known error is a missed death, so this can only remove
 false survivors.
@@ -284,8 +296,8 @@ The search's own keys (by hand; a rung sets what it needs): `sectarget`,
 2 sweep and decide), `secverifyevery` (0; a rung uses 20), `secslicems` (50),
 `secshaderskip` (1), `secforcesize` / `seckeepsize` (-1; 0 normal, 1 mini: start the
 search with player 1 at that size / drop every branch not at it). On by default and
-turned off with `=0`: `secsnapem`, `secjbkeep`, `secheaddash` (what the snapshot
-carries, §4), `secgracedash` (§5), `secrungcoinoff` and `secbookfirst` (see
+turned off with `=0`: `secsnapem`, `secjbkeep`, `secheaddash`, `secheadaccel`, `secwsnapauto`, `secwsnapgate` (what
+the snapshot carries, §4), `secgracedash` (§5), `secrungcoinoff` and `secbookfirst` (see
 [COINS.md](COINS.md#3-in-the-section-search)). The remaining `sec*` keys are
 measurement switches.
 

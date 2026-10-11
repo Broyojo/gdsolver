@@ -73,6 +73,18 @@ object before the area trigger moved the player's landing on the platform it
 moves. With the placeholders, every object of the copy has the level's uid, and
 the session checks that it does (`slice: uids ...`).
 
+A placeholder also keeps its object's groups and the groups it is the parent of
+(cfg `slicekeepgroups`). The game reads a group's members, not just the objects
+that can touch the player. It sends the only member of a moved group to a
+static group (a group of one member). A Move in target mode, a dynamic rotate
+and follow speed pick a random member by the group's count and order. The
+group's parent comes before both. Without the groups, a spike that shared its
+group with three decorations was alone in its group in the copy. The game then
+moved and bucketed it differently, and a plan lived past it in the copy and
+died on it in the level. The placeholders now move with their groups, which
+costs time on levels with many moved decorations (a section search took 30%
+longer on one).
+
 Before the port, the rule was checked on the level itself against the cut copy:
 the player's state agreed on every tick of known solutions of the four heaviest
 official levels and along a 24,733-tick route of a heavy custom level, and a
@@ -210,6 +222,7 @@ one of the level the session was started on.
 | `sliceaddbacks` | 2 | add-backs before the solve moves to the level itself |
 | `slicetriggers` | 1 | drop the triggers that can only act on what the run cannot depend on |
 | `sliceuids` | 1 | replace a left-out object by a placeholder with the same uids, so the copy numbers its objects as the level does |
+| `slicekeepgroups` | 1 | the placeholders keep their objects' groups and parent groups, so the copy's groups are the level's |
 | `slicenotouch` | 1 | decide an id built as a decoration and one other type per object, by No Touch |
 | `slicefirstref` | 1 | a wall check that does not end like the copy compares two first attempts (step 5) |
 | `slicegiveupcopy` | 1 | giving up at a wall the level shares goes on on a fresh copy, once per wall (step 6) |

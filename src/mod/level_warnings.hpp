@@ -25,52 +25,75 @@
 namespace levelwarn {
 
 enum : uint32_t {
-    // A teleport portal (2902) whose exit is away from it in x, with ignoreX off: x is the model's
-    // clock, so an exit elsewhere is a jump it cannot take (dp level_loader: "moves x to ... - NOT
+    // A teleport portal (2902) or a teleport trigger (3022) whose exit is away from it in x, with
+    // ignoreX off: x is the model's clock, so an exit elsewhere is a jump it cannot take (dp
+    // level_loader: "moves x to ... - NOT modelled", "teleporttrig: ... moving x sideways - NOT
     // modelled"). A 747 puts its exit above or below itself and is modelled.
     kSidewaysTeleport = 1u << 0,
-    // ignoreY (key 353, TeleportPortalObject::m_ignoreY): keep the player's height -- "uses ignoreY -
-    // NOT modelled" in the same loader.
-    kTeleportKeepsHeight = 1u << 1,
-    // A static force (key 345) or a redirected one (key 347): the portal sets the player's
-    // velocity. Neither the level export nor dp reads either field.
-    kTeleportPush = 1u << 2,
-    // A 2902 whose target group holds more than one object: teleportPlayer (0x20fdb0) draws one of
-    // them from the seed at 0x6c2ef8. The export takes the first; the model has no draw.
-    kTeleportSeveralExits = 1u << 3,
-    // The teleport orb (3027, GameObjectType::TeleportOrb) and the teleport trigger (3022): the
-    // export lists the orb as a point of interest and dp reads neither.
-    kTeleportOrb = 1u << 4,
-    kTeleportTrigger = 1u << 5,
-    // The 2.2 gravity trigger (2066): dp has no gravity multiplier.
-    kGravityTrigger = 1u << 6,
+    // A teleport orb (3027) with a static force (key 345) or a redirected one (key 347): it sets the
+    // player's velocity, which dp reads for a portal (--tppush, on) but not for an orb (its loader
+    // line: "sets a velocity - NOT modelled"). A portal's ignoreY (353) is modelled too
+    // (--tpkeepy, on); a portal's force or keep met in a turned frame or by a second player is not
+    // measured.
+    kOrbPush = 1u << 1,
+    // A 2902, a teleport orb (3027) or a teleport trigger (3022) whose target group holds more than
+    // one object: teleportPlayer (0x20fdb0) draws one of them from the seed at 0x6c2ef8. The export
+    // takes the first; the model has no draw.
+    kTeleportSeveralExits = 1u << 2,
+    // A teleport trigger (3022) dp leaves out: set off by touch or a spawn (keys 11 / 62) rather
+    // than by its x ("touch/spawn-triggered, not on the crossing queue - NOT modelled"), or one that
+    // keeps the player's offset from it (m_saveOffset, key 351), which the export does not carry.
+    // The trigger is modelled otherwise (dp --teleporttrig, on), as the teleport orb (3027) is
+    // (--teleportorb, on) apart from the shapes above; a second player or a turned frame meeting
+    // either is not measured, which the yellow note and dp's load lines cover.
+    kTeleportTrigger = 1u << 3,
+    // A gravity trigger (2066) dp leaves out. dp models the trigger (--gravtrig, on) when its x sets it off
+    // and it writes player 1: the loader's "gravtrig: ... NOT modelled" cases are one set off by touch or
+    // a spawn (keys 11 / 62: "touch/spawn-triggered, not on the crossing queue") and one that targets
+    // player 2 (key 200: "for player 2 only"). Any other 2066 is modelled and sets nothing here.
+    kGravityTrigger = 1u << 4,
     // A level the dp loader refuses for its gravity portals ("gravity portals: N (limit 128, ...)"
-    // in level_loader.hpp). The portal latch holds kGravPortalBits (128) of them; past that the
+    // in level_loader.hpp), the gravity toggle portal (2926) counted with the two kinds of gravity
+    // portal as the loader counts it. The portal latch holds kGravPortalBits (128) of them; past that the
     // loader shares bits -- portal j takes the bit of portal j-128 in x order -- unless an object
     // carries a reversal or some such pair is closer than kGpShareGap (120 px). Most levels over
     // 128 share fine, so this is set only when the sharing would fail: see gravityPortalsRefused.
-    kGravityPortals = 1u << 7,
+    kGravityPortals = 1u << 5,
     // The level itself runs differently from one attempt to the next: an Item Compare or Item Edit
     // (3620, 3619) that reads the attempt count (item type 5, keys 476/477; getItemValue 0x2341c0
     // reads it from the layer), or Item Persistence (3641), which keeps items across attempts. The
     // loop records the moving geometry on one attempt and flies its plans on later ones, and a
     // solution replayed as a session's first attempt meets a different level.
-    kAttemptDependent = 1u << 8,
-    kPlatformer = 1u << 9,
+    kAttemptDependent = 1u << 6,
+    kPlatformer = 1u << 7,
+    // Two-player mode (header kA10): the second player has a button of its own, and the bot presses
+    // only the first player's (handleButton with isPlayer1). dp has no such mode -- it gives both
+    // dual bodies the press, and links their gravity where flipGravity (0x212b00) does not in
+    // two-player mode -- so the second body is planned with presses the game never gives it.
+    kTwoPlayer = 1u << 8,
+    // A Follow Player Y (1814) with a delay (key 91) -- it follows the player's y that long ago,
+    // from a ring of past heights a state cannot carry -- or one set off by touch or by a spawn
+    // (keys 11 / 62) rather than by its x: dp cli.hpp's followy block says "NOT modelled: delayed"
+    // and "touch- or spawn-triggered".
+    kFollowNotRun = 1u << 9,
+    // More Follow Player Y runs at once than a state holds -- "NOT modelled: one more than a state's
+    // slots" in the same block. See followSlotsShort.
+    kFollowSlots = 1u << 10,
 };
 
 // The phrase each bit is shown as, in bit order.
 inline const char* const kUnmodelledNames[] = {
     "teleports that move you sideways",
-    "teleports that keep your height",
-    "teleports that push you",
+    "teleport orbs that push you",
     "teleports with several exits",
-    "teleport orbs",
-    "teleport triggers",
-    "gravity triggers",
+    "teleport triggers set off by touch or a spawn, or keeping an offset",
+    "gravity triggers set off by touch or a spawn, or for player 2",
     "too many gravity portals",
     "triggers that count attempts",
     "platformer mode",
+    "two-player mode",
+    "delayed, touch- or spawn-started follow triggers",
+    "more than two follow triggers at once",
 };
 
 // Objects added in 2.0 or later that are not a recolour of an older one. Derived, not listed by
@@ -153,14 +176,15 @@ struct GravPortal {
 };
 
 // The half width of a gravity portal's box as getObjectRect gives it to the export the loader
-// reads: the 25x75 hitbox (m_width, m_height), scaled by key 32 (both axes) or 128 / 129 (x / y)
-// and turned by key 6, which makes it the bound of the turned box, |w cos| + |h sin|. Keys
+// reads: the 25x75 hitbox (m_width, m_height) -- 23.75x75.5 for the gravity toggle portal (2926),
+// as every one of its rows in the export reads -- scaled by key 32 (both axes) or 128 / 129
+// (x / y) and turned by key 6, which makes it the bound of the turned box, |w cos| + |h sin|. Keys
 // 131 / 132 turn the two axes apart; then the larger |cos| and the larger |sin| of the angles
 // given are taken, which is never narrower than the box. Two keys for one axis (never seen) take
 // the larger scale. Checked against the export on 6,595 portals of a few hundred levels: x as
 // exported, and the half width within 0.01 px except on one portal whose axes are turned 29.75
 // and 29.76 degrees, where it comes out 0.013 px wider.
-inline double gravPortalHalfWidth(std::string_view obj) {
+inline double gravPortalHalfWidth(std::string_view obj, int id) {
     auto scale = [&](std::string_view axisKey) {
         double s = 0.0;
         bool given = false;
@@ -172,7 +196,8 @@ inline double gravPortalHalfWidth(std::string_view obj) {
         }
         return given ? s : 1.0;
     };
-    const double w = 25.0 * scale("128"), h = 75.0 * scale("129");
+    const bool toggle = id == 2926;
+    const double w = (toggle ? 23.75 : 25.0) * scale("128"), h = (toggle ? 75.5 : 75.0) * scale("129");
     double c = 0.0, s = 0.0;
     bool turned = false;
     for (std::string_view k : {"6", "131", "132"}) {
@@ -234,13 +259,62 @@ inline bool gravityPortalsRefused(std::vector<GravPortal> g, bool reversal) {
     return false;
 }
 
+// The per-tick x advance of a speed portal (dp speed.hpp dxForSpeedId); anything else is the normal
+// speed's.
+inline double speedDx(int id) {
+    switch (id) {
+        case 200: return 251.16 / 240.0;
+        case 202: return 1.6142578;
+        case 203: return 468.0 / 240.0;
+        case 1334: return 576.0 / 240.0;
+        default: return 1.29825044;
+    }
+}
+
+// Would the dp loader leave a Follow Player Y out for want of a slot? Its followy block (cli.hpp)
+// takes, in x order, each 1814 with a target group that is not touch- or spawn-triggered, not
+// delayed and not at speed 0, and gives it one of kFollowYSlots (2) slots free by its x; a run
+// holds its slot until x = its x + duration x 240 x the level's fastest per-tick advance, and one
+// that finds none is NOT modelled. From the string the answer may come out too eager, never too
+// shy: the fastest advance here also counts the start speed (the loader's does not), a missing
+// duration never ends, and a 1814 whose group holds nothing the model collides with, which the
+// loader drops without taking a slot, takes one here.
+struct FollowRun {
+    double x;
+    double dur;   // seconds
+};
+inline bool followSlotsShort(std::vector<FollowRun> runs, double dxMax) {
+    constexpr int kSlots = 2;   // dp: kFollowYSlots
+    std::sort(runs.begin(), runs.end(),
+              [](const FollowRun& a, const FollowRun& b) { return a.x < b.x; });
+    double freeAt[kSlots];
+    for (double& v : freeAt) v = -std::numeric_limits<double>::infinity();
+    for (const FollowRun& r : runs) {
+        int slot = -1;
+        for (int s = 0; s < kSlots; ++s)
+            if (freeAt[s] < r.x && (slot < 0 || freeAt[s] < freeAt[slot])) slot = s;
+        if (slot < 0) return true;
+        freeAt[slot] = r.x + r.dur * 240.0 * dxMax;
+    }
+    return false;
+}
+
 inline Findings scan(std::string_view all, bool platformer) {
     Findings r;
     if (platformer) r.unmodelled |= kPlatformer;
+    const std::string_view head = all.substr(0, all.find(';'));
+    if (field(head, "kA10") == "1") r.unmodelled |= kTwoPlayer;
     struct Portal { double x; int group; bool keepX; };
     std::vector<Portal> portals;
     std::vector<GravPortal> gravity;
     bool reversal = false;
+    std::vector<FollowRun> follows;
+    double dxMax = speedDx(201);
+    {
+        static constexpr int kStartSpeed[] = {201, 200, 202, 203, 1334};   // header kA4 0..4
+        const int s = toInt(field(head, "kA4"));
+        if (s >= 0 && s < 5) dxMax = std::max(dxMax, speedDx(kStartSpeed[s]));
+    }
     forEachObject(all, [&](std::string_view obj) {
         const int id = toInt(field(obj, "1"));
         if (isNewer(id)) {
@@ -251,21 +325,59 @@ inline Findings scan(std::string_view all, bool platformer) {
         // in the export): a No Touch portal is not a portal and a No Touch ring reverses nothing.
         if (!reversal && isOn(field(obj, "117")) && !isOn(field(obj, "121"))) reversal = true;
         switch (id) {
-            case 10: case 11:
+            // the gravity toggle portal (2926) takes a bit too: the loader counts it with the two
+            // gravity portals (dp --gravtoggle, on by default)
+            case 10: case 11: case 2926:
                 if (!isOn(field(obj, "121")))
-                    gravity.push_back({toNum(field(obj, "2")), gravPortalHalfWidth(obj)});
+                    gravity.push_back({toNum(field(obj, "2")), gravPortalHalfWidth(obj, id)});
                 break;
             case 747: case 2902:
-                if (isOn(field(obj, "345")) || isOn(field(obj, "347"))) r.unmodelled |= kTeleportPush;
-                if (isOn(field(obj, "353"))) r.unmodelled |= kTeleportKeepsHeight;
+                // a force (345 / 347) and ignoreY (353) are modelled (dp --tppush, --tpkeepy)
                 if (id == 2902) {
                     const int g = toInt(field(obj, "51"));
                     if (g > 0) portals.push_back({toNum(field(obj, "2")), g, isOn(field(obj, "352"))});
                 }
                 break;
-            case 3027: r.unmodelled |= kTeleportOrb; break;
-            case 3022: r.unmodelled |= kTeleportTrigger; break;
-            case 2066: r.unmodelled |= kGravityTrigger; break;
+            case 3027: {
+                // dp models the orb (--teleportorb) but not its force, and has no draw for a
+                // group of several; it moves x to the exit as the game does, so a sideways orb is
+                // modelled (the keepX below only keeps it out of that test)
+                if (isOn(field(obj, "345")) || isOn(field(obj, "347"))) r.unmodelled |= kOrbPush;
+                const int g = toInt(field(obj, "51"));
+                if (g > 0) portals.push_back({toNum(field(obj, "2")), g, true});
+                break;
+            }
+            case 3022: {
+                // dp moves it as the game does (--teleporttrig) when its x sets it off; one with a
+                // target goes through the exits test like a 2902 (sideways, several exits)
+                if (isOn(field(obj, "11")) || isOn(field(obj, "62")) || isOn(field(obj, "351")))
+                    r.unmodelled |= kTeleportTrigger;
+                const int g = toInt(field(obj, "51"));
+                if (g > 0) portals.push_back({toNum(field(obj, "2")), g, isOn(field(obj, "352"))});
+                break;
+            }
+            case 200: case 201: case 202: case 203: case 1334:
+                dxMax = std::max(dxMax, speedDx(id));
+                break;
+            case 1814:
+                if (toInt(field(obj, "51")) <= 0) break;
+                if (isOn(field(obj, "91")) || isOn(field(obj, "11")) || isOn(field(obj, "62"))) {
+                    r.unmodelled |= kFollowNotRun;
+                } else {
+                    const auto speed = field(obj, "90");
+                    const auto dur = field(obj, "10");
+                    if (speed.empty() || toNum(speed) > 0.0)
+                        follows.push_back({toNum(field(obj, "2")),
+                                           dur.empty() ? std::numeric_limits<double>::infinity()
+                                                       : toNum(dur)});
+                }
+                break;
+            case 2066:
+                // the loader's two refusals, read off the string (keys 11 / 62 touch / spawn, 200 player 2;
+                // checked against the export's touch / spawn / gpl columns on 457 triggers: no disagreement)
+                if (isOn(field(obj, "11")) || isOn(field(obj, "62")) || isOn(field(obj, "200")))
+                    r.unmodelled |= kGravityTrigger;
+                break;
             case 3641: r.unmodelled |= kAttemptDependent; break;
             case 3619: case 3620:
                 if (field(obj, "476") == "5" || field(obj, "477") == "5")
@@ -275,6 +387,7 @@ inline Findings scan(std::string_view all, bool platformer) {
         }
     });
     if (gravityPortalsRefused(std::move(gravity), reversal)) r.unmodelled |= kGravityPortals;
+    if (followSlotsShort(std::move(follows), dxMax)) r.unmodelled |= kFollowSlots;
     if (portals.empty()) return r;
     // The exits: every object in a portal's target group (key 57, '.'-separated).
     struct Exits { int n = 0; double x = 0.0; };

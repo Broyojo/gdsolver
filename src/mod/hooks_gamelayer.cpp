@@ -1,5 +1,7 @@
 // GJBaseGameLayer hook: tick control, fast loop, replay/serve, section solver, tracing.
 #include "mod/playlayer_helpers.hpp"
+#include "mod/profsample.hpp"
+#include <Geode/modify/GameObject.hpp>   // cfg objwatch: ActWatchObject
 // For PROCESS_MEMORY_COUNTERS's named fields -- the struct is only used through
 // GetProcAddress("K32GetProcessMemoryInfo"), so nothing links psapi.
 #ifdef GEODE_IS_WINDOWS
@@ -103,6 +105,20 @@ static void clearCheckpointsUnsectioned(PlayLayer* pl) {
 // and was withdrawn; read correctly it is the LIVE working set during the loop,
 // which is a completely different hypothesis (something held until the frame ends,
 // not something transient). No third guess: the struct has names.
+// The process's private bytes in MB (cfg seekcp's memory line); -1 where not measured.
+static long long privateMB() {
+#ifndef GEODE_IS_WINDOWS
+    return -1;
+#else
+    using Fn = int(__stdcall*)(HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD);
+    static Fn fn = (Fn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo");
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!fn || !fn(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1;
+    return (long long)(pmc.PagefileUsage / (1024 * 1024));
+#endif
+}
+
 static void procMemMB(size_t& cur, size_t& peak) {
 #ifndef GEODE_IS_WINDOWS
     cur = peak = 0;   // Windows only; 0 = not measured
@@ -241,8 +257,97 @@ static void printQueryHits(const char* tag, cocos2d::CCArray* arr) {
     writeResult(s);
 }
 
+// ---- The section hooks, on only where they can act ----
+//
+// updateObjectSection and removeObjectFromSection are hooked for the section search alone, yet GD
+// calls updateObjectSection for every object a move trigger moves, every tick. On a level that
+// moves tens of thousands of objects the hook's dispatch took about 80% of a screen-off replay
+// (cfg profsample, 2026-10-05: a heavy custom level's run through 9.4 s with it, 1.8 s without). So, under
+// cfg `sectionhooklazy` (on by default; 0 = always on, as before):
+//   * updateObjectSection's body acts only while a search runs (secsolve::g_active), so the hook is
+//     enabled exactly then -- every write of g_active goes through secsolve::setSearching, which
+//     calls back here before the search's first update;
+//   * removeObjectFromSection's body acts while secsolve::g_on, which only a session that can
+//     start a section search raises (a solve, a served worker, a cfg-driven section run), so it
+//     is enabled in those sessions. It is not hot.
+namespace {
+geode::Hook* g_updSecHook = nullptr;
+geode::Hook* g_remSecHook = nullptr;
+bool g_updSecOn = true, g_remSecOn = true;
+long long g_secHookFlips = 0;
+}
+inline void setSectionHook(geode::Hook* h, bool& on, bool want, const char* name) {
+    if (!h || on == want) return;
+    if (auto r = want ? h->enable() : h->disable(); r.isErr()) {
+        writeResult(std::string("sectionhooks: ") + name + (want ? " enable" : " disable")
+                    + " FAILED: " + r.unwrapErr());
+        return;
+    }
+    on = want;
+    if (++g_secHookFlips <= 4)
+        writeResult(std::string("sectionhooks: ") + name + (want ? " enabled" : " disabled")
+                    + " (t=" + std::to_string((long long)g_tick) + ")");
+}
+inline void syncSectionHooks() {
+    const bool lazy = itermap::g_sectionHookLazy;
+    setSectionHook(g_updSecHook, g_updSecOn, !lazy || secsolve::g_active, "updateObjectSection");
+    setSectionHook(g_remSecHook, g_remSecOn,
+                   !lazy || (g_started && (g_cfg.dpSolve || g_serveMode || secsolve::g_on)),
+                   "removeObjectFromSection");
+}
+
+// ---- cfg objwatch: who activates a watched object ----
+//
+// GameObject::activateObject (0x4a3b10) with a backtrace whenever a watched object (cfg objwatch) is
+// activated -- the path by which a checkpoint restore activates objects a head run never had activated
+// (SubZero 4002, uid 17999-18002 at t=20,404). Off unless objwatch is set: the hook is installed
+// disabled and enabled at the first frame of a session that watches.
+namespace {
+geode::Hook* g_actHook = nullptr;
+bool g_actHookOn = false;
+}
+class $modify(ActWatchObject, GameObject) {
+    static void onModify(auto& self) {
+        if (auto h = self.getHook("GameObject::activateObject")) {
+            g_actHook = h.unwrap();
+            g_actHook->setAutoEnable(false);
+        }
+    }
+    void activateObject() {
+        if (!itermap::g_objWatch.empty()
+            && std::find(itermap::g_objWatch.begin(), itermap::g_objWatch.end(), m_uniqueID)
+                   != itermap::g_objWatch.end()) {
+            auto* pl = PlayLayer::get();
+            char b[220];
+            snprintf(b, sizeof(b), "objwatch: activateObject uid=%d t=%lld player.x=%.2f restoring=%d run=%s%lld",
+                     m_uniqueID, (long long)g_tick, pl && pl->m_player1 ? pl->m_player1->getPositionX() : -1.f,
+                     (int)seekcp::g_restoring, seekcp::g_from < 0 ? "head" : "cp@",
+                     seekcp::g_from < 0 ? 0LL : seekcp::g_from);
+            writeResult(b);
+#ifdef GEODE_IS_WINDOWS
+            postmortem::writeBacktrace("objwatch-bt:");
+            // (A raw stack scan was tried here; it read past the stack's end inside updateVisibility's
+            // SEH guard and cut that pass short. The activation is updateVisibility's, as that showed.)
+#endif
+        }
+        GameObject::activateObject();
+    }
+};
+inline void syncActWatchHook() {
+    const bool want = !itermap::g_objWatch.empty();
+    if (!g_actHook || want == g_actHookOn) return;
+    if (auto r = want ? g_actHook->enable() : g_actHook->disable(); r.isOk()) g_actHookOn = want;
+}
+
 // ---- Tracing: frame / step structure ----
 class $modify(GJBaseGameLayer) {
+    static void onModify(auto& self) {
+        if (auto h = self.getHook("GJBaseGameLayer::updateObjectSection")) g_updSecHook = h.unwrap();
+        if (auto h = self.getHook("GJBaseGameLayer::removeObjectFromSection")) g_remSecHook = h.unwrap();
+        secsolve::g_onActive = [] { syncSectionHooks(); };
+        itermap::g_cpAhead = [](long long now, long long target) { return seekcp::aheadOf(now, target); };
+        itermap::g_cpLine = [] { return seekcp::summary(); };
+    }
     // The EXACT rect the spider's target search queries (cfg `hitboxtrace=1`,
     // `srect:`/`drect:` lines). spiderTestJumpInternal (win 0x3943f0) builds two
     // rects -- solids and damaging -- whose transverse anchoring in a rotated
@@ -386,9 +491,11 @@ class $modify(GJBaseGameLayer) {
         // line below is capped at 400 for the log's sake; the table is not --
         // a counter that stopped being recorded at the cap would tell a
         // re-anchored search the wrong number.
-        if (g_started && !g_sessionOver && g_cfg.coinRoute)
+        if (g_started && !g_sessionOver && (g_cfg.coinRoute || g_cfg.worldGates))
             solver::g_itemCounts[itemId] = value;
-        if (g_started && !g_sessionOver && g_cfg.coinMode
+        // (...and under cfg worldgates: the counters are what the gates read, and this line is the
+        // game's side of a gate-by-gate comparison with the model's countgate lines.)
+        if (g_started && !g_sessionOver && (g_cfg.coinMode || g_cfg.worldGates)
             && ++solver::g_coinLogLines <= 400) {
             char b[128];
             snprintf(b, sizeof(b), "itemcnt: t=%lld item=%d v=%d",
@@ -623,6 +730,15 @@ class $modify(GJBaseGameLayer) {
         }
         hookdepth::Guard hg(hookdepth::BGL_UPDATE);
         stallwatch::Mark sm(stallwatch::UPDATE);
+        // A prelude attempt's `until` (plan_io.hpp) restarts the level here at a frame boundary (the fast loop does
+        // the same between its updates).
+        if (g_preludeResetPending && g_preludePendingAttempt != g_attempt) g_preludeResetPending = false;
+        if (g_preludeResetPending && g_started && !g_sessionOver) {
+            g_preludeResetPending = false;
+            ++g_preludeResets;
+            ++g_finishedAttempts;   // the prelude attempt ended by its `until`
+            if (auto* pl = PlayLayer::get()) pl->resetLevel();
+        }
         if (secsolve::inFlight() && secsolve::g_sliceEnded)
             secsolve::g_outsideMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - secsolve::g_sliceEnd).count();
@@ -1353,6 +1469,9 @@ class $modify(GJBaseGameLayer) {
         // the head (mod/cp_flight.hpp).
         if (static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this && !secsolve::inFlight()) {
             if (cpflight::g_pending.rec) cpStart(PlayLayer::get());
+            // The human takeover: a reset GD asked for while the person played, made a restore
+            // of its checkpoint here, at the same boundary (mod/takeover.hpp).
+            if (takeover::g_restorePending) takeoverRestore(PlayLayer::get());
             if (cpflight::g_headPending) {
                 cpflight::g_headPending = false;
                 if (auto* pl = PlayLayer::get()) pl->resetLevel();
@@ -1383,8 +1502,21 @@ class $modify(GJBaseGameLayer) {
                 writeResult("secsolve: the level was rebuilt during the search - dropping it");
                 secsolve::g_task.destroy();
                 secsolve::g_taskLayer = nullptr;
-                secsolve::g_active = false;
+                secsolve::setSearching(false);
                 secsolve::g_noKill = false;
+            } else if (g_sessionOver) {
+                // The session ended while a search was suspended between slices -- a give-up, the
+                // `quit` command, the budget -- and nothing asked it to stop: it went on being resumed
+                // here to its own end, restoring and stepping the level for minutes after the solve was
+                // over (a custom level, 2026-10-09: 170 s past `session_end`, ~90,000 restores, each of
+                // which leaves memory behind). Leaving the level drops it (resetSessionState); this is
+                // every other way out. Dropped here, at the frame boundary, never from inside it.
+                const int before = postmortem::privateMB();
+                secsolve::reset();   // the task destroyed, its tables and checkpoints let go
+                writeResult("secsolve: the session ended during the search - dropped it (private "
+                            + std::to_string(before) + " -> " + std::to_string(postmortem::privateMB())
+                            + " MB)");
+                dpsolve::memCensus("search dropped");   // cfg memcensus (print only)
             } else {
                 secsolve::g_sliceStart = std::chrono::steady_clock::now();
                 if (secsolve::g_sliceEnded) {
@@ -1443,6 +1575,12 @@ class $modify(GJBaseGameLayer) {
             }
             return; // freeze game time completely
         }
+        // The human takeover's stop before the person's run (cfg takeoverwait), over on the wall
+        // clock: the game runs on from where the checkpoint holds it.
+        if (takeover::g_waiting && std::chrono::steady_clock::now() >= takeover::g_waitUntil) {
+            takeover::g_waiting = false;
+            g_paused = false;
+        }
         // Auto-stop just before a wall (cfg `pauseatx`). Meant for freezing the screen to
         // take a picture; it only stops, so physics is unaffected (update is not called
         // afterwards = time does not advance)
@@ -1454,6 +1592,21 @@ class $modify(GJBaseGameLayer) {
             writeResult("pauseatx: paused at x=" + std::to_string(m_player1->getPositionX())
                 + " y=" + std::to_string(m_player1->getPositionY())
                 + " tick=" + std::to_string((long long)g_tick));
+        }
+        // ...and by tick (cfg `pauseattick`), once per session, for two runs to be compared side by
+        // side at the same moment. Not during a seek: the stop is for the run that plays after it.
+        {
+            static bool s_tickFired = false;
+            if (!g_started) s_tickFired = false;
+            if (itermap::g_pauseAtTick > 0 && !s_tickFired && !g_paused && g_started && !g_sessionOver
+                && !itermap::seeking() && m_player1 && g_tick >= itermap::g_pauseAtTick) {
+                s_tickFired = true;
+                g_paused = true;
+                writeResult("pauseattick: paused at tick=" + std::to_string((long long)g_tick)
+                    + " x=" + std::to_string(m_player1->getPositionX())
+                    + " y=" + std::to_string(m_player1->getPositionY())
+                    + " run=" + (seekcp::g_from < 0 ? std::string("head") : "cp@" + std::to_string(seekcp::g_from)));
+            }
         }
         // While paused: do not call update at all, freezing game time. If a step was
         // requested, advance by exactly that much
@@ -1495,7 +1648,9 @@ class $modify(GJBaseGameLayer) {
                     // audio::sync only gets to pause it on the NEXT frame -- which is the blip of
                     // the track's first moment you hear on every rewind.
                     audio::muteForSeek();
-                    pl->resetLevel();
+                    // cfg seekcp: from the latest checkpoint at or before the target, if any
+                    if (!(itermap::g_seekTick >= 0 && seekCpRestore(pl, itermap::g_seekTick)))
+                        pl->resetLevel();
                     // ...and again on the OTHER side of it. The reset starts the song on a
                     // channel it creates itself, so the group silenced a line ago is not the
                     // group that is now playing (see hushNow).
@@ -1613,6 +1768,9 @@ class $modify(GJBaseGameLayer) {
         // The sequence is driven by the scheduler = by REAL frames, so everything that
         // reasons about it (the burn below, the fast loop's pacing, the stall guards) has
         // to read a wall clock, not ticks.
+        profsample::frame(g_started && !g_sessionOver);   // cfg profsample (off)
+        syncSectionHooks();                               // cfg sectionhooklazy (off)
+        syncActWatchHook();                               // cfg objwatch (print only)
         const bool lockedNow = g_started && !g_sessionOver && m_player1
                    && m_player1->m_isLocked && m_player1->getPositionX() > 500.f;
         const auto nowLock = std::chrono::steady_clock::now();
@@ -1703,10 +1861,19 @@ class $modify(GJBaseGameLayer) {
                     g_serveReset = false;
                     if (auto* pl = PlayLayer::get()) pl->resetLevel();
                 }
+                if (g_preludeResetPending && g_preludePendingAttempt != g_attempt) g_preludeResetPending = false;
+                if (g_preludeResetPending) {
+                    g_preludeResetPending = false;
+                    ++g_preludeResets;
+                    ++g_finishedAttempts;   // the prelude attempt ended by its `until`
+                    if (auto* pl = PlayLayer::get()) pl->resetLevel();
+                }
+                if (i > 0 && takeover::stopsBatch()) break;   // the takeover's checkpoint is in
                 { stallwatch::Mark gm(stallwatch::GD_UPDATE);
                   GJBaseGameLayer::update(g_cfg.fastdt); }
                 ++g_lastBatchCalls;
                 cpAfterUpdate();   // cfg cpflight: between two update calls, where a restore lands
+                takeoverAfterUpdate();
             }
         } else {
             // F8 spectating speed (1x/2x/4x). Rather than increasing dt, call several times
@@ -1729,10 +1896,14 @@ class $modify(GJBaseGameLayer) {
             // rewind replayed the plan into a death it does not have at 1x. 1/60 is the value
             // the solve's own verification replays use (cfg fastdt), where the plan reproduces
             // exactly, and it also makes the seek's speed independent of slow motion for free.
-            const bool seekNow = g_started && !g_sessionOver && itermap::seeking();
+            // A takeover session's approach to its point (mod/takeover.hpp) rides the same loop on
+            // the same terms: more calls, dt pinned. 0 outside one.
+            const int approach =
+                takeover::approachLoops(g_tick, m_player1 ? m_player1->getPositionX() : 0.f);
+            const bool seekNow = g_started && !g_sessionOver && (itermap::seeking() || approach > 0);
             const float stepDt = seekNow ? (1.f / 60.f) : dt;
             if (g_started && !g_sessionOver)
-                loops = std::max(loops, itermap::seekLoops(stepDt));
+                loops = std::max(loops, std::max(itermap::seekLoops(stepDt), approach));
             // The game is STOPPED: run nothing. Normally the pause branch far above has already
             // returned and this is unreachable -- but a seek that lands puts the stop back AFTER
             // that branch has been passed, so the arrival frame would run its ordinary batch on
@@ -1770,14 +1941,38 @@ class $modify(GJBaseGameLayer) {
                 }
                 g_endzoneBurn = true;
             }
+            const bool seekCounts = itermap::seeking();
+            if (seekCounts) ++itermap::g_seekFrames;
+            // cfg seekblind: screen off up to the last checkpoint slot at or before the target.
+            long long blindCut = -1;
+            if (seekCounts && itermap::g_seekBlind && !itermap::g_seekBlindDone && itermap::g_seekTick >= 0)
+                blindCut = seekBlindCut(itermap::g_seekTick);
+            itermap::g_seekBlindNow = blindCut > (long long)g_tick;
             for (int i = 0; i < loops; ++i) {
                 // `i > 0` is required: with an unconditional break, update is never called
                 // after the session ends and the game freezes. The only thing to stop is
                 // "keep running multiple times after the end"
                 if (i > 0 && g_sessionOver) break;
+                if (i > 0 && takeover::stopsBatch()) break;   // the takeover's checkpoint is in
+                // cfg seekvisevery: during a seek, the visibility pass runs on every Nth batch
+                // and on the frame's last, so what the draw walks is this frame's.
+                const int ve = itermap::g_seekVisEvery;
+                itermap::g_seekVisSkip = itermap::g_seekBlindNow
+                    || (seekCounts && ve > 1 && i + 1 < loops && (i % ve) != ve - 1);
                 stallwatch::Mark gm(stallwatch::GD_UPDATE);
                 GJBaseGameLayer::update(stepDt);   // pinned while seeking; see above
+                itermap::g_seekVisSkip = false;
+                if (seekCounts) ++itermap::g_seekBatches;
                 cpAfterUpdate();
+                takeoverAfterUpdate();
+                // The screen-off stretch ends at the cut (whose checkpoint cpAfterUpdate has just
+                // taken) or on a death before it: the rest runs from that checkpoint, loaded on
+                // the next frame by the restart branch, with the visibility pass back on.
+                if (itermap::g_seekBlindNow
+                    && ((long long)g_tick >= blindCut || !m_player1 || m_player1->m_isDead)) {
+                    endSeekBlind(blindCut);
+                    break;
+                }
             }
         }
         // Post-session heartbeat. "Freezes after replay" cannot be told from a hang, so
@@ -1831,7 +2026,8 @@ class $modify(GJBaseGameLayer) {
         // against callers other than the pauseGame hook). While paused no update arrives,
         // so this can only be noticed on the render side. Must come before the render
         // skip (after it, it would never run with skiprender=1)
-        if (g_started && !g_sessionOver) {
+        // Not while a person plays a takeover: their pause is a pause (the pause menu, focus lost).
+        if (g_started && !g_sessionOver && !takeover::personDriving()) {
             if (auto* pl = PlayLayer::get())
                 if (pl->m_isPaused) {
                     ++g_unfocusPauseBlocked;
@@ -1854,12 +2050,23 @@ class $modify(GJBaseGameLayer) {
         // the SCENE and is drawn either way, which is what the operator needs to see here.
         if (secsolve::inFlight()) { ++g_visitSkips; return; }
         if (g_endzoneBurn) { ++g_visitSkips; return; }   // burning the end animation (see below)
+        // A seek's screen-off stretch (cfg seekblind), and the frame it ended on: the visibility
+        // state stays stale until the checkpoint load on the next frame resets the level.
+        if (itermap::g_seekBlindNow || (itermap::g_seekBlindDone && itermap::g_seekRestart)) {
+            ++g_visitSkips; return;
+        }
         ++g_visitDraws;
         hookdepth::Guard hg(hookdepth::VISIT);
         // The first visit after a render skip walks over a stale visibility state, so it
         // goes through an SEH guard (render preparation only; unrelated to physics or
         // determinism)
+        const bool seekCounts = itermap::seeking();
+        const auto t0 = seekCounts ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
         safeVisit();
+        if (seekCounts)
+            itermap::g_seekDrawMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
     }
 
     void safeVisit() {
@@ -2138,7 +2345,9 @@ class $modify(GJBaseGameLayer) {
     // checkpoint stores the node: restored, the drawing offset became physics -- on a custom level the
     // checkpoint path jumped ~150 px on the tick after the mirror portal. Put the nodes on the
     // physics position for the call and back afterwards; outside a transition nothing moves.
-    CheckpointObject* markCheckpointAtPhys(PlayLayer* pl) {
+    // `createOnly`: the checkpoint is created and not stored (createCheckpoint instead of
+    // markCheckpoint, for the human takeover -- see takeoverMark).
+    CheckpointObject* markCheckpointAtPhys(PlayLayer* pl, bool createOnly = false) {
         PlayerObject* ps[2] = {m_player1, m_player2};
         cocos2d::CCPoint drawn[2];
         bool moved[2] = {false, false};
@@ -2151,7 +2360,7 @@ class $modify(GJBaseGameLayer) {
                 moved[i] = true;
             }
         }
-        CheckpointObject* cp = pl->markCheckpoint();
+        CheckpointObject* cp = createOnly ? pl->createCheckpoint() : pl->markCheckpoint();
         for (int i = 0; i < 2; ++i)
             if (moved[i]) ps[i]->setPosition(drawn[i]);
         return cp;
@@ -2162,7 +2371,9 @@ class $modify(GJBaseGameLayer) {
     // The game events our own checkpoints raise, dropped (see cpflight::g_inTake).
     void gameEventTriggered(GJGameEvent event, int material, int playerID) {
         if ((cpflight::g_inTake && event == GJGameEvent::Checkpoint)
-            || (cpflight::g_starting && event == GJGameEvent::CheckpointRespawn)) {
+            || (cpflight::g_starting && event == GJGameEvent::CheckpointRespawn)
+            || (takeover::g_restoring && event == GJGameEvent::CheckpointRespawn)
+            || (seekcp::g_restoring && event == GJGameEvent::CheckpointRespawn)) {
             ++cpflight::g_eventsDropped;
             return;
         }
@@ -2172,6 +2383,70 @@ class $modify(GJBaseGameLayer) {
     // After every update call: a checkpoint when one is due, and the end of a probe that has outlived
     // the flight it repeats.
     void cpAfterUpdate() {
+        // cfg objwatch=<uid>[,<uid>...] (print only): each watched object's toggle and section
+        // membership, printed when either changes, with the tick and the run.
+        if (!itermap::g_objWatch.empty() && m_objects && g_started && !g_sessionOver) {
+            static const void* s_layer = nullptr;
+            static std::vector<std::pair<GameObject*, int>> s_objs;   // object, last (disabled | in-section<<1)
+            if (s_layer != this) {
+                s_layer = this;
+                s_objs.clear();
+                for (auto* o : CCArrayExt<GameObject*>(m_objects))
+                    if (o && std::find(itermap::g_objWatch.begin(), itermap::g_objWatch.end(), o->m_uniqueID)
+                                 != itermap::g_objWatch.end())
+                        s_objs.emplace_back(o, -1);
+            }
+            // ...with the two bytes staticObjectsInRect (0x211260) tests before it takes an object --
+            // +0x305 (taken whatever its groups) and +0x28e (taken by an enabledGroups query only when 0)
+            // -- and the object's slot in its section against the section's live count (layer+0x3658),
+            // which bounds the query's walk.
+            for (auto& [o, last] : s_objs) {
+                const auto* ob = reinterpret_cast<const uint8_t*>(o);
+                const int b305 = ob[0x305], b28e = ob[0x28e];
+                // the slot and the live count of its section (removeObjectFromSection: +0x278 / +0x27c /
+                // +0x270; staticObjectsInRect: counts at layer+0x3658, sections at layer+0x35b0)
+                const int outer = *reinterpret_cast<const int*>(ob + 0x278);
+                const int inner = *reinterpret_cast<const int*>(ob + 0x27c);
+                const int slot = *reinterpret_cast<const int*>(ob + 0x270);
+                int liveCount = -1;
+                {
+                    const auto* lb = reinterpret_cast<const uint8_t*>(this);
+                    const long long xs = (*reinterpret_cast<const long long*>(lb + 0x35b8)
+                                          - *reinterpret_cast<const long long*>(lb + 0x35b0)) >> 3;
+                    const long long cv = *reinterpret_cast<const long long*>(lb + 0x3658);
+                    if (outer >= 0 && inner >= 0 && outer < xs && cv) {
+                        const long long vp = *reinterpret_cast<const long long*>(cv + (long long)outer * 8);
+                        if (vp) {
+                            const long long d0 = *reinterpret_cast<const long long*>(vp);
+                            const long long d1 = *reinterpret_cast<const long long*>(vp + 8);
+                            if (d0 && inner < (d1 - d0) / 4) liveCount = *reinterpret_cast<const int*>(d0 + (long long)inner * 4);
+                        }
+                    }
+                }
+                const int now = (o->m_isGroupDisabled ? 1 : 0) | (o->m_outerSectionIndex >= 0 ? 2 : 0)
+                                | (b305 ? 4 : 0) | (b28e ? 8 : 0) | ((slot < liveCount ? 1 : 0) << 4);
+                if (now == last) continue;
+                last = now;
+                writeResult("objwatch: t=" + std::to_string((long long)g_tick) + " uid=" + std::to_string(o->m_uniqueID)
+                            + " disabled=" + std::to_string(now & 1) + " sec=" + std::to_string(o->m_outerSectionIndex)
+                            + " b305=" + std::to_string(b305) + " b28e=" + std::to_string(b28e)
+                            + " sec=(" + std::to_string(outer) + "," + std::to_string(inner) + ") slot=" + std::to_string(slot)
+                            + " live=" + std::to_string(liveCount)
+                            + " run=" + (seekcp::g_from < 0 ? std::string("head") : "cp@" + std::to_string(seekcp::g_from)));
+            }
+        }        // cfg batchlog (print only): the ticks each update call ran, (end of the last call, now]
+        {
+            static long long s_prevEnd = -1;
+            if (itermap::g_batchFrom >= 0 && g_started && !g_sessionOver && g_tick >= itermap::g_batchFrom
+                && s_prevEnd <= itermap::g_batchTo) {
+                char b[200];
+                snprintf(b, sizeof(b), "batch: update ran t=%lld..%lld extraDelta=%.17g run=%s%lld", s_prevEnd + 1,
+                         (long long)g_tick, m_extraDelta, seekcp::g_from < 0 ? "head" : "cp@",
+                         seekcp::g_from < 0 ? 0LL : seekcp::g_from);
+                writeResult(b);
+            }
+            s_prevEnd = g_tick;
+        }
         // cfg cpflightlayerdiff: the layer's and player 1's bytes after the calls that follow a
         // checkpoint, recorded by the flight that took it and compared by a flight restored from it
         if (g_cfg.cpFlightLayerDiff && m_player1 && cpflight::g_diffStep < cpflight::kDiffSteps) {
@@ -2209,6 +2484,7 @@ class $modify(GJBaseGameLayer) {
         }
         if (cpflight::g_next >= 0 && g_tick >= cpflight::g_next)
             if (auto* pl = PlayLayer::get(); pl && static_cast<GJBaseGameLayer*>(pl) == this) cpTake(pl);
+        seekCpAfterUpdate();
         cpflight::nodeWatch(this, g_tick, nullptr);
         // the probe's control at the boundary where the probe's checkpoint was taken: its carry state,
         // for the comparison with the probe's right after the restore (cpflight::compareCarryFull)
@@ -2226,6 +2502,617 @@ class $modify(GJBaseGameLayer) {
                                              "outlived the probe"));
             g_paused = true;
         }
+    }
+
+    // ---- the strict checkpoint: shared by the loop's flights and the human takeover ----
+    //
+    // What a restore needs beyond GD's own checkpoint (cp_flight.hpp names each gap these close).
+    // One definition for both users, so a gap closed for the loop's flights is closed for the
+    // takeover too.
+
+    // cfg cpfollowsection: the layer's Follow Player Y objects -- everything in a group some 1814
+    // targets -- worked out once per layer (its object array does not change while it lives).
+    std::vector<GameObject*>& followSectObjects() {
+        static const void* layerOf = nullptr;
+        static const void* arrayOf = nullptr;
+        static size_t countOf = 0;
+        static std::vector<GameObject*> objs;
+        const size_t n = m_objects ? (size_t)m_objects->count() : 0;
+        if (layerOf == this && arrayOf == m_objects && countOf == n) return objs;
+        layerOf = this;
+        arrayOf = m_objects;
+        countOf = n;
+        objs.clear();
+        if (!m_objects) return objs;
+        std::unordered_set<int> groups;
+        for (auto* o : CCArrayExt<GameObject*>(m_objects))
+            if (o && o->m_objectID == 1814)
+                if (auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(o); e && e->m_targetGroupID > 0)
+                    groups.insert(e->m_targetGroupID);
+        if (groups.empty()) return objs;
+        for (auto* o : CCArrayExt<GameObject*>(m_objects)) {
+            if (!o || o->m_groupCount <= 0 || !o->m_groups) continue;
+            for (int i = 0; i < std::min((int)o->m_groupCount, 10); ++i)
+                if (groups.count((*o->m_groups)[i])) {
+                    objs.push_back(o);
+                    break;
+                }
+        }
+        return objs;
+    }
+    // The object's collision section cell, x and y (GJBaseGameLayer::updateObjectSection 0x227f50
+    // compares (int)(scale * m_positionX / Y) with these two and re-buckets on a difference).
+    static int& sectionCellX(GameObject* o) { return *reinterpret_cast<int*>(reinterpret_cast<char*>(o) + 0x278); }
+    static int& sectionCellY(GameObject* o) { return *reinterpret_cast<int*>(reinterpret_cast<char*>(o) + 0x27c); }
+
+    // The state GD's checkpoint does not carry, taken where the physics stands.
+    void cpCaptureState(PlayLayer* pl, cpflight::Rec& r) {
+        psnap::captureRaw(m_player1, this, r.player);
+        secCaptureDash(r.dash);
+        if (m_player2) secCaptureDash(r.dash2, m_player2);
+        psnap::captureTouch(m_player1, r.touch, this);
+        r.damageVerified = pl->m_damageVerified;
+        {
+            auto hb = m_player1->m_holdingButtons.find(1);
+            r.held = (hb != m_player1->m_holdingButtons.end() && hb->second) ? 1 : 0;
+        }
+        r.oobLatch = (int)(unsigned char)reinterpret_cast<const char*>(m_player1)[kOobLatchOff];
+        r.nextInput = g_nextInput;
+        r.nextToggle = g_nextToggle;
+        {
+            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+            r.seedTrig = *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva);
+            r.seedVarIndex = *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva);
+            r.seedVarTable = *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva);
+            r.seedKept = *reinterpret_cast<long long*>(reinterpret_cast<char*>(this)
+                                                       + gdoff::kLayerRandomSeed);
+        }
+        cpflight::captureCamera(this, r.camera);
+        cpflight::captureArea(this, r.area);
+        // cfg cpfollowsection: where the flight has each Follow Player Y object bucketed -- the
+        // flight's own history of re-buckets (Move triggers do, the follow does not), which is a run
+        // from the head's as long as the flights before it kept to that too
+        r.followCells.clear();
+        if (g_cfg.cpFollowSection)
+            for (GameObject* o : followSectObjects())
+                r.followCells.push_back({o, sectionCellX(o), sectionCellY(o)});
+    }
+
+    // GD's own checkpoint for the record, taken out of GD's list at once so that no reset of GD's
+    // own can load it. False: GD gave none (markCheckpoint returned 0).
+    bool cpMark(PlayLayer* pl, cpflight::Rec& r) {
+        cpflight::g_inTake = true;
+        CheckpointObject* cp = markCheckpointAtPhys(pl);
+        cpflight::g_inTake = false;
+        if (!cp) return false;
+        cp->retain();
+        r.cp = cp;
+        r.layer = pl;
+        r.objects = pl->m_objects ? (size_t)pl->m_objects->count() : 0;
+        clearCheckpointsUnsectioned(pl);
+        return true;
+    }
+
+    // After the reset that loaded the record's checkpoint: what that load does not put back. The
+    // caller stored the checkpoint and ran the reset; the cursors and the tick are the caller's.
+    // `diag`: the loop's cfg cpflightobj line between the camera and the objects.
+    void cpRestoreState(PlayLayer* pl, const cpflight::Rec& r, bool diag) {
+        clearCheckpointsUnsectioned(pl);
+        pl->m_queuedButtons.clear();
+        if (r.held) {
+            m_player1->m_holdingButtons[1] = true;
+            if (m_player2) m_player2->m_holdingButtons[1] = true;
+        }
+        psnap::restore(m_player1, this, r.player.data());
+        secRestoreDash(r.dash);
+        if (m_player2) secRestoreDash(r.dash2, m_player2);
+        psnap::restoreTouch(m_player1, r.touch, this);
+        // ...and the two object pointers restoreTouch leaves to cfg secsnapobj: the object the
+        // player is snapped to and the one it collided with. A restore of the loop is on the same
+        // layer, whose objects are never re-created, so they are carried. Measured on lv22 at t=600
+        // without them: the rows after the restore took a different m_snapDistance from t=602.
+        m_player1->m_objectSnappedTo = r.touch.objectSnappedTo;
+        m_player1->m_collidedObject = r.touch.collidedObject;
+        if (m_player2 && r.touch.second) {
+            m_player2->m_objectSnappedTo = r.touch.second->objectSnappedTo;
+            m_player2->m_collidedObject = r.touch.second->collidedObject;
+        }
+        pl->m_damageVerified = r.damageVerified;
+        reinterpret_cast<char*>(m_player1)[kOobLatchOff] = (char)r.oobLatch;
+        {
+            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+            *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva) = r.seedTrig;
+            *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva) = r.seedVarIndex;
+            *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva) = r.seedVarTable;
+            *reinterpret_cast<long long*>(reinterpret_cast<char*>(this) + gdoff::kLayerRandomSeed) =
+                r.seedKept;
+        }
+        cpflight::restoreCamera(this, r.camera);
+        if (diag) cpflight::objLine(this, "reset", r.tick);
+        cpflight::restoreArea(this, r.area);
+        // cfg groupcheck (print only): each object's toggle and section membership against what the
+        // flight had at the checkpoint (seekcp records them at the take, g_toggles). The first try at a
+        // fix took switched-off objects out of their sections here and crashed the worker:
+        // removeObjectFromSection does not clear the object's section index, so GD's own next
+        // updateObjectSection removed it a second time (2026-10-06, SubZero 4002). And a head run keeps
+        // switched-off objects in sections too (85 of them at 4002's t=20,400), so "off means out" is
+        // not GD's rule.
+        if (itermap::g_groupCheck) groupToggleDiff(r);
+        // cfg cpvisafter (off by default): the visibility pass the restore's reset would have run is
+        // run here instead, now that the camera is the flight's (see hooks_playlayer updateVisibility).
+        if (g_cfg.cpVisAfter) pl->updateVisibility(0.f);
+        // cfg cpfollowsection: the checkpoint load re-buckets every object where it stands; put each
+        // Follow Player Y object back in the cell the flight had it in. GD's own re-bucket is the
+        // only tool that keeps the section lists and the indices in step (a bare removal crashed a
+        // worker on 2026-10-06, the groupcheck note above), so the position is lent for the call:
+        // the cell's centre, updateObjectSection, the real position back.
+        if (g_cfg.cpFollowSection && !r.followCells.empty()) {
+            const float kx = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(this) + 0x36a0);
+            const float ky = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(this) + 0x36a4);
+            int moved = 0, already = 0, outside = 0, notStart = 0;
+            if (kx > 0.f && ky > 0.f) {
+                for (const auto& fc : r.followCells) {
+                    GameObject* o = fc.obj;
+                    if (!o || fc.sx < 0 || sectionCellX(o) < 0) { ++outside; continue; }
+                    // print only: whether the checkpoint's cell is the load-time one (a Move trigger
+                    // re-buckets on its way, so the two part where one moved the object)
+                    {
+                        auto cellOf = [](double p, float k) {
+                            return p <= 0.0 ? 0 : (int)((double)k * std::min(p, 1.0e7));
+                        };
+                        if (cellOf(o->m_startPosition.x, kx) != fc.sx || cellOf(o->m_startPosition.y, ky) != fc.sy)
+                            ++notStart;
+                    }
+                    if (sectionCellX(o) == fc.sx && sectionCellY(o) == fc.sy) { ++already; continue; }
+                    const double px = o->m_positionX, py = o->m_positionY;
+                    o->m_positionX = ((double)fc.sx + 0.5) / (double)kx;
+                    o->m_positionY = ((double)fc.sy + 0.5) / (double)ky;
+                    this->updateObjectSection(o);
+                    o->m_positionX = px;
+                    o->m_positionY = py;
+                    ++moved;
+                }
+            }
+            char b[256];
+            snprintf(b, sizeof(b), "cpfollowsection: the restore at t=%lld put %d of %zu Follow Player Y "
+                     "object(s) back in their checkpoint cells (%d already there, %d outside any section; "
+                     "%d checkpoint cell(s) are not the load-time one)",
+                     r.tick, moved, r.followCells.size(), already, outside, notStart);
+            writeResult(b);
+        }
+    }
+
+    // The objects whose toggle (m_isGroupDisabled) or section membership (m_outerSectionIndex >= 0)
+    // differs from the record taken with the checkpoint: counts and the first uids, each with
+    // (disabled, in-section) at the checkpoint and now.
+    void groupToggleDiff(const cpflight::Rec& r) {
+        auto it = seekcp::g_toggles.find(&r);
+        if (it == seekcp::g_toggles.end() || !m_objects) {
+            writeResult("groupcheck: no toggle record for the checkpoint at t=" + std::to_string(r.tick));
+            return;
+        }
+        const auto& rec = it->second;
+        size_t i = 0;
+        int flagDiff = 0, secDiff = 0;
+        std::string s;
+        for (auto* o : CCArrayExt<GameObject*>(m_objects)) {
+            if (i >= rec.size()) break;
+            const uint8_t was = rec[i++];
+            if (!o) continue;
+            const uint8_t now = (uint8_t)((o->m_isGroupDisabled ? 1 : 0) | (o->m_outerSectionIndex >= 0 ? 2 : 0));
+            if (now == was) continue;
+            if ((now ^ was) & 1) ++flagDiff;
+            if ((now ^ was) & 2) ++secDiff;
+            if (flagDiff + secDiff <= 16)
+                s += " " + std::to_string(o->m_uniqueID) + "(" + std::to_string(was & 1) + std::to_string((was >> 1) & 1)
+                     + "->" + std::to_string(now & 1) + std::to_string((now >> 1) & 1) + ")";
+        }
+        writeResult("groupcheck: after the restore at t=" + std::to_string(r.tick) + " toggle differs on "
+                    + std::to_string(flagDiff) + ", section on " + std::to_string(secDiff)
+                    + " object(s) [uid(disabled,in-section) at the checkpoint -> now]:" + s);
+    }
+
+    // cfg groupcheck (print only): the objects whose section membership disagrees with their toggle --
+    // switched off but in a section, and switched on but in none -- with the first few uids of each.
+    void groupSectionCheck(const char* when, long long t) {
+        if (!m_objects) return;
+        int offIn = 0, onOut = 0;
+        std::string offUids, onUids;
+        for (auto* o : CCArrayExt<GameObject*>(m_objects)) {
+            if (!o) continue;
+            const bool in = o->m_outerSectionIndex >= 0;
+            if (o->m_isGroupDisabled && in) {
+                if (++offIn <= 8) offUids += " " + std::to_string(o->m_uniqueID);
+            } else if (!o->m_isGroupDisabled && !in) {
+                if (++onOut <= 8) onUids += " " + std::to_string(o->m_uniqueID);
+            }
+        }
+        writeResult("groupcheck: " + std::string(when) + " t=" + std::to_string(t) + " run="
+                    + (seekcp::g_from < 0 ? std::string("head") : "cp@" + std::to_string(seekcp::g_from))
+                    + " off-but-in-a-section=" + std::to_string(offIn) + offUids
+                    + " | on-but-in-none=" + std::to_string(onOut) + onUids);
+    }
+
+    // ---- the human takeover (mod/takeover.hpp) ----
+
+    // The game's checkpoint for a takeover record: created where the physics stands and NOT stored.
+    // cpMark's markCheckpoint also clears the queued Z press (PlayLayer+0x3a64) and dims the previous
+    // checkpoint's marker -- the game's own practice state, which the person is using -- so the
+    // takeover asks only for the checkpoint itself (createCheckpoint, which tryPlaceCheckpoint also
+    // calls on its own). It is stored by the restore that loads it, as cpStart stores the loop's.
+    bool takeoverMark(PlayLayer* pl, cpflight::Rec& r) {
+        cpflight::g_inTake = true;
+        CheckpointObject* cp = markCheckpointAtPhys(pl, true);
+        cpflight::g_inTake = false;
+        if (!cp) return false;
+        cp->retain();
+        r.cp = cp;
+        r.layer = pl;
+        r.objects = pl->m_objects ? (size_t)pl->m_objects->count() : 0;
+        return true;
+    }
+
+#ifdef GEODE_IS_WINDOWS
+    // The members the takeover reads by name, at the offsets the disassembly reads them at
+    // (tryPlaceCheckpoint 0x3a32d0 keeps the pending checkpoint at player+0x890; handleButton
+    // 0x2338e0 reads two-player mode at levelSettings+0x154).
+    static_assert(offsetof(PlayerObject, m_pendingCheckpoint) == 0x890, "PlayerObject::m_pendingCheckpoint");
+    static_assert(offsetof(LevelSettingsObject, m_twoPlayerMode) == 0x154, "LevelSettingsObject::m_twoPlayerMode");
+#endif
+
+    // After every update call of a takeover session: the start point's checkpoint once the point is
+    // reached; later, a strict checkpoint for each one the game places. Taken between two update
+    // calls, where a restore also lands, as the loop's are (cpTake).
+    void takeoverAfterUpdate() {
+        if (secsolve::g_active) return;
+        const bool start = takeover::approaching();
+        if (!start && !(takeover::personDriving() && !takeover::g_waiting)) return;
+        auto* pl = PlayLayer::get();
+        if (!pl || static_cast<GJBaseGameLayer*>(pl) != this || !m_player1) return;
+        if (pl->m_playerDied || m_player1->m_isDead) {
+            if (!start) {   // whatever the attempt that died had asked for goes with it
+                takeover::g_cpWanted = false;
+                takeover::dropPending();
+            }
+            return;
+        }
+        if (start) {
+            const bool atTick = g_cfg.takeoverAt >= 0 && g_tick >= g_cfg.takeoverAt;
+            const bool atX = g_cfg.takeoverX > 0.f && m_player1->getPositionX() >= g_cfg.takeoverX;
+            if (atTick || atX) takeoverTake(pl, takeover::TakeKind::Start);
+            return;
+        }
+        // The game stored its pending checkpoint: the strict one taken when it appeared goes in.
+        if (takeover::g_commitPending) takeover::commitPending();
+        // The game stored one at once (Z, a checkpoint in the level): a strict one here.
+        if (takeover::g_cpWanted) {
+            takeover::g_cpWanted = false;
+            takeoverTake(pl, takeover::TakeKind::Now);
+        }
+        // The game began a pending checkpoint (its auto setting), or let one go: the strict one is
+        // taken now, at the moment the game judged safe, and kept aside until the game decides.
+        const void* pend = m_player1->m_pendingCheckpoint;
+        if (pend != takeover::g_pendingSrc) {
+            takeover::dropPending();
+            if (pend) {
+                takeoverTake(pl, takeover::TakeKind::Pending);
+                takeover::g_pendingSrc = pend;
+            }
+        }
+    }
+
+    // One strict checkpoint where the physics stands: the start point's, which hands the input
+    // over; one for a checkpoint the game stored at once; or one kept aside for its pending one.
+    void takeoverTake(PlayLayer* pl, takeover::TakeKind kind) {
+        const bool start = kind == takeover::TakeKind::Start;
+        const long long T = g_tick;
+        takeover::Cp c;
+        c.rec = std::make_shared<cpflight::Rec>();
+        c.rec->tick = T;
+        cpCaptureState(pl, *c.rec);
+        if (!takeoverMark(pl, *c.rec)) {
+            if (start) {
+                takeover::g_done = true;
+                takeover::line("refused: GD gave no checkpoint at t=" + std::to_string(T)
+                               + " - the mode is off for this session");
+            } else {
+                takeover::line("no checkpoint: GD gave none at t=" + std::to_string(T));
+            }
+            return;
+        }
+        // The inputs an attempt from here flies before the person: those of step < T, which are
+        // the ones fed so far (processCommands feeds step <= g_tick and then advances the tick) --
+        // the plan's at the start point, then the person's own -- and a release at T if the button
+        // was held: the person is not holding the key after a restore, and a hold nobody releases
+        // would carry into their run.
+        if (start) {
+            c.before.assign(g_cfg.inputs.begin(), g_cfg.inputs.begin()
+                            + (std::ptrdiff_t)std::min(g_nextInput, g_cfg.inputs.size()));
+        } else {
+            for (const InputCmd& in : takeover::attemptPlan())
+                if (in.step < T) c.before.push_back(in);
+        }
+        if (c.rec->held) c.before.push_back({(int)T, false});
+        c.tick = T;
+        const auto pos = m_player1->getPosition();
+        c.x = pos.x;
+        c.y = pos.y;
+        c.vy = (float)m_player1->m_yVelocity;
+        c.dumpAttempt = g_attempt;
+        c.parent = takeover::g_from;
+        c.source = start ? "start" : kind == takeover::TakeKind::Now ? "game" : "auto";
+        c.gdSrc = kind == takeover::TakeKind::Now ? takeover::g_wantedSrc
+                : kind == takeover::TakeKind::Pending ? (const void*)m_player1->m_pendingCheckpoint
+                                                      : nullptr;
+        if (kind == takeover::TakeKind::Now) {
+            takeover::addCp(std::move(c));
+            return;
+        }
+        if (kind == takeover::TakeKind::Pending) {
+            takeover::g_pending = std::move(c);
+            takeover::g_hasPending = true;
+            return;
+        }
+        g_cfg.inputs = c.before;
+        g_cfg.toggles.resize(std::min(g_nextToggle, g_cfg.toggles.size()));
+        // The person plays at the speed the game runs: back to realtime, which is where the
+        // approach already is unless the session runs the fast loop (it should not; see the py
+        // driver). The screen of a fast-loop session would stay dark.
+        if (g_cfg.fastdt > 0 && !g_realtimeOverride) {
+            g_realtimeOverride = true;
+            takeover::line("warning: the session ran the fast loop - realtime from here, and the "
+                           "screen stays as it was");
+        }
+        takeover::begin(std::move(c));
+        // ...and the game's checkpoints from here on are the person's (its auto setting, Z and X),
+        // each replaced by a strict one. Practice mode is what turns them on; entering it keeps the
+        // run where it is (togglePracticeMode(true) sets the flag, the checkpoint buttons and the
+        // practice song, and resets nothing -- only leaving it restarts the level). After the take,
+        // so the start point's checkpoint is the plan's world as it was.
+        if (!pl->m_isPracticeMode) pl->togglePracticeMode(true);
+    }
+
+    // A death while the person plays (or anything else that asked GD for a reset) comes back here
+    // at the frame boundary: the newest checkpoint is loaded the way cpStart loads one, and the
+    // person's next attempt starts from it.
+    void takeoverRestore(PlayLayer* pl) {
+        takeover::g_restorePending = false;
+        takeover::g_cpWanted = false;
+        takeover::dropPending();
+        if (!takeover::personDriving() || takeover::g_cps.empty()) return;
+        const takeover::Cp& c = takeover::g_cps.back();
+        if (!c.rec || !c.rec->cp) return;
+        const cpflight::Rec& r = *c.rec;
+        // Raised before the store as well as the reset: the store hook takes any store while the
+        // person plays for one the game made, and answered this one with a new checkpoint four
+        // ticks on -- every restore crept the newest checkpoint forward (measured on lv1: t=2443,
+        // 2447, 2451 ... one per death).
+        takeover::g_restoring = true;
+        clearCheckpointsUnsectioned(pl);
+        pl->storeCheckpoint(r.cp);
+        g_restorePending = true;
+        pl->resetLevel();
+        g_restorePending = false;
+        takeover::g_restoring = false;
+        cpRestoreState(pl, r, false);
+        g_cfg.inputs = c.before;
+        g_nextToggle = r.nextToggle;
+        // The cursor over what this checkpoint's attempts fly before the person: past everything
+        // before T, so only a release at T is left to feed. (Not the record's own cursor: a
+        // checkpoint the person's run took counted over a list without the person's presses, which
+        // GD received directly.)
+        g_nextInput = 0;
+        while (g_nextInput < g_cfg.inputs.size() && g_cfg.inputs[g_nextInput].step < r.tick)
+            ++g_nextInput;
+        g_tick = r.tick;
+        const auto pos = m_player1->getPosition();
+        takeover::restored(c, pos.x, pos.y, (float)m_player1->m_yVelocity);
+    }
+
+    // ---- cfg seekcp: the seek bar's checkpoints (mod/seek_cp.hpp) ----
+
+    // cfg `latchat=<tick>` (print only): once per run, at the first update boundary at or past the tick,
+    // how many objects carry the rect-path latch (GameObject+0x2e8, m_shouldUseOuterOb) and, within
+    // 300 px of player 1, each rotated or latched object with its uid, id, latch and rotation. Reads members
+    // only: getObjectRect / getOrientedBox can raise the latch it is reading.
+    void latchLine() {
+        static long long s_doneFor = -2;   // the run (attempt, seekcp::g_from) it was printed for
+        const long long at = itermap::g_latchAt;
+        if (at <= 0 || !m_player1 || !m_objects || !g_started || g_sessionOver) return;
+        const long long run = (long long)g_attempt * 1000000 + seekcp::g_from;
+        if (g_tick < at || s_doneFor == run) return;
+        s_doneFor = run;
+        const float px = m_player1->getPositionX(), py = m_player1->getPositionY();
+        int set = 0;
+        std::string nearby;
+        for (auto* o : CCArrayExt<GameObject*>(m_objects)) {
+            if (!o) continue;
+            if (o->m_shouldUseOuterOb) ++set;
+            if (std::fabs((float)o->m_positionX - px) > 300.f || std::fabs((float)o->m_positionY - py) > 300.f) continue;
+            if (o->getRotation() == 0.f && !o->m_shouldUseOuterOb) continue;
+            char b[96];
+            snprintf(b, sizeof(b), " %d/%d:L%d r%.1f", o->m_uniqueID, o->m_objectID,
+                     o->m_shouldUseOuterOb ? 1 : 0, (double)o->getRotation());
+            nearby += b;
+        }
+        char h[200];
+        snprintf(h, sizeof(h), "latch: t=%lld run=%s%lld player=(%.3f,%.3f) latched=%d near(rotated or latched):",
+                 (long long)g_tick, seekcp::g_from < 0 ? "head" : "cp@", seekcp::g_from < 0 ? 0LL : seekcp::g_from,
+                 (double)px, (double)py, set);
+        writeResult(std::string(h) + nearby);
+    }
+
+    // cfg `regionat=<tick>` + `regionbox=x0:y0:x1:y1` (print only): once per run, at the first update
+    // boundary at or past the tick, every object whose position is in the box, with its on/off flags and
+    // its cached rect (m_objectRect as it stands; nothing is recomputed).
+    void regionLine() {
+        static long long s_doneFor = -2;
+        const long long at = itermap::g_regionAt;
+        if (at <= 0 || !m_player1 || !m_objects || !g_started || g_sessionOver) return;
+        const long long run = (long long)g_attempt * 1000000 + seekcp::g_from;
+        if (g_tick < at || s_doneFor == run) return;
+        s_doneFor = run;
+        const float* bx = itermap::g_regionBox;
+        char h[200];
+        snprintf(h, sizeof(h), "region: t=%lld run=%s%lld player=(%.3f,%.3f) vy=%.3f box=(%.0f,%.0f)-(%.0f,%.0f)",
+                 (long long)g_tick, seekcp::g_from < 0 ? "head" : "cp@", seekcp::g_from < 0 ? 0LL : seekcp::g_from,
+                 (double)m_player1->getPositionX(), (double)m_player1->getPositionY(),
+                 (double)m_player1->m_yVelocity, (double)bx[0], (double)bx[1], (double)bx[2], (double)bx[3]);
+        writeResult(h);
+        groupSectionCheck("region", (long long)g_tick);
+        for (auto* o : CCArrayExt<GameObject*>(m_objects)) {
+            if (!o) continue;
+            const double x = o->m_positionX, y = o->m_positionY;
+            if (x < bx[0] || x > bx[2] || y < bx[1] || y > bx[3]) continue;
+            const auto& r = o->m_objectRect;
+            char b[260];
+            snprintf(b, sizeof(b), "region:   uid=%d id=%d type=%d pos=(%.3f,%.3f) rect=(%.2f,%.2f %.2fx%.2f) "
+                     "gdis=%d gdisT=%d dis=%d dis2=%d inv=%d hide=%d vis=%d rot=%.1f sec=%d",
+                     o->m_uniqueID, o->m_objectID, (int)o->m_objectType, x, y, (double)r.origin.x, (double)r.origin.y,
+                     (double)r.size.width, (double)r.size.height, (int)o->m_isGroupDisabled,
+                     (int)o->m_isGroupDisabledTemp, (int)o->m_isDisabled, (int)o->m_isDisabled2,
+                     (int)o->m_isInvisible, (int)o->m_isHide, (int)o->isVisible(), (double)o->getRotation(),
+                     (int)o->m_outerSectionIndex);
+            writeResult(b);
+        }
+    }
+
+    // cfg actcensus=1 (print only): after every update call, GD's own collision queries around each
+    // player (its rect grown by 60 px, enabledGroups=true, as the hitbox probe asks), and every object
+    // they return although its group is switched off -- returned only because it is activated
+    // (m_isActivated, +0x305), which is the visibility pass's to set and clear. Counted per run: the
+    // update boundaries with at least one such object, and each object's first and last tick
+    // (`actcensus:` lines, the summary at the session's end).
+    void actCensus() {
+        if (!itermap::g_actCensus || !g_started || g_sessionOver || !m_player1) return;
+        auto& c = itermap::g_actCensusState;
+        bool any = false;
+        for (PlayerObject* p : {m_player1, m_player2}) {
+            if (!p || (p == m_player2 && !m_gameState.m_isDualMode)) continue;
+            cocos2d::CCRect q = p->getObjectRect();
+            q.origin.x -= 60.f; q.origin.y -= 60.f; q.size.width += 120.f; q.size.height += 120.f;
+            for (int kind = 0; kind < 2; ++kind) {
+                cocos2d::CCArray* a = kind == 0 ? staticObjectsInRect(q, true) : damagingObjectsInRect(q, true);
+                if (!a) continue;
+                for (auto* o : CCArrayExt<GameObject*>(a)) {
+                    if (!o || !reinterpret_cast<const uint8_t*>(o)[0x28e]) continue;
+                    any = true;
+                    auto& e = c.objs[o->m_uniqueID];
+                    if (e.first < 0) {
+                        e.first = g_tick;
+                        e.id = o->m_objectID;
+                        e.kind = kind;
+                        if (c.objs.size() <= 40)
+                            writeResult("actcensus: t=" + std::to_string((long long)g_tick) + " uid=" + std::to_string(o->m_uniqueID)
+                                        + " id=" + std::to_string(o->m_objectID) + (kind == 0 ? " solid" : " hazard")
+                                        + " is switched off and activated near the player");
+                    }
+                    e.last = g_tick;
+                    ++e.boundaries;
+                }
+            }
+        }
+        if (any) ++c.boundaries;
+        ++c.checked;
+    }
+
+    // After every update call of a plain replay: a checkpoint when one is due.
+    void seekCpAfterUpdate() {
+        actCensus();
+        latchLine();
+        regionLine();
+        if (seekcp::g_every <= 0 || seekcp::g_off) return;
+        if (!g_started || g_sessionOver || g_cfg.dpSolve || g_serveMode || secsolve::g_on
+            || secsolve::g_active || takeover::armed())
+            return;
+        auto* pl = PlayLayer::get();
+        if (!pl || static_cast<GJBaseGameLayer*>(pl) != this || !m_player1) return;
+        if (pl->m_isPracticeMode || pl->m_playerDied || m_player1->m_isDead || m_player1->m_isLocked) return;
+        seekcp::validate(pl, pl->m_objects ? (size_t)pl->m_objects->count() : 0);
+        if (seekcp::g_step <= 0) seekcp::g_step = seekcp::g_every;
+        if (!seekcp::due(g_tick)) return;
+        if (seekcp::g_memBefore < 0) seekcp::g_memBefore = privateMB();
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = std::make_shared<cpflight::Rec>();
+        r->tick = g_tick;
+        cpCaptureState(pl, *r);
+        if (!cpMark(pl, *r)) {
+            writeResult("seekcp: markCheckpoint returned 0 at t=" + std::to_string((long long)g_tick)
+                        + " - off for this session");
+            seekcp::g_off = true;
+            return;
+        }
+        if (itermap::g_groupCheck) {
+            std::vector<uint8_t> tg;
+            tg.reserve(m_objects ? m_objects->count() : 0);
+            for (auto* o : CCArrayExt<GameObject*>(m_objects))
+                tg.push_back(o ? (uint8_t)((o->m_isGroupDisabled ? 1 : 0) | (o->m_outerSectionIndex >= 0 ? 2 : 0)) : 0);
+            seekcp::g_toggles[r.get()] = std::move(tg);
+            groupSectionCheck("checkpoint taken", (long long)g_tick);
+        }
+        seekcp::add(std::move(r));
+        ++seekcp::g_taken;
+        seekcp::g_takeMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        seekcp::g_memAfter = privateMB();
+    }
+
+    // cfg seekblind: the tick a seek to `target` runs screen off up to -- the last checkpoint slot at
+    // or before it, so the checkpoint the restart then loads is at most one spacing short of the
+    // target. -1: no checkpoints in this session.
+    long long seekBlindCut(long long target) {
+        if (seekcp::g_every <= 0 || seekcp::g_off) return -1;
+        const long long step = seekcp::g_step > 0 ? seekcp::g_step : seekcp::g_every;
+        return (target / step) * step;
+    }
+
+    void endSeekBlind(long long cut) {
+        itermap::g_seekBlindNow = false;
+        itermap::g_seekBlindDone = true;
+        itermap::g_seekBlindMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - itermap::g_seekT0).count();
+        itermap::g_seekRestart = true;
+        char b[200];
+        snprintf(b, sizeof(b), "seekblind: screen off up to t=%lld (cut %lld%s) in %.0f ms; the rest from "
+                 "the checkpoint at or before t=%lld", (long long)g_tick, cut,
+                 (m_player1 && m_player1->m_isDead) ? ", died first" : "", itermap::g_seekBlindMs,
+                 (long long)itermap::g_seekTick);
+        writeResult(b);
+    }
+
+    // A seek's restart from the latest checkpoint at or before `target`, loaded the way the loop's
+    // flights load one (cpStart). False: none to load, and the caller restarts the level.
+    bool seekCpRestore(PlayLayer* pl, long long target) {
+        if (seekcp::g_every <= 0 || seekcp::g_off || !pl || !m_player1) return false;
+        seekcp::validate(pl, pl->m_objects ? (size_t)pl->m_objects->count() : 0);
+        long long want = target;
+        if (itermap::g_seekFromCp >= 0) { want = std::min(want, itermap::g_seekFromCp); itermap::g_seekFromCp = -1; }
+        auto r = seekcp::atOrBefore(want);
+        if (!r || !r->cp) return false;
+        const auto t0 = std::chrono::steady_clock::now();
+        seekcp::g_restoring = true;
+        clearCheckpointsUnsectioned(pl);
+        pl->storeCheckpoint(r->cp);
+        g_restorePending = true;
+        pl->resetLevel();
+        g_restorePending = false;
+        seekcp::g_restoring = false;
+        cpRestoreState(pl, *r, false);
+        g_nextInput = r->nextInput;
+        g_nextToggle = r->nextToggle;
+        g_tick = r->tick;
+        itermap::g_nowTick = r->tick;
+        seekcp::g_from = r->tick;
+        seekcp::g_partSaid = false;
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        ++seekcp::g_restores;
+        seekcp::g_restoreMs += ms;
+        char b[200];
+        snprintf(b, sizeof(b), "seekcp: restored the checkpoint at t=%lld for a seek to t=%lld in %.1f ms",
+                 r->tick, target, ms);
+        writeResult(b);
+        return true;
     }
 
     // A checkpoint of the loop's flight at the tick just run, with what it does not carry, as the
@@ -2248,48 +3135,19 @@ class $modify(GJBaseGameLayer) {
         const auto t0 = std::chrono::steady_clock::now();
         auto r = std::make_shared<cpflight::Rec>();
         r->tick = T;
-        psnap::captureRaw(m_player1, this, r->player);
-        secCaptureDash(r->dash);
-        if (m_player2) secCaptureDash(r->dash2, m_player2);
-        psnap::captureTouch(m_player1, r->touch, this);
-        r->damageVerified = pl->m_damageVerified;
-        {
-            auto hb = m_player1->m_holdingButtons.find(1);
-            r->held = (hb != m_player1->m_holdingButtons.end() && hb->second) ? 1 : 0;
-        }
-        r->oobLatch = (int)(unsigned char)reinterpret_cast<const char*>(m_player1)[kOobLatchOff];
-        r->nextInput = g_nextInput;
-        r->nextToggle = g_nextToggle;
-        {
-            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
-            r->seedTrig = *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva);
-            r->seedVarIndex = *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva);
-            r->seedVarTable = *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva);
-            r->seedKept = *reinterpret_cast<long long*>(reinterpret_cast<char*>(this)
-                                                        + gdoff::kLayerRandomSeed);
-        }
-        cpflight::captureCamera(this, r->camera);
-        cpflight::captureArea(this, r->area);
+        cpCaptureState(pl, *r);
         if (g_cfg.cpFlightLayerDiff)
             r->layerBytes.assign(reinterpret_cast<const uint8_t*>(pl),
                                  reinterpret_cast<const uint8_t*>(pl) + sizeof(PlayLayer));
         cpflight::objLine(this, "take", T);
         if (g_cfg.cpFlightObj >= 0) cpflight::g_objAfter = 3;
         cpflight::captureBooks(*r);
-        cpflight::g_inTake = true;
-        CheckpointObject* cp = markCheckpointAtPhys(pl);
-        cpflight::g_inTake = false;
-        if (!cp) {
+        if (!cpMark(pl, *r)) {
             writeResult("cpflight: markCheckpoint returned 0 at t=" + std::to_string(T)
                         + " - no more checkpoints this attempt");
             cpflight::g_next = -1;
             return;
         }
-        cp->retain();
-        r->cp = cp;
-        r->layer = pl;
-        r->objects = pl->m_objects ? (size_t)pl->m_objects->count() : 0;
-        clearCheckpointsUnsectioned(pl);
         if (g_cfg.cpFlightLayerDiff) {
             cpflight::g_diffCollect = r;
             cpflight::g_diffCompare.reset();
@@ -2339,39 +3197,7 @@ class $modify(GJBaseGameLayer) {
         pl->resetLevel();
         g_restorePending = false;
         cpflight::g_starting = nullptr;
-        clearCheckpointsUnsectioned(pl);
-        pl->m_queuedButtons.clear();
-        if (r.held) {
-            m_player1->m_holdingButtons[1] = true;
-            if (m_player2) m_player2->m_holdingButtons[1] = true;
-        }
-        psnap::restore(m_player1, this, r.player.data());
-        secRestoreDash(r.dash);
-        if (m_player2) secRestoreDash(r.dash2, m_player2);
-        psnap::restoreTouch(m_player1, r.touch, this);
-        // ...and the two object pointers restoreTouch leaves to cfg secsnapobj: the object the
-        // player is snapped to and the one it collided with. A restore of the loop is on the same
-        // layer, whose objects are never re-created, so they are carried. Measured on lv22 at t=600
-        // without them: the rows after the restore took a different m_snapDistance from t=602.
-        m_player1->m_objectSnappedTo = r.touch.objectSnappedTo;
-        m_player1->m_collidedObject = r.touch.collidedObject;
-        if (m_player2 && r.touch.second) {
-            m_player2->m_objectSnappedTo = r.touch.second->objectSnappedTo;
-            m_player2->m_collidedObject = r.touch.second->collidedObject;
-        }
-        pl->m_damageVerified = r.damageVerified;
-        reinterpret_cast<char*>(m_player1)[kOobLatchOff] = (char)r.oobLatch;
-        {
-            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
-            *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva) = r.seedTrig;
-            *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva) = r.seedVarIndex;
-            *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva) = r.seedVarTable;
-            *reinterpret_cast<long long*>(reinterpret_cast<char*>(this) + gdoff::kLayerRandomSeed) =
-                r.seedKept;
-        }
-        cpflight::restoreCamera(this, r.camera);
-        cpflight::objLine(this, "reset", r.tick);
-        cpflight::restoreArea(this, r.area);
+        cpRestoreState(pl, r, true);
         cpflight::objLine(this, "restored", r.tick);
         cpflight::nodeWatch(this, r.tick, "restored");
         if (g_cfg.cpFlightObj >= 0) cpflight::g_objAfter = 3;
@@ -2486,9 +3312,57 @@ class $modify(GJBaseGameLayer) {
         }
     }
 
+    // `movedOnly`: `out` takes only the objects that moved under the three input patterns, not
+    // also every grouped object in reach (cfg secwsnapset=1).
+    // cfg secwsnapset=2 / secwsnapgroups: the objects of the groups a section's own position
+    // triggers aim at -- move 901, rotate 1346, follow 1347, follow-player-Y 1814, scale 2067 and
+    // toggle 1049 placed in [x0, x1], plus those triggers when they sit in a group a spawn 1268 in
+    // that range calls -- or of the groups named (secsolve::g_wsnapGroups, diagnosis), appended
+    // to `out` without duplicates.
+    // `anyTrigger` (secwsnapset=3): every trigger kind counts, not those six -- the Area effects,
+    // alpha, animate and the rest move or reshape objects too -- and a trigger's center group goes
+    // in with its target group.
+    void wsnapTriggerSet(std::vector<GameObject*>& out, double x0, double x1, bool anyTrigger = false) {
+        if (!this->m_objects) return;
+        auto mover = [anyTrigger](int id) {
+            if (anyTrigger) return id != 1268;
+            return id == 901 || id == 1346 || id == 1347 || id == 1814 || id == 2067 || id == 1049;
+        };
+        auto take = [&](EffectGameObject* e, std::set<int>& into) {
+            into.insert(e->m_targetGroupID);
+            if (anyTrigger && e->m_centerGroupID > 0) into.insert(e->m_centerGroupID);
+        };
+        std::set<int> groups(secsolve::g_wsnapGroups.begin(), secsolve::g_wsnapGroups.end());
+        if (groups.empty()) {
+            std::set<int> spawned;
+            for (auto* o : CCArrayExt<GameObject*>(this->m_objects)) {
+                if (!o) continue;
+                const double ox = o->getPositionX();
+                if (ox < x0 || ox > x1) continue;
+                auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(o);
+                if (!e || e->m_targetGroupID <= 0) continue;
+                if (mover(o->m_objectID)) take(e, groups);
+                else if (o->m_objectID == 1268) spawned.insert(e->m_targetGroupID);
+            }
+            for (int g : spawned)
+                if (auto* arr = this->getGroup(g))
+                    for (auto* o : CCArrayExt<GameObject*>(arr))
+                        if (auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(o))
+                            if (e->m_targetGroupID > 0 && mover(o->m_objectID))
+                                take(e, groups);
+        }
+        std::unordered_set<GameObject*> seen(out.begin(), out.end());
+        for (int g : groups)
+            if (auto* arr = this->getGroup(g))
+                for (auto* o : CCArrayExt<GameObject*>(arr))
+                    if (o && seen.insert(o).second) out.push_back(o);
+    }
+
     int movingObjectsInSection(PlayLayer* pl, int n,
                                std::vector<GameObject*>* out = nullptr,
-                               int* portalsOut = nullptr) {
+                               int* portalsOut = nullptr, bool movedOnly = false,
+                               double* winLo = nullptr, double* winHi = nullptr,
+                               bool physOnly = false, bool toHorizon = false) {
         if (out) out->clear();
         auto* arr = this->m_objects;
         const int nobj = arr ? arr->count() : 0;
@@ -2517,7 +3391,58 @@ class $modify(GJBaseGameLayer) {
         const bool savedNoKill = secsolve::g_noKill;
         secsolve::g_noKill = true;
         double wx0 = m_player1 ? m_player1->getPositionX() : 0.0, wx1 = wx0;
+        double vMax = 0.0;   // the fastest x step the probe saw (secwsnapset=5)
         std::vector<uint8_t> moving((size_t)nobj, 0);
+        // cfg secwsnapany (secsolve::g_wsnapAny, with secwsnapauto): `changed` takes an object
+        // whose pose -- position, rotation, scale, visibility and the area offsets -- differs from
+        // its pose at the pattern's start at any sample (every kPoseEvery ticks and at the end).
+        // `moving` stays the old end-to-start position test: the portal count and the return value
+        // read it, so a run without secwsnapauto is the old qualify to the byte.
+        const bool anyChange = secsolve::g_wsnapAuto && secsolve::g_wsnapAny && out;
+        constexpr int kPoseEvery = 10;
+        static const std::vector<psnap::Mem> poseMems = [] {
+            static const char* const kNames[] = {
+                "m_positionXOffset", "m_positionYOffset", "m_rotationXOffset", "m_rotationYOffset",
+                "m_scaleXOffset", "m_scaleYOffset", "m_customScaleX", "m_customScaleY",
+                "m_isRotationAligned"};
+            std::vector<psnap::Mem> r;
+            for (const auto& m : psnap::goScalars())
+                for (const char* n : kNames)
+                    if (std::strcmp(m.name, n) == 0) { r.push_back(m); break; }
+            return r;
+        }();
+        size_t poseBytes = 7 * sizeof(float);
+        for (const auto& m : poseMems) poseBytes += m.size;
+        std::vector<uint8_t> changed(anyChange ? (size_t)nobj : 0, 0);
+        std::vector<uint8_t> pose0(anyChange ? (size_t)nobj * poseBytes : 0);
+        auto poseOf = [&](GameObject* o, uint8_t* d) {
+            const float f[7] = {o->getPositionX(), o->getPositionY(), o->getRotationX(),
+                                o->getRotationY(), o->getScaleX(), o->getScaleY(),
+                                o->isVisible() ? 1.f : 0.f};
+            std::memcpy(d, f, sizeof f);
+            d += sizeof f;
+            for (const auto& m : poseMems) {
+                std::memcpy(d, (const uint8_t*)o + m.off, m.size);
+                d += m.size;
+            }
+        };
+        auto poseCheck = [&]() {
+            std::vector<uint8_t> now(poseBytes);
+            for (int i = 0; i < nobj; ++i) {
+                if (changed[(size_t)i]) continue;
+                auto* o = static_cast<GameObject*>(arr->objectAtIndex((unsigned)i));
+                poseOf(o, now.data());
+                const uint8_t* b = pose0.data() + (size_t)i * poseBytes;
+                const float* fa = (const float*)b;
+                const float* fb = (const float*)now.data();
+                bool diff = false;
+                for (int k = 0; k < 7 && !diff; ++k) diff = std::fabs(fa[k] - fb[k]) > 1e-4f;
+                if (!diff)
+                    diff = std::memcmp(b + 7 * sizeof(float), now.data() + 7 * sizeof(float),
+                                       poseBytes - 7 * sizeof(float)) != 0;
+                if (diff) changed[(size_t)i] = 1;
+            }
+        };
         // 0=always released / 1=always held / 2=toggle every tick. What gets touched
         // changes, so put "objects moved by any one of them" into the set (the same reason
         // only the every-tick toggle broke in the sweep -- what is touched depends on the
@@ -2529,14 +3454,20 @@ class $modify(GJBaseGameLayer) {
                 auto* o = static_cast<GameObject*>(arr->objectAtIndex((unsigned)i));
                 px[(size_t)i] = o->getPositionX();
                 py[(size_t)i] = o->getPositionY();
+                if (anyChange) poseOf(o, pose0.data() + (size_t)i * poseBytes);
             }
+            double xPrev = m_player1 ? m_player1->getPositionX() : 0.0;
             for (int i = 0; i < n; ++i) {
                 const int in = pat == 0 ? 0 : (pat == 1 ? 1 : (i & 1));
                 secStep(in, dt);
                 if (!m_player1) break;
                 const double x = m_player1->getPositionX();
                 wx0 = std::min(wx0, x); wx1 = std::max(wx1, x);
+                vMax = std::max(vMax, x - xPrev);
+                xPrev = x;
+                if (anyChange && i % kPoseEvery == kPoseEvery - 1) poseCheck();
             }
+            if (anyChange) poseCheck();
             for (int i = 0; i < nobj; ++i) {
                 auto* o = static_cast<GameObject*>(arr->objectAtIndex((unsigned)i));
                 if (std::fabs(o->getPositionX() - px[(size_t)i]) > 1e-4
@@ -2545,7 +3476,23 @@ class $modify(GJBaseGameLayer) {
             }
         }
         secsolve::g_noKill = savedNoKill;
+        // secwsnapset=5 (`toHorizon`): the probe runs the first n ticks only, and a long window's
+        // later part lies past it -- the reach window's far end goes on by the ticks the probe did
+        // not run at the fastest x step it saw. Measured (2026-10-08) on four custom windows of 904 to
+        // 3,151 ticks: set 4 moved the snapshot's loss of the plan's own branch hundreds of ticks
+        // later, and in each the new loss point lay past the window or on its edge, the moving
+        // objects there left out.
+        if (toHorizon && secsolve::g_horizon > n && vMax > 0.0) {
+            const double ext = (double)(secsolve::g_horizon - n) * vMax;
+            wx1 += ext;
+            char eb[160];
+            snprintf(eb, sizeof(eb), "secsolve: wsnap reach extended %.0f px past the probe (%d of %d ticks, "
+                     "%.2f px a tick at most) (secwsnapset=5)", ext, n, secsolve::g_horizon, vMax);
+            writeResult(eb);
+        }
         wx0 -= 900.0; wx1 += 900.0;
+        if (winLo) *winLo = wx0;
+        if (winHi) *winHi = wx1;
         int moved = 0;
         if (portalsOut) *portalsOut = 0;
         for (int i = 0; i < nobj; ++i) {
@@ -2565,8 +3512,21 @@ class $modify(GJBaseGameLayer) {
                 && moving[(size_t)i])
                 ++*portalsOut;
             if (!out) continue;
-            if (moving[(size_t)i] || (grouped && inWindow))
+            const bool posed = anyChange && changed[(size_t)i];
+            // secwsnapset=4 (`physOnly`): the grouped objects in reach, but not decoration (object
+            // type 7) -- what a trigger can move into the player's way, without the decoration that
+            // carries groups too and is most of the in-reach set on a heavy level.
+            const bool reach = grouped && inWindow && !(physOnly && (int)o->m_objectType == 7);
+            if (moving[(size_t)i] || posed || (!movedOnly && reach))
                 out->push_back(o);
+        }
+        if (anyChange) {
+            size_t nChanged = 0;
+            for (uint8_t c : changed) nChanged += c;
+            char cb[160];
+            snprintf(cb, sizeof(cb), "secsolve: wsnap probe %zu objects - %d moved end to start, %zu changed "
+                     "pose at a sample (cfg secwsnapany)", out->size(), moved, nChanged);
+            writeResult(cb);
         }
         return moved;
     }
@@ -2675,7 +3635,7 @@ class $modify(GJBaseGameLayer) {
         int held = 0;
         for (const auto& in : g_cfg.inputs)
             if (in.step <= g_ckptTick) held = in.down ? 1 : 0;
-        g_active = true;
+        secsolve::setSearching(true);
         int freeze = 0;
         std::vector<uint64_t> base, again, after;
         std::vector<uint8_t> snapBytes;
@@ -2774,7 +3734,7 @@ class $modify(GJBaseGameLayer) {
                  "world: CP->run%d->psnap differs=%zu / %zu stable members",
                  N, nDiff, nStable);
         writeResult(b);
-        g_active = false;
+        secsolve::setSearching(false);
         endSession("world");
     }
 
@@ -2824,7 +3784,7 @@ class $modify(GJBaseGameLayer) {
         bool allOk = true;
 
         const bool wasActive = g_active;
-        g_active = true;
+        secsolve::setSearching(true);
         std::vector<double> refY, refV;
         std::vector<uint8_t> refFlags;   // mode|grounded<<4|mini<<5|flip<<6
         std::vector<uint8_t> snapBytes;
@@ -3081,7 +4041,7 @@ class $modify(GJBaseGameLayer) {
             }
             if (!allOk && !verbose) break;   // verdict only: settled at the first split
         }
-        g_active = wasActive;
+        secsolve::setSearching(wasActive);
         return allOk;
     }
 
@@ -3111,7 +4071,7 @@ class $modify(GJBaseGameLayer) {
             if (t >= base && (size_t)(t - base) < seq.size())
                 seq[(size_t)(t - base)] = (uint8_t)held;
         }
-        g_active = true;
+        secsolve::setSearching(true);
         // Measure the frozen steps. Count them the same way the search does: the frozen
         // ticks idle with "the input at the time of the restore", and the k-th advance
         // after that produces tick base+k. Doing this with a flat array index lets the
@@ -3158,7 +4118,7 @@ class $modify(GJBaseGameLayer) {
         }
         const double x1 = m_player1 ? m_player1->getPositionX() : -1;
         const double y1 = m_player1 ? m_player1->getPositionY() : -1;
-        g_active = false;
+        secsolve::setSearching(false);
         char b[256];
         snprintf(b, sizeof(b),
                  "secverify: restoreX=%.3f restoreY=%.3f -> x=%.3f y=%.3f "
@@ -3262,6 +4222,7 @@ class $modify(GJBaseGameLayer) {
             // the one solution at the end to confirm is done always.
             int moved = -1;
             int movPortals = 0;
+            g_wsnapHeld = 0;
             if (g_snapOn && gated) {
                 moved = movingObjectsInSection(pl, std::min(400, g_horizon),
                                                &g_movSet, &movPortals);
@@ -3273,9 +4234,17 @@ class $modify(GJBaseGameLayer) {
                 // portals in different positions is not drift but a different world, and
                 // the very path the search finds becomes a lie (see the note on
                 // isWorldDefiningPortal).
-                movingObjectsInSection(pl, std::min(400, g_horizon),
-                                       nullptr, &movPortals);
+                double wLo = 0.0, wHi = 0.0;
+                const bool byTrig = g_wsnapSet == 2 || g_wsnapSet == 3 || !g_wsnapGroups.empty();
+                const int mv = movingObjectsInSection(pl, std::min(400, g_horizon),
+                                                      g_wsnapAuto ? &g_movSet : nullptr,
+                                                      &movPortals, g_wsnapSet == 1 || byTrig,
+                                                      &wLo, &wHi, g_wsnapSet == 4 || g_wsnapSet == 5,
+                                                      g_wsnapSet == 5);
+                if (g_wsnapAuto && byTrig && movPortals == 0)
+                    wsnapTriggerSet(g_movSet, wLo, wHi, g_wsnapSet == 3);
                 if (movPortals > 0) {
+                    g_movSet.clear();
                     g_snapOn = false;
                     // When falling back to the checkpoint, lower the cap too. Cost grows
                     // super-linearly with cap and memory grows as well (measured 15GB at
@@ -3287,6 +4256,49 @@ class $modify(GJBaseGameLayer) {
                         writeResult(cb);
                         g_cap = 120;
                     }
+                } else if (g_wsnapAuto) {
+                    // cfg secwsnapauto: ...and the objects that move are put back with the
+                    // player (wsnap), where the cross-checks alone left them as the node stepped
+                    // before had them (see secsolve::g_wsnapAuto).
+                    // cfg secwsnapgate: a rung's first ask holds a set it could put back and runs
+                    // as secwsnapauto=0 does; only if it finds nothing is the window asked again
+                    // with the set (g_wsnapForce, the rung's end below).
+                    // cfg seclieskippsnap: ...except in a window whose plain search was caught
+                    // parting from the game before (secsolve::g_liedWindows): the set goes back now.
+                    const bool lieSkip = g_lieSkipPsnap && g_wsnapGate && !g_wsnapForce && g_secRung
+                                         && liedWindow(secsolve::g_startTick);
+                    const bool hold = g_wsnapGate && !g_wsnapForce && !lieSkip && g_secRung
+                                      && !g_movSet.empty() && g_movSet.size() <= g_maxMoving;
+                    if (!hold) moved = mv;
+                    // ...and say what was done with the set, every time: a set above secmaxmov
+                    // is dropped, and the search then runs on psnap alone -- the same lie the set
+                    // was for (a custom level's window at 10,116 objects), which must not read as covered.
+                    char wb[240];
+                    if (hold) {
+                        g_wsnapHeld = g_movSet.size();
+                        snprintf(wb, sizeof(wb), "secsolve: wsnap set %zu objects (secwsnapset=%d) - held "
+                                 "back (cfg secwsnapgate): psnap alone first, the set only if that finds "
+                                 "nothing", g_movSet.size(), g_wsnapSet);
+                        g_movSet.clear();
+                    } else if (!g_movSet.empty() && g_movSet.size() <= g_maxMoving) {
+                        g_worldOn = true;
+                        if (lieSkip)
+                            snprintf(wb, sizeof(wb), "secsolve: wsnap set %zu objects (secwsnapset=%d) - "
+                                     "put back from the start (cfg seclieskippsnap): this window's plain "
+                                     "snapshot search parted from the game before", g_movSet.size(), g_wsnapSet);
+                        else
+                            snprintf(wb, sizeof(wb), "secsolve: wsnap set %zu objects (secwsnapset=%d) - "
+                                     "put back with the player", g_movSet.size(), g_wsnapSet);
+                    } else if (g_movSet.empty()) {
+                        snprintf(wb, sizeof(wb), "secsolve: wsnap set empty (secwsnapset=%d) - "
+                                 "the search runs on psnap alone", g_wsnapSet);
+                    } else {
+                        snprintf(wb, sizeof(wb), "secsolve: wsnap set %zu objects is over secmaxmov %zu "
+                                 "(secwsnapset=%d) - NOT put back, the search runs on psnap alone",
+                                 g_movSet.size(), g_maxMoving, g_wsnapSet);
+                        g_movSet.clear();
+                    }
+                    writeResult(wb);
                 }
             }
             const double qms = std::chrono::duration<double, std::milli>(
@@ -3336,7 +4348,7 @@ class $modify(GJBaseGameLayer) {
         }
         const double killAboveY = g_maxY > 0.0 ? g_maxY : g_maxYAuto;
 
-        g_active = true;
+        secsolve::setSearching(true);
         // Only the search proper swallows deaths. The sweep (snapSweep) must detect death
         // to shorten its window, so do not set this before here.
         g_noKill = g_killOverride < 0 ? g_snapOn : (g_killOverride == 1);
@@ -3365,6 +4377,20 @@ class $modify(GJBaseGameLayer) {
         secsolve::g_accel2.clear();
         secsolve::g_pad2.clear();
         secPushP2();                      // its dash is retaken below, as player 1's is
+        // cfg secheadaccel: the head's accumulator and pad flag as the plain flight had them, not as
+        // the qualify probes' last checkpoint load left the player (see secsolve::g_headAccel).
+        if (secsolve::g_headAccel && !secsolve::g_headPlain.empty()) {
+            const size_t one = sizeof(PlayerObject) + psnap::kExtra;
+            const uint8_t* hp = secsolve::g_headPlain.data();
+            std::memcpy(&g_accel[0], hp + offsetof(PlayerObject, m_accelerationOrSpeed), sizeof(double));
+            g_pad[0] = hp[offsetof(PlayerObject, m_touchedPad)] ? 1 : 0;
+            const size_t p2at = one + psnap::layerBytes();
+            if (secP2() && !secsolve::g_accel2.empty() && secsolve::g_headPlain.size() >= p2at + one) {
+                std::memcpy(&secsolve::g_accel2[0],
+                            hp + p2at + offsetof(PlayerObject, m_accelerationOrSpeed), sizeof(double));
+                secsolve::g_pad2[0] = hp[p2at + offsetof(PlayerObject, m_touchedPad)] ? 1 : 0;
+            }
+        }
         // The section head IS the spine's first node: the verified solution
         // passed through here, so following its own inputs from this node is
         // the one rollout that must never be pruned (see g_spineOn).
@@ -5198,7 +6224,7 @@ class $modify(GJBaseGameLayer) {
         // the search (`evalLeaf`). Back when it ran once here, a dead-end first leaf to
         // reach the goal ended the search on the spot.
 
-        g_active = false;
+        secsolve::setSearching(false);
         g_noKill = false;
         g_tick = savedTick;
         g_nextInput = savedInput;
@@ -5450,6 +6476,11 @@ class $modify(GJBaseGameLayer) {
                 // crossing back to the model. If the spliced plan turns out to die before
                 // the wall, every rung is pinned out and runLadder drops the pin.
                 g_secPin = std::max(base + (long long)seq.size(), g_secPinWall);
+                {   // the run counts a flight of this plan as the section search's (dprun via=secsolve)
+                    std::vector<std::pair<long long, int>> se;
+                    for (const InputCmd& c : plan) se.emplace_back((long long)c.step, c.down ? 1 : 0);
+                    dpbridge::runNoteSplice(se, base);
+                }
                 if (stateKind == 2)   // cfg dpsecstate: the splice is the way on now
                     dpsolve::stateAdopt(plan, base + (long long)seq.size(),
                                         g_nodes[(size_t)foundLeaf].x);
@@ -5497,26 +6528,49 @@ class $modify(GJBaseGameLayer) {
             const long long snapReach = (long long)g_ckptTick + deepest;
             const bool reachedDeath = g_cfg.secRedoReach && secsolve::g_spineUntil > 0
                                       && snapReach >= secsolve::g_spineUntil - secsolve::kSpineSlack;
-            const bool redoCp = secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0
+            // cfg seclieskippsnap: a plain snapshot search (its wsnap set held back) caught parting from
+            // the game that found nothing marks its window, whose later asks put the set back at once.
+            if (secsolve::g_lieSkipPsnap && secsolve::g_psnapLied && secsolve::g_wsnapHeld > 0
+                && foundLeaf < 0 && !secsolve::liedWindow(secsolve::g_startTick)) {
+                secsolve::g_liedWindows.push_back(secsolve::g_startTick);
+                writeResult("secrung: window t=" + std::to_string(secsolve::g_startTick)
+                            + " marked (cfg seclieskippsnap): its later asks start with the wsnap set");
+            }
+            // cfg secwsnapgate: a search that held its wsnap set back and found nothing is asked again
+            // at once, the same window with the set put back (and the same coin and spine check); the
+            // ladder counts that search's answer. It comes before a checkpoint re-ask, which costs more.
+            const bool redoWsnap = secsolve::g_wsnapHeld > 0 && foundLeaf < 0 && stateKind == 0
+                                   && g_secLastReq.start >= 0;
+            const bool redoCp = !redoWsnap && secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0
                                 && g_secLastReq.start >= 0 && !reachedDeath && g_cfg.secCpFallback;
-            if (secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0 && reachedDeath)
+            if (redoWsnap) {
+                // (no checkpoint re-ask line: the wsnap re-ask comes first)
+            } else if (secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0 && reachedDeath)
                 writeResult("secrung: not asked again on checkpoints - the snapshot search lived to t="
                             + std::to_string(snapReach) + " against the plan's verified death at t="
                             + std::to_string(secsolve::g_spineUntil) + " (cfg secredoreach)");
             else if (secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0 && !g_cfg.secCpFallback)
                 writeResult("secrung: not asked again on checkpoints (cfg seccpfallback=0) - the loop "
                             "carries on from the deepest plan");
-            if (redoCp) {
+            if (redoCp || redoWsnap) {
                 g_secReqStart = g_secLastReq.start;
                 g_secReqTarget = g_secLastReq.target;
                 g_secReqDepth = g_secLastReq.depth;
                 g_secReqHorizon = g_secLastReq.horizon;
                 g_secReqCap = g_secLastReq.cap;
-                g_secReqCoin = -1;       // a coin wall's rung is never checked this way
+                // a coin wall's rung is never checked on checkpoints; the wsnap re-ask keeps its coin
+                g_secReqCoin = redoWsnap ? g_secLastReq.coin : -1;
                 g_secReqRung = true;
-                g_secReqForceCp = true;
+                g_secReqForceCp = redoCp;
+                g_secReqForceWsnap = redoWsnap;
+                if (redoWsnap) g_secReqSpineUntil = secsolve::g_spineUntil;
                 g_secReqPending = true;
-                writeResult("secrung: asking the same window again on checkpoints");
+                if (redoCp)
+                    writeResult("secrung: asking the same window again on checkpoints");
+                else
+                    writeResult("secrung: asking the same window again with its wsnap set of "
+                                + std::to_string(secsolve::g_wsnapHeld)
+                                + " objects (cfg secwsnapgate) - the plain snapshot search found nothing");
             } else {
                 // (A checkpoint redo that found nothing is not searched again at a larger cap:
                 // the ladder goes to its next window, further back -- on that level of 22 the
@@ -5530,12 +6584,14 @@ class $modify(GJBaseGameLayer) {
                 if (ownTiers) dpsolve::stateRungDone(stateKind, foundLeaf >= 0);
             }
             g_secCpRedo = false;
+            secsolve::g_wsnapForce = false;
+            secsolve::g_wsnapHeld = 0;
             if (g_ckpt) { g_ckpt->release(); g_ckpt = nullptr; }
             g_ckptTick = -1;
             g_headHeld = 0;
             g_practiceOn = false;
             dpsolve::g_stop = false;     // the loop may spawn solves again
-            g_paused = redoCp;           // ...unless the redo is queued: held until it is taken
+            g_paused = redoCp || redoWsnap;   // ...unless a redo is queued: held until it is taken
             g_forceCleanStart = true;    // drop the search's practice mode and checkpoints
             g_hudPhase = "secrung: replaying the spliced plan";
             // cfg secbookfirst: the coin books go back to the searched attempt's HERE, before the
@@ -5573,6 +6629,18 @@ class $modify(GJBaseGameLayer) {
         // so mixing them would replay the plan again from the section head).
         // The input cursor as this attempt's first tick on the active layer finds it, whatever
         // else has run since the attempt's reset (see g_nextInputAtStart).
+        // An attempt sequence: a prelude attempt that reaches its `until` is restarted at the next safe point
+        // (plan_io.hpp), as a person pressing restart; one that dies first is restarted by the game.
+        if (!g_prelude.empty() && g_started && !g_sessionOver && !g_preludeResetPending
+            && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this) {
+            const size_t pidx = (size_t)(g_attempt > 0 ? g_attempt - 1 : 0);
+            if (pidx < g_prelude.size() && g_prelude[pidx].until >= 0 && g_tick >= g_prelude[pidx].until
+                && m_player1 && !m_player1->m_isDead) {
+                g_preludeResetPending = true;
+                g_preludePendingAttempt = g_attempt;
+                writeResult("sequence: prelude attempt " + std::to_string(g_attempt) + " restarts at tick " + std::to_string((long long)g_tick));
+            }
+        }
         if (!g_attemptFed && !secsolve::g_active
             && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this) {
             g_attemptFed = true;
@@ -6574,8 +7642,10 @@ class $modify(GJBaseGameLayer) {
         // tEff above), so it counts every step of every node -- tens of thousands per search --
         // and the bar's axis grew by that much each time a rung ran, crushing the run's marks
         // to the left, while the search's scattered x values landed on ticks past the level.
-        if (g_started && !g_sessionOver && m_player1 && !secsolve::g_active)
+        if (g_started && !g_sessionOver && m_player1 && !secsolve::g_active) {
             itermap::trackX(g_tick, m_player1->getPositionX());
+            seekcp::noteX(g_tick, m_player1->getPositionX(), m_player1->getPositionY());   // cfg seekcp: head run kept, restored checked
+        }
         // GD's max-gameplay-y bound (layer+0x36a8, updateMaxGameplayY), logged
         // on change. On dynamic-height levels the bound moves with the world,
         // and whether it does -- and when -- decides how --maxplayy has to be
@@ -6835,6 +7905,11 @@ class $modify(GJBaseGameLayer) {
                    // not be checked against anything. Appended at the END like every column
                    // since p2ground2: readers index the earlier ones by position.
                    << ',' << (m_player2 ? m_player2->getRotation() : 0.f)
+                   // p2ctrlOff: the SECOND body's m_controlsDisabled. ctrlOff is player 1's, and
+                   // the Options trigger switches the two players separately
+                   // (processOptionsTrigger 0x223d50: +0x754 player 1, +0x758 player 2), so a
+                   // window that stops only p1 left p2 jumping in GD while the model held both.
+                   << ',' << ((m_player2 && m_player2->m_controlsDisabled) ? 1 : 0)
                    << '\n';
         }
     }
@@ -6847,6 +7922,20 @@ class $modify(GJBaseGameLayer) {
     // Record the fact that a switch (touch trigger) was touched (cfg `trigtrace=1`).
     // Which trigger was stepped on at which tick makes run lineages distinguishable
     void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
+        // touchfire (sweep.hpp, --rectouch): GD fires a touch trigger here -- collisionCheckObjects'
+        // object types 0x14 / 0x2d; 0x217f50 stores (uid, player) in the effect manager's triggered set
+        // and calls triggerObject only when the pair is not there yet -- so the first call per uid in an
+        // attempt is the fire. Read-only: the uid and tick are taken before the call. Unconditional like
+        // the recorders in hooks_player.cpp, so carrying nothing never depends on a flag.
+        if (object) {
+            ++touchfire::g_calls;
+            if (player == m_player1) {
+                auto& m = touchfire::g_first;
+                if (m.find(object->m_uniqueID) == m.end()) m[object->m_uniqueID] = (int)g_tick;
+            } else {
+                ++touchfire::g_p2;
+            }
+        }
         if (g_trigTrace && g_started && !g_sessionOver && object
             && player == m_player1) {
             static int s_logs = 0;
@@ -6890,16 +7979,28 @@ class $modify(GJBaseGameLayer) {
         // Replay mode: block real input other than injections (still recorded).
         // !g_sessionOver is required: without it the block persists after the session
         // ends and manual play stops working
-        if (g_cfg.blockInput && g_started && !g_sessionOver && !g_injecting) {
+        // ...except a person's, once a takeover has given them the input (mod/takeover.hpp).
+        if (g_cfg.blockInput && g_started && !g_sessionOver && !g_injecting
+            && !takeover::personDriving()) {
             ev("handleButton_BLOCKED", down, button, isPlayer1);
             return;
         }
         ev("handleButton", down, button, isPlayer1);
+        // The person's presses, at the tick GD applies them: g_tick is the substep about to run
+        // (or, between frames, the next one), which is the step an injection of the same press
+        // is fed at.
+        if (!g_injecting && takeover::personDriving()) takeover::noteInput(down, button, isPlayer1);
         // Remember the raw press for the slope trace. Jump only (button 1) and
         // player 1 only: the second body follows the same input in these levels,
         // and a per-half press would need the dual input split, which no probe
         // here varies.
         if (button == 1 && isPlayer1) g_btnDown = down;
+        // cfg batchlog (print only): the tick each press and release reaches GD at
+        if (itermap::g_batchFrom >= 0 && g_tick >= itermap::g_batchFrom && g_tick <= itermap::g_batchTo
+            && g_started && !g_sessionOver)
+            writeResult("batch: button t=" + std::to_string((long long)g_tick) + " down=" + std::to_string(down ? 1 : 0)
+                        + " btn=" + std::to_string(button) + " p1=" + std::to_string(isPlayer1 ? 1 : 0)
+                        + " run=" + (seekcp::g_from < 0 ? std::string("head") : "cp@" + std::to_string(seekcp::g_from)));
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 

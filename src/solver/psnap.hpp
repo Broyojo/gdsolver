@@ -506,15 +506,34 @@ inline const char* const LAYER_RESTORE[] = {
 // INVARIANT IN ONE-TO-ONE CORRESPONDENCE WITH THE LIVE ARRAYS, not something
 // to write from outside.
 
+// cfg `secwsnaplayer` (bits, default 0, diagnosis): three more layer ints the snapshot carries --
+// 1 m_currentStep, 2 m_clicks, 4 m_queuedRecordedButtonsSize. A psnap restore leaves them where the
+// last stepped node had them while a checkpoint restore puts them back (secworld, 2026-10-08, three
+// custom windows); whether the next steps read them is what the bits are for. The list is chosen at
+// each call, so capture, restore and layerBytes agree within a run (the cfg is fixed for a session).
+inline int g_layerInput = 0;
+inline const char* const LAYER_INPUT[] = {
+    "m_currentStep", "m_clicks", "m_queuedRecordedButtonsSize",
+};
+
 inline const std::vector<Mem>& layerRestoreList() {
-    static std::vector<Mem> v = [] {
+    static std::vector<Mem> lists[8];
+    static bool built[8] = {};
+    const int bits = g_layerInput & 7;
+    if (!built[bits]) {
         std::vector<Mem> r;
-        for (auto& m : gbScalars())
+        for (auto& m : gbScalars()) {
+            bool take = false;
             for (auto* n : LAYER_RESTORE)
-                if (std::strcmp(m.name, n) == 0) { r.push_back(m); break; }
-        return r;
-    }();
-    return v;
+                if (std::strcmp(m.name, n) == 0) { take = true; break; }
+            for (int k = 0; k < 3 && !take; ++k)
+                if ((bits & (1 << k)) && std::strcmp(m.name, LAYER_INPUT[k]) == 0) take = true;
+            if (take) r.push_back(m);
+        }
+        lists[bits] = std::move(r);
+        built[bits] = true;
+    }
+    return lists[bits];
 }
 
 inline size_t layerBytes() {
@@ -575,12 +594,27 @@ struct Touch {
     // re-creates them, they must not be carried). cfg `secsnapobj=1`.
     GameObject* objectSnappedTo = nullptr;
     GameObject* collidedObject = nullptr;
+    // The rings the player is inside (m_touchingRings, a CCArray), cfg `secsnapring`. Same reason
+    // the pointers above can be carried: the objects live as long as the section.
+    std::vector<cocos2d::CCObject*> touchingRings;
+    bool haveTouching = false;
     // Player 2's, when the snapshot had one (see partner below).
     std::shared_ptr<Touch> second;
 };
 
 // cfg `secsnapobj=1`: also carry the two pointers above
 inline bool g_snapCollideObj = false;
+// cfg `secsnapring` (off): carry m_touchingRings, the rings a press fires. PlayerObject::pushButton
+// ring-jumps every object in that array; the collision pass adds a ring to it and to m_touchedRings
+// (GJBaseGameLayer::playerTouchedRing), and each GJBaseGameLayer::update starts by keeping only the
+// array's rings that m_touchedRings holds (PlayerObject::resetTouchedRings(false)) and clearing the
+// set. So the array is state from tick to tick, and it only ever loses rings at that prune. The
+// snapshot carried the set and not the array: a restored node pruned the array the node stepped
+// before had left, and a ring the node was inside was gone by the time it pressed. MEASURED on a
+// custom level (2026-10-08, `robodbg`): the plan's own branch tracks the game to the tick, presses at
+// t=9,354 inside a blue gravity orb, and gets a plain UFO click on the snapshot where the game -- and
+// the checkpoint path, whose restore re-runs the collision -- flips gravity.
+inline bool g_snapRing = false;
 
 // THE SECOND PLAYER travels with the first. Every snapshot below used to be of player 1 alone, so
 // a search through a dual section restored p1 and left p2 wherever the last branch had taken it:
@@ -603,6 +637,11 @@ inline void captureTouchOne(PlayerObject* p, Touch& out) {
     out.potentialSlopeMap = p->m_potentialSlopeMap;
     out.objectSnappedTo = p->m_objectSnappedTo;
     out.collidedObject = p->m_collidedObject;
+    out.touchingRings.clear();
+    out.haveTouching = g_snapRing && p->m_touchingRings;
+    if (out.haveTouching)
+        for (unsigned i = 0; i < p->m_touchingRings->count(); ++i)
+            out.touchingRings.push_back(p->m_touchingRings->objectAtIndex(i));
 }
 
 inline void restoreTouchOne(PlayerObject* p, const Touch& in) {
@@ -613,6 +652,10 @@ inline void restoreTouchOne(PlayerObject* p, const Touch& in) {
     if (g_snapCollideObj) {
         p->m_objectSnappedTo = in.objectSnappedTo;
         p->m_collidedObject = in.collidedObject;
+    }
+    if (g_snapRing && in.haveTouching && p->m_touchingRings) {
+        p->m_touchingRings->removeAllObjects();
+        for (auto* o : in.touchingRings) p->m_touchingRings->addObject(o);
     }
 }
 

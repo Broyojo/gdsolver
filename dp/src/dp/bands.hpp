@@ -83,12 +83,22 @@ inline bool startBandUsable() {
 // In a rotated frame (frame != 0) it is as before (the band is a world-Y quantity
 // and the frame mapping is a separate matter; the maze passes as it is, so it is
 // left alone).
-struct BandTrackRow { int t; BandKind kind; float fl, ce; };
+// src: WHICH band GD's getMinPortalY / getMaxPortalY returned (the MOD's fifth column):
+// 1 = branch A, read off the ground layers and moving with the camera ([layer+0x23c] != 0 and
+// [layer+0x2a0] == 0), 0 = branch B, the portal's band. -1 = the file has no fifth column (a
+// recording from before it was written), and every reader then behaves as it did without one.
+struct BandTrackRow { int t; BandKind kind; float fl, ce; int8_t src = -1; };
 inline std::vector<BandTrackRow> g_bandTrack;
 // The Interval rows' indices, in the same order. The lookup below walks THIS,
 // so a run that sees no D/N/U row behaves exactly as it did before the kinds
 // existed; the readers that want to see the other kinds ask bandTrackKindAt.
 inline std::vector<size_t> g_bandTrackIntervals;
+// The file's `t,S,src` rows (band_rows.hpp): the band's source changed at t while its kind and values did
+// not. Kept apart from g_bandTrack so that every reader of the rows -- the camera verdict, the band-seen
+// test, the dual walk -- sees exactly the rows it saw before the S rows existed; only the source lookup
+// (bandTrackKindAt's `src`) reads them. In tick order.
+struct BandSrcRow { int t; int8_t src; };
+inline std::vector<BandSrcRow> g_bandSrcRows;
 // --bandtrackend <t>: the last tick the recording behind --bandtrack reached. -1 =
 // not given, and the last row is held indefinitely as before.
 // Holding the last row keeps the frontier's neighbourhood fresh while the band is the
@@ -102,6 +112,21 @@ inline std::vector<size_t> g_bandTrackIntervals;
 // it2 is the same shape (ball portal at t=14,150, stale ceiling 390, model 375 vs GD
 // 397). Past the end the lookups answer "no row", so the State's portal band decides.
 inline long long g_bandTrackEnd = -1;
+// --bandholdend (g_bandHoldEnd, on; --no-bandholdend is the off arm):...but a worldline that has fired no mode portal since the
+// end keeps the last row. The State's own band is the portal's formula, and where the band is the
+// camera's that formula is not GD's band at all. SubZero 4002 t=21,340: a ball section whose
+// camera band settled at 1,476..1,764 at t=21,024 and stayed there; the recording behind the solve
+// ended at t=21,340, the model fell back to the ball portal's 1,500..1,740, seated the ball on a
+// floor at 1,515 and survived, while GD's ball fell on to 1,495.3 and died on the spike there at
+// 21,341 -- with the last row held the model follows GD to that death. A mode portal fired past
+// the end (lv10's case above) marks the State (kBandPastEnd) and the portal's band decides again.
+// g_bandHoldNow is the stepping State's answer, set at the top of stepOne under the flag.
+inline bool g_bandHoldEnd = true;
+inline thread_local bool g_bandHoldNow = false;
+constexpr uint8_t kBandPastEnd = 32;
+inline bool bandTrackPastEnd(long long t) {
+    return g_bandTrackEnd >= 0 && t > g_bandTrackEnd && !(g_bandHoldEnd && g_bandHoldNow);
+}
 // [2026-08-22 r107] **Look up the row at t+1.** The 36 fixups at lv22's vertical
 // entrance (x 20,000..20,090, the section where the band rises at +1.4px/tick)
 // named it: GD's seat is
@@ -118,7 +143,7 @@ inline long long g_bandTrackEnd = -1;
 // until the next. Callers pick the phase -- see bandTrackAt and the fly floor.
 inline bool bandTrackRowAt(long long t, double& fl, double& ce) {
     if (g_bandTrackIntervals.empty()) return false;
-    if (g_bandTrackEnd >= 0 && t > g_bandTrackEnd) return false;
+    if (bandTrackPastEnd(t)) return false;
     size_t lo = 0, hi = g_bandTrackIntervals.size();
     while (lo + 1 < hi) {
         const size_t m = (lo + hi) / 2;
@@ -136,9 +161,9 @@ inline bool bandTrackRowAt(long long t, double& fl, double& ce) {
 // imposed here: which staleness is acceptable is the caller's question, and
 // today every caller accepts any.
 inline bool bandTrackKindAt(long long t, BandKind& kind, double& fl, double& ce,
-                            long long& age) {
+                            long long& age, int* src = nullptr) {
     if (g_bandTrack.empty()) return false;
-    if (g_bandTrackEnd >= 0 && t > g_bandTrackEnd) return false;
+    if (bandTrackPastEnd(t)) return false;
     size_t lo = 0, hi = g_bandTrack.size();
     while (lo + 1 < hi) {
         const size_t m = (lo + hi) / 2;
@@ -149,8 +174,50 @@ inline bool bandTrackKindAt(long long t, BandKind& kind, double& fl, double& ce,
     fl = (double)g_bandTrack[lo].fl;
     ce = (double)g_bandTrack[lo].ce;
     age = t - (long long)g_bandTrack[lo].t;
+    if (src) {
+        *src = g_bandTrack[lo].src;
+        // ...unless the source changed since that row (an S row at or before t, after the row).
+        size_t a = 0, b = g_bandSrcRows.size();
+        while (a < b) {
+            const size_t m = (a + b) / 2;
+            if ((long long)g_bandSrcRows[m].t <= t) a = m + 1; else b = m;
+        }
+        if (a > 0 && g_bandSrcRows[a - 1].t >= g_bandTrack[lo].t) *src = g_bandSrcRows[a - 1].src;
+    }
     return true;
 }
+// --bandsrc (default on since 2026-10): a recorded row the MOD marks as the PORTAL's band (src 0) holds a flyer
+// whatever side of it the body is on. checkCollisions clamps the flying modes to whatever
+// getMaxPortalY returns (0x213c38); the "only while y is inside the band" gate below was written for
+// the camera's band (branch A), whose pmin/pmax are not a clamp when the body flies outside them. A
+// custom level's mini swing put on a block's top above the band (y 939, band top 937.89) is pulled
+// back to 928.89 on the next tick in GD. Rows without the column (src -1) keep the gate.
+inline bool g_bandSrc = true;
+// [2026-10-04] --bandowntrack: State::bandBranch bit 4 (kBandOwn) says this worldline's band
+// was written by a portal the recording behind --bandtrack never saw fire. The recording is one
+// route's camera; up to --bandtrackend it is read as truth for every route, so a route that
+// leaves the recorded one and takes a portal the recording passed below or above keeps the
+// recording's last band. Measured on a custom level: the recorded run stayed on the floor past a
+// ship portal at cy 1005; the solve that took that portal kept the earlier ship section's band
+// 630..930 (GD: 840..1140), rode its ceiling at y=915, and was called SOLVED, while GD sank onto
+// a spike at y=862. The anchor at t=18,000 carried GD's band and agreed with GD to the tick, so
+// the replay instruments never saw it. What "seen" means is bandTrackSawBand (below); an anchor
+// whose --startband the recording does not hold at t0 starts with the bit (cli.hpp). Off: the
+// bit is never set.
+constexpr uint8_t kBandOwn = 16;
+constexpr int kBandOwnNear = 3;   // GD's band changes on the portal's own tick
+inline bool g_bandOwnTrack = false;
+// --bandtrackseen: the mirror of --bandowntrack -- a band change in the recording comes from a portal
+// the recorded route fired, and a worldline that did not fire it keeps its own band. The recorded
+// band is passed over (step.hpp, bandTrackOtherRoute) when the state's own band is still the
+// recording's band from before the change, more than kBandOwnNear ticks after it, and only for rows
+// the mod marks as the portal's band (src 0) -- a camera's band pans for every route.
+// A custom level's spider: the recorded run takes a ship portal at t=212 (band 90..360 -> 90..390);
+// a search from t=76 rides the ceiling instead, never touches the portal, and taps up at t=219 into
+// the recording's 390 (lands at 376.5) where GD lands at 346.5 under its own 360 and dies at t=228
+// on a block the model's ceiling ran over. The search called that route alive to t=1,276. On by
+// default since 2026-10; --no-bandtrackseen turns it off.
+inline bool g_bandTrackSeen = true;
 inline bool bandTrackAt(long long t, double& fl, double& ce) {
     return bandTrackRowAt(t + 1, fl, ce);
 }
@@ -188,31 +255,155 @@ inline bool bandTrackFloorAt(long long t, double& fl, double& ce) {
 // Cached: this is read once per child per tick and the track runs to thousands
 // of rows. -1 = not computed yet; reset.hpp clears it with the track (a stale
 // verdict would otherwise cross into the next in-process solve).
-inline int g_bandTrackCam = -1;
+// The first use comes from the search's pool threads, so several can find it
+// unset at once. Each computes the same verdict from the read-only track; only
+// the one whose compare-exchange stores it prints the line (it used to print
+// once per thread that got in, a schedule-dependent count).
+inline std::atomic<int> g_bandTrackCam{-1};
 inline bool bandTrackIsCamera() {
-    if (g_bandTrackCam < 0) {
-        // Only Interval rows carry a ceiling to be on or off the grid, so they
-        // are the population -- both the numerator and the count this is
-        // compared against. A collapsed or absent band is not evidence either
-        // way about which kind of band the recording holds.
-        const size_t n = g_bandTrackIntervals.size();
-        if (n < 8) {
-            g_bandTrackCam = 0;          // too short to judge; as before
-        } else {
-            size_t off = 0;
-            for (const size_t i : g_bandTrackIntervals) {
-                const double c = (double)g_bandTrack[i].ce;
-                if (std::fabs(c - std::round(c / 30.0) * 30.0) >= 0.01) ++off;
-            }
-            g_bandTrackCam = (off * 2 > n) ? 1 : 0;
-            std::printf("bandtrack: %zu interval rows, %zu off-grid -> %s\n",
-                        n, off,
-                        g_bandTrackCam ? "CAMERA-driven (no physical ceiling)"
-                                       : "portal-set (the ceiling is a wall)");
+    const int cam = g_bandTrackCam.load(std::memory_order_relaxed);
+    if (cam >= 0) return cam != 0;
+    // Only Interval rows carry a ceiling to be on or off the grid, so they
+    // are the population -- both the numerator and the count this is
+    // compared against. A collapsed or absent band is not evidence either
+    // way about which kind of band the recording holds.
+    const size_t n = g_bandTrackIntervals.size();
+    size_t off = 0;
+    int verdict = 0;                     // too short to judge (n < 8); as before
+    if (n >= 8) {
+        for (const size_t i : g_bandTrackIntervals) {
+            const double c = (double)g_bandTrack[i].ce;
+            if (std::fabs(c - std::round(c / 30.0) * 30.0) >= 0.01) ++off;
         }
+        verdict = (off * 2 > n) ? 1 : 0;
     }
-    return g_bandTrackCam != 0;
+    int unset = -1;
+    if (g_bandTrackCam.compare_exchange_strong(unset, verdict, std::memory_order_relaxed)
+        && n >= 8)
+        std::printf("bandtrack: %zu interval rows, %zu off-grid -> %s\n",
+                    n, off,
+                    verdict ? "CAMERA-driven (no physical ceiling)"
+                            : "portal-set (the ceiling is a wall)");
+    return verdict != 0;
 }
+// --bandtrack <file>: read the recorded band (history at g_bandTrack's declaration). Appends to the
+// track, as every --bandtrack on a command line always has.
+//
+// NO ROW IS DROPPED. The old reader kept only `ce > fl` and said nothing about the rest, so a
+// collapsed band reached the lookup as "no row" and the lookup answered with the last interval it
+// had -- an old, wrong, non-degenerate band. Each row now arrives with its kind and is counted; what
+// a reader does with a kind is the reader's decision, not the parser's.
+//
+// The version is the column count: three fields is the original `t,floor,ceil`, four is
+// `t,kind,a,b`, five adds the source. No header line, because a reader of the older format would
+// take one for a row. An S row (band_rows.hpp) goes to g_bandSrcRows, never to the track.
+inline bool loadBandTrack(const char* path) {
+    std::FILE* bf = std::fopen(path, "r");
+    if (!bf) {
+        std::fprintf(stderr, "bandtrack: cannot open %s\n", path);
+        return false;
+    }
+    size_t kn[4] = {0, 0, 0, 0};
+    size_t skipped = 0, nSrc = 0;
+    char line[256];
+    while (std::fgets(line, sizeof line, bf)) {
+        BandTrackRow r{};
+        char k = 0;
+        float a = 0, b = 0;
+        // a fifth field is the band's source (BandTrackRow::src); absent = -1
+        int src = -1;
+        const int nf = std::sscanf(line, "%d,%c,%f,%f,%d", &r.t, &k, &a, &b, &src);
+        if (nf >= 3 && k == 'S') {
+            const int s = (int)a;
+            g_bandSrcRows.push_back({r.t, (int8_t)((s == 0 || s == 1) ? s : -1)});
+            ++nSrc;
+            continue;
+        }
+        if (nf >= 2
+            && (k == 'I' || k == 'D' || k == 'N' || k == 'U')) {
+            r.src = (int8_t)((nf >= 5 && (src == 0 || src == 1)) ? src : -1);
+            r.fl = a;
+            // A D row carries the collapsed value in both columns, so this does not depend on the
+            // fourth field being present -- but the writers fill it in anyway, so a future reader
+            // may tighten the field count.
+            r.ce = (k == 'D') ? a : b;
+            r.kind = k == 'I' ? BandKind::Interval
+                   : k == 'D' ? BandKind::Degenerate
+                   : k == 'N' ? BandKind::NoBand
+                              : BandKind::Unknown;
+            // An interval that is not one is not silently kept: the invariant is part of the type.
+            if (r.kind == BandKind::Interval && !(r.ce > r.fl))
+                r.kind = BandKind::Unknown;
+        } else if (std::sscanf(line, "%d,%f,%f", &r.t, &r.fl, &r.ce) == 3) {
+            r.kind = r.ce > r.fl  ? BandKind::Interval
+                   : r.ce == r.fl ? BandKind::Degenerate
+                                  : BandKind::Unknown;
+            if (r.ce < r.fl)
+                std::fprintf(stderr, "bandtrack: t=%d has ceil %g below floor %g\n", r.t,
+                             (double)r.ce, (double)r.fl);
+        } else {
+            // A line that matches neither shape. It is still not dropped in silence: the count is
+            // printed with the rest, because "nothing here" and "I could not read this" are the two
+            // the whole change exists to keep apart.
+            ++skipped;
+            continue;
+        }
+        if (r.kind == BandKind::Interval)
+            g_bandTrackIntervals.push_back(g_bandTrack.size());
+        ++kn[(size_t)r.kind];
+        g_bandTrack.push_back(r);
+    }
+    std::fclose(bf);
+    g_bandTrackCam = -1;   // the verdict belongs to THIS track
+    if (nSrc)
+        std::printf("bandtrack: %zu rows (I %zu D %zu N %zu U %zu) unreadable %zu, source changes %zu (%s)\n",
+                    g_bandTrack.size(), kn[0], kn[1], kn[2], kn[3], skipped, nSrc, path);
+    else
+        std::printf("bandtrack: %zu rows (I %zu D %zu N %zu U %zu) unreadable %zu (%s)\n",
+                    g_bandTrack.size(), kn[0], kn[1], kn[2], kn[3], skipped, path);
+    return true;
+}
+// --bandowntrack: did the recording see THIS band written near tick t? On a portal-set track a
+// row within kBandOwnNear ticks must also carry the band itself, or it is another portal's -- a
+// second lane's portal firing within the window, which the presence test alone would take as
+// this one. The track holds CHANGES only, so a portal that rewrote the band the recording already
+// held leaves no row: a band equal to the row in force at t is seen too (a custom level's UFO
+// portal rewrote [300, 600] over [300, 600], and the old test made the band the state's own and
+// dropped the recording's for the rest of the track).
+// A camera-driven track is always "seen": its rows are the camera's pans, not portal writes, so
+// their presence near t says nothing about which portal fired (a custom level's anchor re-fired
+// the ship portal GD had just taken, on a tick the camera did not move, and the bit threw away
+// the camera ceiling GD stopped the ship on).
+inline bool bandTrackSawBand(long long t, double fl, double ce) {
+    if (g_bandTrack.empty()) return false;
+    if (bandTrackIsCamera()) return true;
+    size_t lo = 0, hi = g_bandTrack.size();
+    while (lo < hi) {
+        const size_t m = (lo + hi) / 2;
+        if ((long long)g_bandTrack[m].t < t - kBandOwnNear) lo = m + 1; else hi = m;
+    }
+    for (size_t i = lo; i < g_bandTrack.size() && (long long)g_bandTrack[i].t <= t + kBandOwnNear;
+         ++i) {
+        const BandTrackRow& r = g_bandTrack[i];
+        if (r.kind == BandKind::Interval && std::fabs((double)r.fl - fl) <= 1.0
+            && std::fabs((double)r.ce - ce) <= 1.0)
+            return true;
+    }
+    double f0 = 0.0, c0 = 0.0;
+    return bandTrackRowAt(t, f0, c0) && std::fabs(f0 - fl) <= 1.0 && std::fabs(c0 - ce) <= 1.0;
+}
+// [2026-10-05] --portalstarty: a mode portal's band is centred on where the portal was PLACED,
+// not where a group has since moved it. animateInDualGroundNew (0x140213370) reads the portal's
+// y through vtable slot 0x670, GameObject::getStartPos (0x140137ca0), which copies
+// m_startPosition (+0x3c8); the current position (m_positionX/Y, +0x3b8/+0x3c0) is
+// getRealPosition, slot 0x4a8. Measured on a custom level: a UFO portal placed at y=450 and moved
+// to 510 at t=3 left GD's band at [300, 600] = bandFor(450) for the next 300 ticks, while the
+// model's bandFor(510) put the floor at 360 and stopped the UFO on it as GD fell past. A static
+// portal has never moved, so its cy is its start. On by default since 2026-10-05 (also five moved
+// mode portals crossed in GD, every band at the placed position; a kitref of 0 fixed and 0 broken in
+// 1,773 episodes on one exe); --no-portalstarty is the off arm, the portal's current cy (step.hpp
+// portalBandY).
+inline bool g_portalStartY = true;
 // Calibration factor for the band height (height asked of GD via --startband / the
 // value computed from the zoom). 0 = uncalibrated. Fixed once, at the first tick
 // where the band is evaluated (= the anchor).
@@ -256,13 +447,8 @@ inline long long frameRevReach(int f, int r) {
 // above: reset.hpp has to see it.
 inline long long g_fxWatchT = -1;
 inline char g_fxWhy[1600] = "";
-inline long long g_frameRevCall[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-// ...and HITS by the same pair. Frame 0's 2,822 hits are the only ones this
-// level produces, and frame 0 is worn by both the plain frame and the anchor
-// rewrite's (frame 0, rev 1) -- so a frame-only hit count cannot say whether
-// any record was ever applied to a state that GD recorded as frame 2. If none
-// were, the geometry of `rev` has no consequence yet and can stay open.
-inline long long g_frameRevHit[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+// (the fixup lookups and hits by the same (frame, rev) pair are counted in
+// fixup.hpp, g_fixupCensus)
 // --dcydbg: one line every time a SURFACE'S OWN SPEED is stamped into vy as
 // `dcy / 0.25`, tagged with which of the four sites did it. Separate from
 // --slopedbg only because that one prints per ramp tick and buries these.
@@ -302,11 +488,8 @@ inline bool g_shipCeilSet = false;
 // comes earlier in the header chain.
 // On by default since 2026-10 (was opt-in).
 // (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
-// --rotlast: adopt the LAST 2900 that matches on a tick rather than the nearest
-// one on the perpendicular axis. That is the pre-0a1e8b6 rule; with
-// --rotperp 30 it restores that function exactly, which is how the 84% cold run
-// of 08-24 is reproduced on a current build.
-inline bool g_rotLast = false;
+// (--rotlast, the A/B switch that adopted the LAST matching 2900 on a tick instead of the nearest one
+// on the perpendicular axis -- the pre-0a1e8b6 rule -- is gone.)
 // [2026-09-02] THE BAND'S HEIGHT IS THE ONE THE PORTAL WROTE, and a Free Mode
 // portal writes nothing. Read out of the exe and checked against GD's own
 // 21,140-tick dump of lv22 (notes: band-numerator-writers, 2026-09-02):
@@ -354,9 +537,36 @@ inline bool g_freeModeCol = false;
 // the old behaviour exactly, which is what the anchored suites were built on.
 constexpr uint8_t kBandFreeKnown = 4;
 constexpr uint8_t kBandFree = 8;
+// (--bandowntrack's bit is kBandOwn, declared with the track above.)
 inline bool bandIsWall(uint8_t branch, bool legacyGridTest) {
     if (branch & kBandFreeKnown) return (branch & kBandFree) == 0;
     return legacyGridTest;
+}
+// --flyfree: ...and the flying modes ask it too. The cube family's band faces went through
+// bandIsWall from the start; the ship / UFO / swing branch and the wave's own branch clamped to
+// the band whatever the byte said. Measured on a custom level whose first ship portal carries Free
+// Mode (band [7804, 8126] in GD's own pmin/pmax): GD's ship falls straight past 7819 = floor + 15
+// at -6.4 a tick and dies on a hazard strip at 7800 that rides along beneath it, which is where
+// that level's runs keep dying; the model sat on 7819 (fly/bandfloor) and lived thousands of ticks
+// longer. Known and set only -- an unknown byte keeps the old clamp. On by default since 2026-10-06;
+// --no-flyfree is the off arm.
+inline bool g_flyFree = true;
+// --dualzoomband (default on since 2026-10): a dual cube's or robot's band (--dualcubeband's floor and ceiling)
+// is divided by the camera zoom about its centre, as GD's getMinPortalY / getMaxPortalY give it in
+// branch B (the portal's centre -+ 0.5 * H / zoom). The flying modes' clamp rewrites its ceiling for
+// the zoom; the cube family's took the stored zoom-1 band. A custom level's robot portal in a dual at
+// y 285 under a zoom of 0.85: GD's pmin/pmax read 126.18 / 443.82 = 285 -+ 135 / 0.85 on every tick of
+// the section, and its bodies fell past 165 and rose past 405 (the zoom-1 band's seats), where the
+// model stood them on the band and the game killed them on spikes beneath. Not over a recorded band,
+// which is GD's own value already; only where the zoom is not 1 or the band below is animating.
+// ...and under a Static Camera (branch A) the height is the ground layers', which the dual portal
+// animates in from the screen's 322 like a mode portal does (bandProgress), over the dual's 0.4 s.
+// The same custom level's dual entry: GD's (pmax - pmin) * zoom reads 322 - 52 * p, p eased over 96
+// ticks, while the zoom eases from 0.98 to 0.85 (with --zoomchain, modifiers.hpp, the model's zoom
+// is GD's to 0.000005 there; without it, 0.017 off once the speed changes inside the ease).
+inline bool g_dualZoomBand = true;
+inline bool flyBandFree(uint8_t branch) {
+    return g_flyFree && (branch & kBandFreeKnown) && (branch & kBandFree);
 }
 // The same for the trigger queue's admission gate: PlayLayer::addObject only
 // enqueues a trigger when it is neither touch- nor spawn-triggered, so those
@@ -394,12 +604,15 @@ inline uint8_t bandAnimStep(uint8_t a) {
     const int e = a & 0x7f;
     return (uint8_t)((a & 0x80) | (e >= 127 ? 127 : e + 1));
 }
-inline double bandProgress(uint8_t a) {
+// --dualzoomband: in a dual animateInDualGroundNew (0x213370) tweens the band in over 0.4 s, not 0.5
+// (its duration is 0.4 when the dual byte +0x422 or +0x310 is set): 96 ticks.
+constexpr int kBandAnimInDual = 96;
+inline double bandProgress(uint8_t a, int inTicks = kBandAnimIn) {
     const bool in = (a & 0x80) != 0;
     const int e = a & 0x7f;
-    if (e >= (in ? kBandAnimIn : kBandAnimOut)) return in ? 1.0 : 0.0;
+    if (e >= (in ? inTicks : kBandAnimOut)) return in ? 1.0 : 0.0;
     // ease-in-out, the exponent GD's tween carries
-    const double u = (double)e / (in ? kBandAnimIn : kBandAnimOut);
+    const double u = (double)e / (in ? inTicks : kBandAnimOut);
     const double rate = in ? 2.0 : 1.5;
     const double t = 2.0 * u;
     const double e01 = t < 1.0 ? 0.5 * std::pow(t, rate)

@@ -83,7 +83,7 @@ python py/dev.py                                   # build, deploy, launch GD
    yesterday's files — these have each produced convincing wrong conclusions.
    One cold run at a time, in its own `--data-dir`.
 5. **Public tree is English.** Code comments and documentation here are in
-   English; the private lab may be in Japanese.
+   English; private notes kept outside the tree may be in any language.
 
 ## Safety (kept from the project spec)
 
@@ -96,5 +96,5 @@ on a list of modes is what leaked the last time. Every session prints what it
 blocked and a `level record changed:` line that must read `none`. Replays are
 marked as bot input; nothing here may be used to claim a record.
 
-`CLAUDE.local.md` (not tracked) holds the original Japanese spec and the
+`CLAUDE.local.md` (not tracked) holds the original project spec and the
 machine-specific operating notes.

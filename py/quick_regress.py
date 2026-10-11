@@ -624,9 +624,22 @@ def pad_anchor_args(level: int, t0: int, gd: dict | None = None) -> list[str]:
 
 _BANDTRACK: dict[int, list[str]] = {}
 _BANDTRACK_LOCK = threading.Lock()
+_BANDTRACK_OWN: list[Path] = []   # the private directory made for callers that name none
 
 
-def band_track_args(level: int, gd: dict) -> list[str]:
+def _own_bandtrack_dir() -> Path:
+    """A directory of this process's own, removed when it exits (callers hold _BANDTRACK_LOCK)."""
+    if not _BANDTRACK_OWN:
+        import atexit
+        import shutil
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="gdsolver_bandtrack_"))
+        atexit.register(shutil.rmtree, d, True)
+        _BANDTRACK_OWN.append(d)
+    return _BANDTRACK_OWN[0]
+
+
+def band_track_args(level: int, gd: dict, dst_dir: Path | None = None) -> list[str]:
     """Pass the rows where gdref's pmin/pmax change through --bandtrack.
 
     The loop always passes this in the
@@ -662,11 +675,23 @@ def band_track_args(level: int, gd: dict) -> list[str]:
 
     The write is claimed with `gdtas.inputguard` so a guarded run can tell OUR
     rewrite (expected, every run does it) from a SECOND PROCESS rewriting the
-    same path (the 2026-09-06 collision), which is invisible in the output."""
+    same path (the 2026-09-06 collision), which is invisible in the output.
+
+    [2026-10-09] ...AND IT IS NO LONGER A SHARED FILE. The band went to
+    gdref/lv<N>.bandtrack.txt, which every caller in every session wrote and
+    every solver it started read by path, so a writer between one run's write
+    and its solver's read measured that run against another band: a probe that
+    wrote its own lv18 band at 08:18 was read by another session's quick at
+    08:19, and lv18 alone came out different. It is written in `dst_dir` now
+    (quick_regress passes its run directory, the --tmp) or, for a caller that
+    names none, in a directory of this process's own; gdref is only read.
+    Re-recording gdref (`--record`) therefore needs no band step: every run
+    builds the band again from gdref/lv<N>.csv, and nothing reads the old
+    gdref/lv*.bandtrack.txt files any more."""
     with _BANDTRACK_LOCK:
         if level in _BANDTRACK:
             return _BANDTRACK[level]
-        out = REF / f"lv{level}.bandtrack.txt"
+        out = (Path(dst_dir) if dst_dir is not None else _own_bandtrack_dir()) / f"lv{level}.bandtrack.txt"
         args: list[str] = []
         try:
             rows = 0
@@ -788,7 +813,7 @@ def seg_jobs(level: int, a) -> tuple[dict, list]:
                 "--out", str(base)]
             if r.get("pmin") and r.get("pmax"):
                 args += ["--startband", f"{r['pmin']},{r['pmax']}"]
-            args += band_track_args(level, gd)
+            args += band_track_args(level, gd, tmp.dir)
             args += rot_anchor_args(level, t)
             args += pad_anchor_args(level, t, gd)
             # --xtrack-ref: the reference run's own x per tick, for dp's --xtrack (the loop
@@ -895,7 +920,7 @@ def seg_check(level: int, a) -> dict:
                 "--out", str(base)]
         if r.get("pmin") and r.get("pmax"):
             args += ["--startband", f"{r['pmin']},{r['pmax']}"]
-        args += band_track_args(level, gd)
+        args += band_track_args(level, gd, tmp.dir)
         trig, grp = LEVEL_DATA / f"triggers_lv{level}.txt", LEVEL_DATA / f"objgroups_lv{level}.txt"
         if trig.exists() and grp.exists():
             args += ["--triggers", str(trig), "--objgroups", str(grp)]

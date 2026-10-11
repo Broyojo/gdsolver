@@ -40,6 +40,20 @@ inline int g_p2 = 0;
 inline int g_calls = 0;
 inline void reset() { g_first.clear(); g_p2 = 0; g_calls = 0; }
 }
+// ...and the TOUCH TRIGGERS themselves, which the map above does not hold: measured on four custom
+// levels' kits, touchseed's map holds orbs and teleport portals only, never a touch-triggered Move or
+// Pulse (one level's 187 Move and 93 Pulse boxes, another's 33 Moves: none). GD fires a touch trigger from
+// collisionCheckObjects' object types 0x14 / 0x2d through GJBaseGameLayer::playerTouchedTrigger
+// (0x217f50): when (uid, player) is not yet in the effect manager's triggered set it stores it and calls
+// the trigger's triggerObject, and any later call that attempt is a no-op. So the first call per uid is
+// the fire. Read-only: recorded before the call, nothing changed. p1's only, as touchseed, and for
+// --rectouch (repair.hpp): the boxes GD fired in the attempt the recording comes from.
+namespace touchfire {
+inline std::unordered_map<int, int> g_first;   // touch trigger uid -> first tick, p1
+inline int g_p2 = 0;                           // calls for the second player, counted only
+inline int g_calls = 0;                        // a denominator for a zero -- see touchseed::g_calls
+inline void reset() { g_first.clear(); g_p2 = 0; g_calls = 0; }
+}
 // ...and the same question for GRAVITY PORTALS, which have the same hole:
 // State::portalLatch accumulates over the run, so a state handed to dp's
 // --start begins with an empty mask and believes every portal the run has
@@ -78,8 +92,12 @@ inline void reset() { g_first.clear(); g_calls = 0; }
 // fire itself: a successful ringJump sets one of the per-tick fire latches 0x98b / 0x98c / 0x98d
 // (0x398e08..0x398e26), and a call that returns early leaves them as they were. p1's only, in fire
 // order.
+// ...and p2's apart, for dp's --spentorb2 (passed only to a call that asks for it, dp --spentp2). GD keeps a
+// ring's "fired" per body (EnhancedGameObject::hasBeenActivatedByPlayer reads +0x5b4 for p1, +0x5b5 for p2,
+// and collisionCheckObjects skips a ring that answers yes), so p2's rings are not p1's.
 namespace ringseed {
 inline std::vector<std::pair<int, int>> g_fired;   // (ring uid, tick), p1, oldest first
+inline std::vector<std::pair<int, int>> g_fired2;  // ...p2's
 inline int g_calls = 0;   // ringJump calls on p1 -- a denominator for a zero
-inline void reset() { g_fired.clear(); g_calls = 0; }
+inline void reset() { g_fired.clear(); g_fired2.clear(); g_calls = 0; }
 }

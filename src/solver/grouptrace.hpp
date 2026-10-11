@@ -26,6 +26,22 @@
 
 namespace grouptrace {
 
+// cfg gtrollcheck: FNV-1a of a whole file (0 when it cannot be read).
+inline unsigned long long fileFnv(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0;
+    unsigned long long h = 1469598103934665603ULL;
+    std::vector<char> buf(1 << 20);
+    while (f.read(buf.data(), (std::streamsize)buf.size()) || f.gcount()) {
+        const std::streamsize got = f.gcount();
+        for (std::streamsize i = 0; i < got; ++i) {
+            h ^= (unsigned char)buf[(size_t)i];
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
 inline bool g_on = false;      // cfg `grouptrace=1`
 inline long long g_stride = 1; // cfg `groupstride=<n>` (subsampling)
 // cfg `grouptraceall=1`: track every object, not only the grouped non-decorations.
@@ -231,15 +247,42 @@ inline Roll roll(long long endTick = -1) {
             const std::string last =
                 std::string(DATA_DIR) + "/grouptrace_last.txt";
             const std::string tmp = last + ".tmp";
-            {
-                std::ifstream src(cur, std::ios::binary);
-                std::ofstream dst(tmp, std::ios::binary | std::ios::trunc);
-                dst << src.rdbuf();
-                if (endTick >= 0) dst << "end," << endTick << "\n";
-                dst.flush();
+            // The trailer goes onto the recording itself and the recording is RENAMED onto _last
+            // (replacing it, atomically on one volume): the same bytes the copy below wrote, without
+            // copying them -- 9 s of a 300 s run on a custom level whose recordings reach 293 MB.
+            // A rename that fails (a reader holding _last open: a dp read, a kit copy, a scan)
+            // falls back to the copy and says so once.
+            if (endTick >= 0) {
+                std::ofstream app(cur, std::ios::binary | std::ios::app);
+                app << "end," << endTick << "\n";
             }
+            // cfg gtrollcheck (debug): the copy's bytes, hashed before the rename, against _last after
+            unsigned long long checkSig = 0;
+            if (g_cfg.gtRollCheck) checkSig = fileFnv(cur);
             std::error_code ec;
-            std::filesystem::rename(tmp, last, ec);
+            std::filesystem::rename(cur, last, ec);
+            if (ec) {
+                static bool s_said = false;
+                if (!s_said) {
+                    s_said = true;
+                    log::warn("grouptrace: renaming the recording onto grouptrace_last.txt failed ({}) "
+                              "- copying it instead from now on when that happens", ec.message());
+                }
+                // The copy, from the recording as it now stands (trailer included).
+                {
+                    std::ifstream src(cur, std::ios::binary);
+                    std::ofstream dst(tmp, std::ios::binary | std::ios::trunc);
+                    dst << src.rdbuf();
+                    dst.flush();
+                }
+                ec.clear();
+                std::filesystem::rename(tmp, last, ec);
+            }
+            if (g_cfg.gtRollCheck && !ec) {
+                const unsigned long long got = fileFnv(last);
+                log::info("gtrollcheck: {} (copy {:016x} last {:016x})",
+                          got == checkSig ? "same bytes" : "MISMATCH", checkSig, got);
+            }
             if (ec) {
                 // if rename fails, keep the previous recording (do not throw)
                 std::filesystem::remove(tmp, ec);

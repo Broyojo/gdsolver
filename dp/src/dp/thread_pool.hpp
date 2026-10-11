@@ -208,12 +208,19 @@ inline double g_coinWinLen = 0.0;
 // 160.1 -> 163.3 s coins on, 22/22 either way (lv14 24 -> 9 s; lv19 20 -> 23 s and lv21 10 ->
 // 11 s pay for the lead step at a wall that wanted the cap).
 // (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
-// --ladderx0 (off; with --ladderback; a measurement): the window from x 0 at the full cap, once,
-// before the plain search at a wall neither kind of step moved (cli.hpp cliMain step 3). It
-// crosses lv16's wall at x 11,371 (34 -> 11 s) and costs every wall no search crosses a second
-// plain-sized search: RC9 lv20 26 -> 54 s offline, SubZero 4002 with coins 251 -> 853 s of dp in
-// the cold.
-inline bool g_ladderX0 = false;
+// (--ladderx0, a measurement arm that ran the window from x 0 at the full cap once before the plain search at
+// a wall neither kind of step moved, is gone: it crossed one wall (34 -> 11 s) and cost every wall no search
+// crosses a second plain-sized search, e.g. 251 -> 853 s of dp on a coin run.)
+// --ladderovercap: a window that neither kind of step moves, with its cap at --cap,
+// gets up to two more attempts with the WINDOW's cap at 2x and then 4x --cap before the plain search
+// (the plain search is --cap everywhere, the same ceiling, so it cannot cross what the window could
+// not). The rest of the map keeps its caps, so the extra breadth is paid only over the window, and
+// the memory gate (--memlimit) still bounds it. lv22's anchor at t=6,986 (the swing portal at
+// x 9,315): every window at cap 2000 and the plain search die in the climb at t=7,877-8,134, while
+// the same window at 4000 or 8000 reaches t=11,948 -- the window's position was never the limit.
+// On by default since 2026-10-07 (lv22 cold without a section-solver handoff); --no-ladderovercap is the
+// off arm.
+inline bool g_ladderOverCap = true;
 // --capenvelope (off; --ladderenv passes it to the attempts after a coin's miss prune, cli.hpp
 // cliMain): a class the alive cap thins keeps its lowest and its highest state
 // (by y, then vy, then layer order) before the stride takes the rest of its share. The stride

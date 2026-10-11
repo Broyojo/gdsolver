@@ -4,6 +4,18 @@
 
 using namespace p1;
 
+// Whether the solver runs with the spider pad loaded: dp's g_spiderPad is on by default, and the
+// solver reads its arguments in order, so the last --spiderpad / --no-spiderpad among the extra
+// arguments (cfg dparg) decides -- the same answer the CLI comes to.
+static bool solverSpiderPad() {
+    bool on = true;
+    for (const auto& a : g_cfg.dpArgs) {
+        if (a == "--spiderpad") on = true;
+        else if (a == "--no-spiderpad") on = false;
+    }
+    return on;
+}
+
 class $modify(PadTraceGameObject, EnhancedGameObject) {
     void activatedByPlayer(PlayerObject* p) {
         // THE ANCHOR PAYLOAD'S SOURCE. This is the only setter of the flag the
@@ -52,7 +64,12 @@ class $modify(PadTraceGameObject, EnhancedGameObject) {
             }
             // ...and pads, for dp's --spentpad (padseed in sweep.hpp). Unconditional for
             // the same reason as the two recorders above.
-            if (ty == 8 || ty == 9 || ty == 10 || ty == 34) {
+            // The spider pad (44) only while the solver loads it (--spiderpad, on by default):
+            // under --no-spiderpad the solver does not load the object, takes its uid for "not a
+            // pad in this level" and skips it, so carrying it would change nothing but the
+            // arguments -- which have to stay byte-identical with the flag off.
+            const bool spiderPadSeed = ty == 44 && solverSpiderPad();
+            if (ty == 8 || ty == 9 || ty == 10 || ty == 34 || spiderPadSeed) {
                 ++padseed::g_calls;
                 auto* l = GJBaseGameLayer::get();
                 if (l && p == l->m_player1) {
@@ -386,6 +403,38 @@ class $modify(PlayerObject) {
     // become unknowable)
     void checkSnapJumpToObject(GameObject* object) {
         auto* l = GJBaseGameLayer::get();
+        // cfg snapnodesync (on by default; =0 is the off arm). GD's snap (0x393cb0) reads the object's NODE position
+        // (getPosition): it nudges x to node.x + m_snapDistance and then stores
+        // m_snapDistance = player x - node.x. A move trigger moves only the real position
+        // (m_positionX/Y); the node follows in the visibility pass, which in play runs every frame
+        // and covers whatever is on screen -- an object the player lands on always is. With that
+        // pass skipped the node stays where the object was when the pass last saw it, so a landing
+        // on a moved object snaps against an old x (SubZero 4003 t=6,238: node 5,175 screen off,
+        // 5,235 at 1x, and the solve's plan dies at 1x real time at t=6,444). Putting this one
+        // object's node at its real position is what the pass would have done; an object whose
+        // node is already there is left alone, so nothing changes where nothing moved.
+        // GameObject::setPosition (0x197b60) moves the node and its child sprites; it does not
+        // write m_positionX/Y.
+        // cfg snapnodelog=1 (print only): every snap whose object's node is not at its real
+        // position, before any sync -- with the visibility pass on, that is an object still moving
+        // since the last pass, the case where 1x reads a node up to one frame old.
+        if (g_cfg.snapNodeLog && object && l && this == l->m_player1) {
+            const CCPoint node = object->getPosition();
+            const float rx = (float)object->m_positionX, ry = (float)object->m_positionY;
+            if (node.x != rx || node.y != ry) {
+                char b[200];
+                snprintf(b, sizeof(b), "snapnode: t=%lld uid=%d node=(%.3f,%.3f) real=(%.3f,%.3f) dx=%+.3f "
+                         "vis=%s sync=%d", (long long)g_tick, object->m_uniqueID, node.x, node.y, rx, ry,
+                         rx - node.x, visibilityPassOff() ? "off" : "on",
+                         (g_cfg.snapNodeSync && visibilityPassOff()) ? 1 : 0);
+                writeResult(b);
+            }
+        }
+        if (g_cfg.snapNodeSync && object && visibilityPassOff()) {
+            const CCPoint real((float)object->m_positionX, (float)object->m_positionY);
+            const CCPoint node = object->getPosition();
+            if (node.x != real.x || node.y != real.y) object->setPosition(real);
+        }
         bool watch = g_cfg.snapTrace && l && this == l->m_player1 && object;
         if (!watch) { PlayerObject::checkSnapJumpToObject(object); return; }
         GameObject* prev = this->m_objectSnappedTo;
@@ -435,14 +484,24 @@ class $modify(PlayerObject) {
     void ringJump(RingObject* object, bool skipCheck) {
         auto* l = GJBaseGameLayer::get();
         bool isP1 = object && l && this == l->m_player1;
+        // ...and p2 (ringseed::g_fired2, dp --spentorb2): the same latches on its own object
+        const bool isP2 = object && l && !isP1 && this == l->m_player2;
         // ringseed (sweep.hpp), for dp --spentorb: a call that fires sets one of the per-tick
         // fire latches 0x98b / 0x98c / 0x98d; one that returns early leaves them alone.
         const unsigned char* const fireLatch = (const unsigned char*)this + gdoff::kPlayerTouchedRing;
         auto latchBits = [&]() {
             return (fireLatch[0] ? 1 : 0) | (fireLatch[1] ? 2 : 0) | (fireLatch[2] ? 4 : 0);
         };
-        const int latchBefore = isP1 ? latchBits() : 0;
+        const int latchBefore = (isP1 || isP2) ? latchBits() : 0;
         auto noteRingFire = [&]() {
+            if (isP2) {
+                if ((latchBits() & ~latchBefore) == 0) return;
+                const int uid = object->m_uniqueID;
+                for (const auto& f : ringseed::g_fired2)
+                    if (f.first == uid) return;
+                ringseed::g_fired2.push_back({uid, (int)g_tick});
+                return;
+            }
             if (!isP1) return;
             ++ringseed::g_calls;
             if ((latchBits() & ~latchBefore) == 0) return;

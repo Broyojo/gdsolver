@@ -174,8 +174,8 @@ python -m gdmcp.cli objects --level 1 --x0 500 --x1 800
   This is exactly how "the MOD is dropping inputs" got misdiagnosed (2026-07-31).
   → `parse_plan_file` raises if a line contains `input=` but cannot be parsed.
 - **PowerShell 5.1 reads a BOM-less UTF-8 .ps1 as ANSI.**
-  A .ps1 with Japanese comments must be saved with a BOM (without one it is a syntax
-  error).
+  A .ps1 with non-ASCII text (comments in a language other than English, say) must be
+  saved with a BOM (without one it is a syntax error).
 - **If an observation looks like "the input is not taking effect", suspect your own
   reading and writing first.** In the BOM case above, GD was run 13 times, varying
   lengths, ticks and history, before it finally came down to our own parser.

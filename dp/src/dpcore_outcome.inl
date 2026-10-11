@@ -1,5 +1,5 @@
-// The body of outcome() in dp_bridge.cpp and dp_bridge2.cpp: one list of the fields, read from
-// whichever copy of the core `dp` names in the including file.
+// The body of outcome() in dpcore.cpp and src/mod/dp_bridge2.cpp: one list of the fields, read
+// from whichever copy of the core `dp` names in the including file.
 SolveOutcome o;
 o.verdict = dp::g_outcome.verdict;
 o.horizonCut = dp::g_outcome.horizonCut;

@@ -3,7 +3,7 @@ r"""Which `g_*` global carries state out of one solve and into the next?
 `dp::cliMain` was written as a process: parse a command line, load a level,
 search, print, exit. Under that assumption a namespace-scope global IS
 per-solve state and nothing ever had to clear one. The mod broke it -- it calls
-cliMain in-process dozens of times per level (src/mod/dp_bridge.cpp), and the
+cliMain in-process dozens of times per level (dp/src/dpcore.cpp), and the
 cold suite's `--one-session` runs all 22 levels in one game -- so every such
 global now reaches the NEXT call. `dp/src/dp/reset.hpp` is the answer to that,
 and `p1::resetSessionState` (src/mod/plan_io.hpp) is the mod's own copy of the
@@ -49,6 +49,21 @@ Name matching alone is not enough, and each of these has bitten:
   * reads.      A name appearing in a reset body in a NON-mutating position is
                 not coverage. Reported separately (`touched but not mutated`)
                 rather than counted.
+  * homonyms.   A name can be declared in several namespaces (g_on is in
+                four). Keyed by the bare name, the first declaration was the
+                only one in the table, and a reset of ANY of them counted for
+                it: padtrace::reset clearing padtrace::g_lines stood for
+                orbtrace::g_lines, which nothing clears, and solver::g_killY sat
+                outside the audit behind itermap::g_killY. Globals are keyed by
+                qualified name, and every token is resolved to the global it
+                names from where it stands (Resolver); a token it cannot settle
+                covers nothing and is printed.
+
+Residual risk in that resolution: a using-directive at file scope in a
+header reaches every header after it in the translation unit, which a file
+at a time cannot see, so the tree's file-scope directives (`using namespace
+p1;`) are applied everywhere, after the enclosing namespaces and the local
+directives. A namespace alias would not be followed; there is none today.
 
 Residual risk this cannot cover: a global mutated through a reference or
 pointer alias, or cleared by a function reached through a function pointer.
@@ -72,6 +87,14 @@ built-in self-check covers the other half: every `g_` token in the tree must
 resolve to a declaration the scanner parsed, so a declaration form it cannot
 read is reported instead of silently dropped (that check found six globals
 missing from the first draft's table).
+
+Qualified names (2026-10-09) were checked the same two ways. The known
+answer holds: 8f1ae6b against 9ceaabe is exactly the same three more. And on
+the tree they landed in, every global the bare-name audit judged keeps its
+verdict, but for two kinds of change: 33 globals it had not judged at all, or
+had counted as reset by a homonym's reset, are now judged, and p1::suite::g_at
+reads as written, through `++suite::g_at`, which the bare-name prefix pattern
+could not see.
 
 WHAT THE CLOSURE IS NOT
 -----------------------
@@ -135,6 +158,10 @@ SCOPES = [
     # reset -- without asserting anything about the 300 that were already
     # there. Retiring a name from the ratchet into a real classification is
     # the way this shrinks.
+    #
+    # The names that landed after the baseline are classified one by one in
+    # MOD_ALLOWLIST_DATA, each with the reset that governs it, and an A there
+    # is a finding as it is in dp/.
     ("mod", "src", ["resetSessionState", "dpsolve::start"], "ratchet"),
 ]
 SUFFIXES = {".hpp", ".cpp", ".h", ".inc", ".cc"}
@@ -236,7 +263,12 @@ SKIP_KW = re.compile(
 
 
 def scan_globals(root: Path, base: Path) -> dict:
-    """name -> dict(file, line, ns, type, init, qual). Namespace-scope only."""
+    """qualified name -> dict(name, file, line, ns, type, init, qual).
+    Namespace-scope only.
+
+    Keyed by the QUALIFIED name. Keyed by the bare one, the first declaration
+    of a name won and a second one in another namespace was not in the table
+    at all: solver::g_killY sat outside the audit behind itermap::g_killY."""
     found = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix not in SUFFIXES:
@@ -286,7 +318,12 @@ def scan_globals(root: Path, base: Path) -> dict:
             elif ch == ";":
                 if all(k == "ns" for k, _ in stack):
                     _decl(text, stmt_start, i, stack, rel, found)
-                stmt_start = i + 1
+                # ...but a `;` INSIDE an initialiser is the initialiser's own: a global built by a
+                # lambda (`inline std::array<int, kTouchBits> g_touchFireT = [] { ...; return a;
+                # }();`, dynamics.hpp) restarted the statement mid-body, and the `;` that ends the
+                # declaration then saw only `}()`. Three of dp's globals vanished that way.
+                if not any(k == "init" for k, _ in stack):
+                    stmt_start = i + 1
             i += 1
     return found
 
@@ -327,11 +364,21 @@ def _decl(text, a, b, stack, rel, found):
         # in frames.hpp are declared that way.
         # ...and the brace match is greedy, because these initialisers nest:
         # `inline Bucketed g_hazardIdx{{}, 2, false};` (clearance.hpp).
-        m = re.search(r"\b(" + NAME + r")\s*(?:\[[^\]]*\])?\s*(?:\{.*\})?\s*$",
+        # ...with any number of extents: `inline long long g_frameRevCall[4][2] = {...}` (bands.hpp).
+        m = re.search(r"\b(" + NAME + r")\s*(?:\[[^\]]*\]\s*)*(?:\{.*\})?\s*$",
                       lhs, re.S)
+        # ...or a FUNCTION POINTER, whose name sits inside its declarator:
+        # `inline bool (*g_cpAhead)(long long now, long long target) = nullptr;` (itermap.hpp).
+        # Five hooks the mod installs at start-up were outside the audit in that form.
+        fptr = None if m else re.search(r"\(\s*\*\s*(" + NAME + r")\s*\)\s*\(.*\)\s*$",
+                                        lhs, re.S)
+        if fptr:
+            m = fptr
         if m:
             name = m.group(1)
             ty = " ".join(lhs[:m.start(1)].split())
+            if fptr:
+                ty = " ".join((lhs[:m.start(1)] + lhs[m.end(1):]).split())
             ty = re.sub(r"^(?:inline|static|constexpr|extern)\s+", "",
                         ty).strip()
             # Only the FIRST declarator carries the type; later ones in
@@ -340,16 +387,17 @@ def _decl(text, a, b, stack, rel, found):
                 ty0 = ty
             elif not ty:
                 ty = ty0
-            if name not in found:         # first declaration wins
+            qual = f"{ns}::{name}" if ns else name
+            if qual not in found:         # first declaration wins
                 init = seg[len(lhs) + 1:].strip() if "=" in seg else ""
                 # line number from the NAME's absolute offset, not the
                 # statement's: `a` sits just past the previous `;`, i.e. on the
                 # previous line, which reported every global one line early.
                 pos = a + off + m.start(1)
-                found[name] = dict(
-                    file=rel, line=text.count("\n", 0, pos) + 1, ns=ns,
+                found[qual] = dict(
+                    name=name, file=rel, line=text.count("\n", 0, pos) + 1, ns=ns,
                     type=ty or ty0 or "?", init=" ".join(init.split())[:60],
-                    qual=f"{ns}::{name}" if ns else name)
+                    qual=qual)
         off += len(seg) + 1               # +1 for the comma split_top removed
 
 
@@ -358,20 +406,27 @@ def _decl(text, a, b, stack, rel, found):
 # ---------------------------------------------------------------------------
 FUNC = re.compile(r"\binline\s+(?:void|bool|int)\s+(\w+)\s*\([^;{]*\)\s*\{")
 
-MUTATE = [
+# What a write looks like, anchored at the token (the match starts at its
+# qualifier): `_writes` tests these just after it, and a prefix `++`/`--` or a
+# range-for colon just before it. Anchored, one statement's write to a name
+# cannot make another occurrence of it on the same line read as written.
+_W_AFTER = [
     # plain / subscripted assignment, but never `==`; and the compound forms.
-    # `++g_rotSeen` and `++g_fireBNoTick` were being reported as reads, which
-    # made two accumulating counters look like constants.
-    lambda n: re.compile(r"\b" + n + r"\s*(?:\[[^\]]*\])?\s*"
-                         r"(?:[-+*/|&^%]|<<|>>)?=(?!=)"),
-    lambda n: re.compile(r"(?:\+\+|--)\s*\b" + n + r"\b|\b" + n +
-                         r"\b\s*(?:\+\+|--)"),
+    # Any number of subscripts: `g_frameRevCall[i][j] = g_frameRevHit[i][j] = 0;` (reset.hpp).
+    re.compile(r"\s*(?:\[[^\]]*\]\s*)*(?:[-+*/|&^%]|<<|>>)?=(?!=)"),
+    # `g_rotSeen++`. `++g_rotSeen` and `++g_fireBNoTick` were once reported as
+    # reads, which made two accumulating counters look like constants; the
+    # prefix form is tested before the token, and with the qualifier inside
+    # the match `++suite::g_at` is seen too, which a bare-name pattern was not.
+    re.compile(r"\s*(?:\+\+|--)"),
     # the container idioms reset.hpp uses
-    lambda n: re.compile(r"\b" + n +
-                         r"\s*\.\s*(?:clear|reset|fill|assign|close|erase|"
-                         r"resize|swap|pop_back)\s*\("),
-    # `for (auto& f : g_frameLv) f.reset();`
-    lambda n: re.compile(r":\s*" + n + r"\s*\)"),
+    re.compile(r"\s*\.\s*(?:clear|reset|fill|assign|close|erase|resize|swap|"
+               r"pop_back)\s*\("),
+    # an atomic's writes, element by element too: reset.hpp clears g_formulaRecHit with
+    # `.store(0)` and g_keyCount / g_countSaid with `g_keyCount[b].store(0)` in a loop, and all four
+    # were reported as "named in a reset body but never mutated there".
+    re.compile(r"\s*(?:\[[^\]]*\])?\s*\.\s*(?:store|exchange|fetch_add|"
+               r"fetch_sub|fetch_or|fetch_and)\s*\("),
 ]
 
 
@@ -399,15 +454,126 @@ def namespace_spans(text: str) -> list:
     return spans
 
 
+# ---------------------------------------------------------------------------
+# Which global a token names
+# ---------------------------------------------------------------------------
+# A token is an optional qualifier and a g_ name: `g_x`, `secsolve::g_x`,
+# `::p1::g_x`. It names a global the way C++ lookup would find it from where it
+# stands: the qualifier relative to each enclosing namespace, innermost first;
+# then through the using-directives in force there (`using namespace secsolve;`
+# opens runSectionVerify, `using namespace p1;` most .cpp files); and only then,
+# as a last resort, any global whose qualified name ends in what was written.
+# Several answers at that last step is AMBIGUOUS, and an ambiguous token covers
+# nothing: matching on the bare name is what let a reset of itermap::g_killY
+# stand for solver::g_killY.
+QTOK = re.compile(r"(?<![\w:])((?:::\s*)?(?:\w+\s*::\s*)*)(" + NAME + r")\b")
+USING = re.compile(r"\busing\s+namespace\s+((?:::)?[\w:]+)\s*;")
+
+
+class FileCtx:
+    """One file's namespaces and using-directives, by offset."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.spans = namespace_spans(text)
+        opens, pairs = [], []
+        for i, ch in enumerate(text):
+            if ch == "{":
+                opens.append(i)
+            elif ch == "}" and opens:
+                pairs.append((opens.pop(), i))
+        pairs.sort()
+        self.usings = []
+        for m in USING.finditer(text):
+            end = len(text)            # file scope: to the end of the file
+            for o, c in pairs:         # ...else the innermost block holding it
+                if o < m.start() < c:
+                    end = c
+                elif o > m.start():
+                    break
+            self.usings.append((m.end(), end, m.group(1).lstrip(":")))
+        self.file_usings = [u for a, e, u in self.usings if e == len(text)]
+
+    def ns_at(self, pos: int) -> str:
+        return "::".join(n for o, c, n in self.spans if o < pos < c)
+
+    def usings_at(self, pos: int) -> list:
+        """Innermost first: a later directive is in a narrower block, or the same."""
+        return [u for a, e, u in reversed(self.usings) if a <= pos < e]
+
+
+def _prefixes(ns: str) -> list:
+    parts = [p for p in ns.split("::") if p]
+    return ["::".join(parts[:k]) for k in range(len(parts), -1, -1)]
+
+
+def _join(*xs) -> str:
+    return "::".join(x for x in xs if x)
+
+
+class Resolver:
+    """Token -> the qualified globals it can mean, over every scanned global."""
+
+    def __init__(self, quals, global_usings=()):
+        self.quals = set(quals)
+        self.by_name: dict[str, list] = {}
+        for q in self.quals:
+            self.by_name.setdefault(q.rsplit("::", 1)[-1], []).append(q)
+        self.global_usings = list(global_usings)
+
+    def resolve(self, qualifier: str, name: str, ns: str, usings: list) -> list:
+        q = re.sub(r"\s+", "", qualifier)
+        if q.startswith("::"):
+            c = _join(q.strip(":"), name)
+            return [c] if c in self.quals else []
+        q = q.strip(":")
+        for p in _prefixes(ns):
+            c = _join(p, q, name)
+            if c in self.quals:
+                return [c]
+        for u in list(usings) + self.global_usings:
+            for p in _prefixes(ns):
+                c = _join(p, u, q, name)
+                if c in self.quals:
+                    return [c]
+        tail = _join(q, name)
+        return sorted(x for x in self.by_name.get(name, ())
+                      if x == tail or x.endswith("::" + tail))
+
+
+def _writes(text: str, start: int, end: int) -> bool:
+    after = text[end:end + 200]
+    if any(p.match(after) for p in _W_AFTER):
+        return True
+    before = text[max(0, start - 16):start]
+    if re.search(r"(?:\+\+|--)\s*$", before):
+        return True
+    # a range-for subject: `for (auto& f : g_frameLv) f.reset();`
+    return bool(re.search(r":\s*$", before) and not before.endswith("::")
+                and re.match(r"\s*\)", after))
+
+
+def tokens_in(ctx: FileCtx, lo: int, hi: int, resolver: "Resolver"):
+    """(qualified candidates, is a write, offset, bare name) for every g_ token
+    in text[lo:hi]."""
+    for m in QTOK.finditer(ctx.text, lo, hi):
+        ns = ctx.ns_at(m.start())
+        us = ctx.usings_at(m.start())
+        yield (resolver.resolve(m.group(1), m.group(2), ns, us),
+               _writes(ctx.text, m.start(), m.end()), m.start(), m.group(2))
+
+
 def collect_bodies(root: Path) -> dict:
-    """(namespace, funcname) -> body text, comments stripped."""
+    """(namespace, funcname) -> (FileCtx, body start, body end), comments
+    stripped. `namespace` is the innermost one, as a call names it."""
     bodies = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix not in SUFFIXES:
             continue
         text = strip_comments(path.read_text(encoding="utf-8",
                                              errors="replace"))
-        spans = namespace_spans(text)
+        ctx = FileCtx(text)
+        spans = ctx.spans
         for m in FUNC.finditer(text):
             # brace-match the body
             i, depth = m.end() - 1, 0
@@ -419,7 +585,7 @@ def collect_bodies(root: Path) -> dict:
                     if depth == 0:
                         break
                 i += 1
-            body = text[m.end():i]
+            body = (ctx, m.end(), i)
             ns, nsOpen = "", -1
             for o, c, name in spans:      # the innermost namespace containing it
                 if o < m.start() < c and o > nsOpen:
@@ -445,56 +611,67 @@ def entry_key(e: str) -> tuple:
     return (ns, name) if sep else ("", name)
 
 
-def reset_set(bodies: dict, entries: list, names: set):
-    """Names mutated by the entry points or anything they call.
+def reset_set(bodies: dict, entries: list, quals: set, resolver: "Resolver"):
+    """Qualified globals mutated by the entry points or anything they call.
 
-    Returns (mutated, touched_only) -- the second is names that appear in a
-    reset body but never in a mutating position, which is NOT coverage and is
-    worth printing rather than silently counting either way."""
-    mutated, touched, seen = set(), set(), set()
+    Returns (mutated, touched_only, ambiguous) -- touched_only is globals that
+    appear in a reset body but never in a mutating position, which is NOT
+    coverage and is worth printing rather than silently counting either way;
+    ambiguous is {written token: its candidates} for tokens the lookup could
+    not settle, which cover nothing."""
+    mutated, touched, seen, ambiguous = set(), set(), set(), {}
     queue = [entry_key(e) for e in entries]
     while queue:
         key = queue.pop()
         if key in seen:
             continue
         seen.add(key)
-        body = bodies.get(key)
-        if body is None:
+        got = bodies.get(key)
+        if got is None:
             continue
-        for n in names:
-            # Word-boundary, not `in`: a substring test made g_at "touched" by
-            # every `g_attempt`, g_fix by `g_fixups`, g_total by
-            # `g_totalAttempts` -- ten phantom entries in the report.
-            if not re.search(r"\b" + n + r"\b", body):
+        ctx, lo, hi = got
+        # Tokens, not a search per name: a substring test made g_at "touched"
+        # by every `g_attempt`, g_fix by `g_fixups`, g_total by
+        # `g_totalAttempts` -- ten phantom entries in the report.
+        for cands, wr, _, name in tokens_in(ctx, lo, hi, resolver):
+            hit = [c for c in cands if c in quals]
+            if len(cands) > 1:
+                if hit:
+                    ambiguous.setdefault(name, set()).update(cands)
                 continue
-            touched.add(n)
-            if any(pat(n).search(body) for pat in MUTATE):
-                mutated.add(n)
+            for c in hit:
+                touched.add(c)
+                if wr:
+                    mutated.add(c)
+        body = ctx.text[lo:hi]
         for cm in re.finditer(r"(?:(\w+)\s*::\s*)?(\w+)\s*\(", body):
             queue.append((cm.group(1) or "", cm.group(2)))
-    return mutated, touched - mutated
+    return mutated, touched - mutated, ambiguous
 
 
-def find_uses(base: Path, names: set) -> dict:
+def find_uses(base: Path, names: set, resolver: "Resolver") -> dict:
     """name -> [(file:line, statement, mutating?)] for every occurrence outside
     its own declaration, across the WHOLE tree.
 
     Two lessons are baked in here.
 
     Scope: this used to search only the scope's own root, which reported
-    dp::g_levelCsv as never assigned -- its writer is src/mod/dp_bridge.cpp,
+    dp::g_levelCsv as never assigned -- its writer was src/mod/dp_bridge.cpp,
     in the other root. A global's writers are wherever they are.
 
-    Reads count. The first cut called a global constant when no MUTATE pattern
+    Reads count. The first cut called a global constant when no write pattern
     matched, and that is not a proof: dp::g_progress is only ever mutated
     through `.begin()` / `.end()` / `.layer()`, none of which any assignment
     pattern can see, and it came back "provably never assigned". So the only
     thing claimed automatically now is the honest one -- the name occurs
     NOWHERE outside its declaration, so nothing writes it and nothing reads it.
-    Everything else is a judgement and needs a line in the allowlist."""
+    Everything else is a judgement and needs a line in the allowlist.
+
+    `names` are qualified, and each occurrence is resolved to the global it
+    names (Resolver); a token that could mean several counts for each of them,
+    so a use is never lost to an ambiguity -- the safe direction here, where a
+    missing use could turn into a false `never assigned`."""
     out = {n: [] for n in names}
-    pats = {n: (re.compile(r"\b" + n + r"\b"),
-                [p(n) for p in MUTATE]) for n in names}
     for path in sorted(base.rglob("*")):
         if not path.is_file() or path.suffix not in SUFFIXES:
             continue
@@ -508,22 +685,25 @@ def find_uses(base: Path, names: set) -> dict:
             continue
         text = strip_comments(path.read_text(encoding="utf-8",
                                              errors="replace"))
+        if "g_" not in text:
+            continue
         lines = text.splitlines()
         rel = str(path.relative_to(base)).replace("\\", "/")
-        for n, (any_pat, mut_pats) in pats.items():
-            if n not in text:
+        ctx = FileCtx(text)
+        for cands, wr, pos, name in tokens_in(ctx, 0, len(text), resolver):
+            hit = [c for c in cands if c in out]
+            if not hit:
                 continue
-            for m in any_pat.finditer(text):
-                ln = text.count("\n", 0, m.start()) + 1
-                line = lines[ln - 1].strip() if ln <= len(lines) else ""
-                # its own declaration is not a use
-                if re.match(r"^\s*(?:inline|static|thread_local|constexpr|"
-                            r"extern)\b", line) and re.search(
-                                r"\b" + n + r"\b\s*(?:\[[^\]]*\])?\s*(?:=|,|;)",
-                                line):
-                    continue
-                mut = any(p.search(line) for p in mut_pats)
-                out[n].append((f"{rel}:{ln}", line[:110], mut))
+            ln = text.count("\n", 0, pos) + 1
+            line = lines[ln - 1].strip() if ln <= len(lines) else ""
+            # its own declaration is not a use
+            if re.match(r"^\s*(?:inline|static|thread_local|constexpr|"
+                        r"extern)\b", line) and re.search(
+                            r"\b" + name + r"\b\s*(?:\[[^\]]*\])?\s*(?:=|,|;)",
+                            line):
+                continue
+            for c in hit:
+                out[c].append((f"{rel}:{ln}", line[:110], wr))
     return out
 
 
@@ -542,19 +722,30 @@ def find_uses(base: Path, names: set) -> dict:
 #
 # Anything not listed here is reported as UNACCOUNTED and fails the run. That
 # is the point: a new global must be classified by a person.
+#
+# The mod's table (MOD_ALLOWLIST_DATA) uses the same letters for the same
+# claims, B widened to the mod's lifetimes (the reset that starts the global's
+# own lifetime, or the marker its every reader tests first), and one more:
+#   K  a cfg key: written ONLY by the autorun.cfg parsers (loadConfig and the
+#      parsers it calls), which a suite runs again on the same file before
+#      every level. The file does not change within a process, so neither does
+#      the value. Not safe the day something rewrites autorun.cfg between two
+#      levels of one game, which is the case K would then have to be split by.
 # ---------------------------------------------------------------------------
 ALLOW: dict[str, tuple] = {}
+MOD_ALLOW: dict[str, tuple] = {}
 
 
 def load_allowlist():
-    """Populated from ALLOWLIST_DATA below; kept as data so the table reads as
-    a table."""
-    for line in ALLOWLIST_DATA.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        bucket, name, reason = line.split(None, 2)
-        ALLOW[name] = (bucket, reason)
+    """Populated from ALLOWLIST_DATA and MOD_ALLOWLIST_DATA below; kept as data
+    so the tables read as tables."""
+    for data, table in ((ALLOWLIST_DATA, ALLOW), (MOD_ALLOWLIST_DATA, MOD_ALLOW)):
+        for line in data.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            bucket, name, reason = line.split(None, 2)
+            table[name] = (bucket, reason)
 
 
 ALLOWLIST_DATA = """
@@ -564,12 +755,15 @@ ALLOWLIST_DATA = """
 #
 # (B) the three deliberate exceptions. Two are documented in reset.hpp itself;
 #     the third is cleared by cliMain one line above the reset call.
-B g_levelCsv        set unconditionally at src/mod/dp_bridge.cpp:52 before every in-process cliMain and cleared at :61 -- the caller's data, not the last solve's (reset.hpp documents it)
+B g_levelCsv        set unconditionally by dpcore::solveInProcess (dp/src/dpcore.cpp) before every in-process cliMain and cleared after it -- the caller's data, not the last solve's (reset.hpp documents it)
 B g_progress        a live readout the mod polls from another thread; cliMain re-opens it with g_progress.begin() at cli.hpp:2398 and a ProgressGuard ends it (reset.hpp documents it)
 B g_outcome         cleared by cliMain itself at cli.hpp:41, deliberately ABOVE resetInvocationState so an early return leaves "FAILED, nothing measured" rather than the last verdict
 B g_plainElsewhere  the caller's hooks, not a solve's state: set unconditionally by dpbridge::plainBeside before every in-process call (src/mod/repair.hpp timedSolve), and never written by dp
 B g_ladderBestT     one ladder's: cliMain stores -1 at every ladder's start and its EndLadder guard stores -1 on every way out; outside a ladder nothing reads it
 B g_ladderStop      one ladder's: cliMain stores false at every ladder's start, after taking the plain search, and in its EndLadder guard on every way out
+B g_wrc             one ladder's walk-resume cache (--walkresume): cliMain stores an empty one at every ladder's start (cli.hpp:7513) and its EndLadder guard clears it (cli.hpp:7525); outside a ladder nothing reads it
+B g_walkResumeCheck stored false at the top of every cliMainOnce (cli.hpp:529), before the argument loop that may set it
+C g_walkResumeEvery the walk-resume checkpoint stride, 256 ticks; never written
 #
 # (B) per-tick step scratch, thread_local. cli.hpp:2218-2223 zeroes all six
 #     immediately before every stepBoth call, so nothing can read an older
@@ -591,6 +785,63 @@ B g_clampCx         written only by the CLAMP0O macro, which sets the per-tick-c
 B g_clampCy         written only by the CLAMP0O macro, which sets the per-tick-cleared g_clampUid in the same statement (step.hpp:78-79)
 B g_deadCx          written only by the DIE macro, which sets the per-tick-cleared g_deadWhy/g_deadObj in the same statement (step.hpp:84-86)
 B g_deadCy          written only by the DIE macro, which sets the per-tick-cleared g_deadWhy/g_deadObj in the same statement (step.hpp:84-86)
+#
+# (B) the spider press probe's result, thread_local: stepOne stores false at step.hpp:4031, immediately before
+#     the one nested probe step that can set it (the pad pass, step.hpp:15932), and reads it only after that
+#     step returns (step.hpp:4038), so no read can see an earlier probe's value.
+B g_probePadFired   stored false at step.hpp:4031 before the probe step that alone sets it (step.hpp:15932); read only after it, at step.hpp:4038
+#
+# ---- classified 2026-10-09: the globals that landed between the 09-04 audit and 10-08 ----------
+#
+# (B) the second dual half's signals, thread_local: stepBoth sets each one right before the
+#     second body's stepOne (fixup.hpp:400-403) and reads or clears it right after (407-410).
+B g_bandPortalWrote stored false at fixup.hpp:400 before the second half's stepOne, which alone sets it (step.hpp:14335/14338); read at fixup.hpp:410 right after
+B g_dualOtherMode   set for the second half only (fixup.hpp:401, under --dualband) and stored -1 at fixup.hpp:409 right after it; its reader (step.hpp:14312) takes s.mode2 at -1
+B g_p2SoloHalf      set at fixup.hpp:402 before the second half and stored false at fixup.hpp:407 right after it
+B g_p2SoloFired     stored false at fixup.hpp:403 before the second half, which alone sets it (step.hpp:14192); read at fixup.hpp:408 right after
+B g_fxBlockedUid    stored -1 at the top of every stepBoth (fixup.hpp:311), before the fixup lookup that sets it (fixup.hpp:344)
+B g_inPressProbe    true only between step.hpp:4030 and 4033, around the one nested probe step
+B g_deadKind        written with every `dead = true`: by DIE_AS in the same statement (step.hpp:230) and by the three direct deaths (deadband, maxplayy, offboard, which until 2026-10-09 left it alone); its one reader (--spiderpresslate's test after the probe step) runs only when that step died
+#
+# (B) set for the length of one call, a ladder or a replay, by the code that opens it.
+B g_check           the mod's live channel, not a solve's state: dpcore.cpp:149-176 sets enabled/cancel; cliMain resets it at cli.hpp:5395 when a call uses it, and its CheckGuard on the way out (cli.hpp:5393)
+B g_declineToLadder stored true at cli.hpp:7275 around a ladder's first call and false by its Clear guard (cli.hpp:7273/7278)
+B g_declinedToLadder stored false at cli.hpp:7276 before the call that alone sets it (cli.hpp:6482); read only after it, at cli.hpp:7279
+B g_dynParTasks     lent to the search's pool for one search by DynParLoan (cli.hpp:5432-5435), whose destructor stores nullptr
+B g_fileSigHint     the caller's hints, not a solve's state: repair.hpp:2476 sets them before the in-process call and repair.hpp:2487 empties them after it (dp_bridge2.cpp:130-133, dpcore.cpp:36)
+B g_groupSigCheck   stored false at the top of every cliMainOnce (cli.hpp:425), before the argument loop that may set it
+B g_levelCacheCheck stored false at the top of every cliMainOnce (cli.hpp:426), before the argument loop that may set it
+B g_prepMark        stored -1 at the top of every cliMainOnce (cli.hpp:424)
+B g_hist            cleared at the start of every replay (cli.hpp:5743); its only reader is that replay's summary (cli.hpp:6302-6305)
+B g_histFired       cleared at the start of every replay (cli.hpp:5744), beside g_hist
+B g_histPads        cleared at the start of every replay (cli.hpp:5745), beside g_hist
+B g_ladder          stored when a ladder starts (cli.hpp:7250) and 0 when it ends (cli.hpp:7255)
+B g_ladderLevel     one ladder's level cache, taken only under its own g_ladder (cli.hpp:2640) and cleared when the ladder ends (cli.hpp:7256)
+B g_lpc             one ladder's prefix cache, cleared when the ladder starts and when it ends (cli.hpp:7247/7257)
+B g_loadPrinted     points at a local only while the level loads (cli.hpp:2660) and is stored nullptr right after (cli.hpp:2664)
+B g_tpForceCol      stored at every level load from the objrects header (level_loader.hpp:363); a cached level is taken only when it was the last one loaded (the g_replayLevel / g_ladderLevel keys)
+#
+# (B) a payload read only below its own counter, which reset.hpp zeroes.
+B g_fixupRotX       the payload of g_fixupRotSeen (reset.hpp:309); the only reader prints indices below it (cli.hpp:6587)
+B g_fixupCallRotX   the payload of g_fixupCallRotSeen (reset.hpp:310); the only reader prints indices below it (cli.hpp:6581)
+B g_impTrail        the ring of g_impCount (reset.hpp:96, step.hpp:2060); the only reader prints the last min(g_impCount, 8) (cli.hpp:6238-6241)
+B g_vpTrail         the ring of g_vpWrites (reset.hpp:95, step.hpp:2059); the only reader prints the last min(g_vpWrites, 8) (cli.hpp:6233-6236)
+B g_rotWatchUid     written only under --rotwatch (g_rotWatchLo >= 0, which reset.hpp:326 stores -1; step.hpp:918/1108), and model.hpp:386 stores -1 before the read at model.hpp:392
+#
+# (C) constants held as globals.
+C g_ladderPrefixEvery    never written (search_dp.hpp:722)
+C g_ladderPrefixMaxSnaps never written (search_dp.hpp:723)
+#
+# (S) process lifetime by design.
+S g_envKills        a running total by design: the mod reads it through dpcore envKillsTotal() and takes differences across a span (dp_bridge.cpp:97/133)
+S g_groupLayersGen  a generation number for the groups cache, bumped whenever the layers change (cli.hpp:179); the level caches compare against it, so it must outlive a call
+S g_levelTextCache  a cross-call cache by design: taken only while the level text is the same text (cli.hpp:72); emptied between calls by releaseCrossCallCaches (cli.hpp:416), the mod's call when a solve is over
+S g_groupLayersCache a cross-call cache by design: taken only on the same files by signature or bytes and the same hold setting (cli.hpp:133-176), rebuilt and its generation bumped otherwise (cli.hpp:237); emptied by releaseCrossCallCaches (cli.hpp:416)
+S g_trigRowsCache   a cross-call cache by design: taken only while the file holds the bytes it was parsed from (triggers.hpp:805); emptied by releaseCrossCallCaches (cli.hpp:416)
+S g_groupMembersCache a cross-call cache by design: taken only while the file holds the bytes it was parsed from (triggers.hpp:827); emptied by releaseCrossCallCaches (cli.hpp:416)
+S g_replayLevel     a cross-call cache by design: taken only when the args, the groups generation, the csv and the files all match (cli.hpp:2645-2647), and cleared by any call that is not a replay (cli.hpp:2620)
+S g_run             a level's run spans many calls by design: the mod opens and closes it (runBegin / runEnd, search_dp.hpp:2874/2965)
+S g_threadSlot      a worker thread's identity, stored once when the pool's thread starts (thread_pool.hpp:15)
 #
 # (C) unreachable, so a stale value cannot differ from the declared default.
 C g_rotCompute      declared false and the ONLY writer is `--no-rotcompute` setting it false again (cli.hpp:149); nothing can make it true, so it is constant by reachability (the known dead-flag shape)
@@ -622,9 +873,258 @@ A g_fireBNoBit      `++` counter (cli.hpp:2749) that nothing zeroes -- same runn
 A g_fireBTooEarly   `++` counter (cli.hpp:2760) that nothing zeroes -- same running-total defect
 """
 
+MOD_ALLOWLIST_DATA = """
+# bucket  name  reason
+#
+# ---- src/ : the globals that landed after the 2026-09-04 ratchet, classified 2026-10-09 ----
+#
+# (K) cfg keys, written only by the autorun.cfg parsers (session.hpp loadConfig and the
+#     parsers it calls; a suite runs it again on the same file before every level,
+#     level_entry.hpp:229-230). Checked: no other writer anywhere under src/.
+K g_actKey               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_areaT0               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_areaT1               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_areaUids             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_attemptOne           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_attemptCount         cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_batchFrom            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_batchTo              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_bookFirst            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_boundOn              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_cover                cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_cpCheck              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_cpPlayer             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_driftLog             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_graceDash            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_graceFly             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_groupCheck           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_headAccel            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_headCheck            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_headDash             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_jbKeep               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_latchAt              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_layerInput           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_leafLife             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_leafMid              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_levelDir             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_objWatch             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_p2Extras             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_p2Key                cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_pauseAtTick          cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_pressT0              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_pressT1              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_profSample           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_regionAt             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_regionBox            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rngFix               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rngFresh             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rngSeedEE0           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rngSeedEF8           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rngSeedSet           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_rungCoinOff          cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_secCoins             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_sectionHookLazy      cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekBlind            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekCpEvery          cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekCpFrom           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekCpKeep           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekCpTo             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_seekVisEvery         cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_shaderSig            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_shaderSkip           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_sizeFam              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_slopeT0              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_slopeT1              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_snapAct              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_snapEM               cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_snapEMFrom           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_snapRing             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_stickT0              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_stickT1              cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_trailClear           cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_wsnapAny             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_wsnapAuto            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_wsnapGate            cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_wsnapGroups          cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_wsnapSet             cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K clearance::g_on        cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K p1::itermap::g_actCensus cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K secsolve::g_off        cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K secsolve::g_visRefresh cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K solver::ckpttrace::g_on cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+K g_lieSkipPsnap         cfg key: written only by the autorun.cfg parsers, which a suite runs again on the same file before every level (level_entry.hpp:229-230)
+#
+# (B) reset at the start of their own lifetime -- a section search, a seek, an attempt, a
+#     rung, a session's first attempt -- outside the two entry points above; or a payload
+#     read only behind a marker that is reset; or a guard set and cleared around one call.
+B g_accel2               cleared at every section search's head (hooks_gamelayer.cpp:4282-4284), refilled by secPushP2
+B g_actCaptures          cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actCapUs             cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actDecos             cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actObjs              cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actRestores          cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actRestUs            cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_actSeen              cleared by psnap::buildActWindow (psnap.hpp:800-805) at every section search's head (hooks_gamelayer.cpp:4446)
+B g_areaArr              print only (cfg areatrace): looked up again when the object array changes and at the window's first tick, before the window reads them (hooks_gamelayer.cpp:7501-7509)
+B g_areaObjs             print only (cfg areatrace): looked up again when the object array changes and at the window's first tick, before the window reads them (hooks_gamelayer.cpp:7501-7509)
+B g_attemptFed           cleared at every attempt's start (hooks_playlayer.cpp:292)
+B g_attemptT0            set at every attempt's start (cpflight::onAttemptStart, cp_flight.hpp:910-915)
+B g_boundSkips           zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_boxX0                set at every section search's head when g_boundOn and the layer has objects (hooks_gamelayer.cpp:4471-4480); read only under g_active && g_boundOn (hooks_gamelayer.cpp:7963)
+B g_boxX1                set at every section search's head when g_boundOn and the layer has objects (hooks_gamelayer.cpp:4471-4480); read only under g_active && g_boundOn (hooks_gamelayer.cpp:7963)
+B g_boxY0                set at every section search's head when g_boundOn and the layer has objects (hooks_gamelayer.cpp:4471-4480); read only under g_active && g_boundOn (hooks_gamelayer.cpp:7963)
+B g_boxY1                set at every section search's head when g_boundOn and the layer has objects (hooks_gamelayer.cpp:4471-4480); read only under g_active && g_boundOn (hooks_gamelayer.cpp:7963)
+B g_buf                  assigned by profsample::start() at every sampling run, released by stopAndReport (profsample.hpp:42-53, 90-131)
+B g_ckAbandonJob         cfg dpcheck: consumed by the abandoned job's own collect, which poll() runs before its generation check (repair.hpp:8780 vs 8786), so it is taken even when that job reports into the next level's session
+B g_ckptDash2            written on both branches whenever a head checkpoint is made (hooks_gamelayer.cpp:991-994)
+B g_coinBest             assigned by solver::buildPois (solver.hpp:707-712), with solver::g_coins, once per session (g_poisBuilt; hooks_playlayer.cpp:353-356)
+B g_coinLiveSaid         assigned at every attempt's start (hooks_playlayer.cpp:326)
+B g_coinMoveX            assigned by solver::buildPois (solver.hpp:707-712), with solver::g_coins, once per session (g_poisBuilt; hooks_playlayer.cpp:353-356)
+B g_coinObjs             assigned by solver::buildPois (solver.hpp:707-712), with solver::g_coins, once per session (g_poisBuilt; hooks_playlayer.cpp:353-356)
+B g_coinPosLog           assigned by solver::buildPois (solver.hpp:707-712), with solver::g_coins, once per session (g_poisBuilt; hooks_playlayer.cpp:353-356)
+B g_compound             areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_controlAtT           a probe's and its control's books: written when the probe starts (hooks_gamelayer.cpp:3148), cleared when it is captured and ended (cp_flight.hpp:1370-1372, 1470, 1496); read only under g_probeFlying / g_controlFlying
+B g_decoSeen             assigned by buildActWindow past its g_snapAct gate (psnap.hpp:817); with the gate shut it is never filled, and g_snapAct is a cfg key
+B g_degenerate           areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_diffCollect          print only (cfg cpflightlayerdiff): set at every take and start (hooks_gamelayer.cpp:3058-3060, 3139-3141)
+B g_diffCompare          print only (cfg cpflightlayerdiff): set at every take and start (hooks_gamelayer.cpp:3058-3060, 3139-3141)
+B g_diffStep             print only (cfg cpflightlayerdiff): set at every take and start (hooks_gamelayer.cpp:3058-3060, 3139-3141)
+B g_dpCfgSeen            cleared at every loadConfig (session.hpp:748)
+B g_ended                set at every attempt's start (cpflight::onAttemptStart, cp_flight.hpp:910-915)
+B g_firstMiss            areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_frameGapMs           zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_frames               zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_headChecked          seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_headJb               captured immediately before every head checkpoint (hooks_gamelayer.cpp:950-956); a section search runs only from that checkpoint
+B g_headPlain            captured immediately before every head checkpoint (hooks_gamelayer.cpp:950-956); a section search runs only from that checkpoint
+B g_headRun              seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_headX                seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_headY                seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_inPostCollP1         set and cleared around player 1's postCollision (hooks_player.cpp:204-206)
+B g_inTake               set and cleared around the checkpoint take (hooks_gamelayer.cpp:2529-2531, 2650-2652)
+B g_killsBase            areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_lastBatchCalls       zeroed at every batch's start (hooks_gamelayer.cpp:1827); its one reader paces the render-off effect sweep, visual only (hooks_gamelayer.cpp:1779)
+B g_layer                seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_lineSig              seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_main                 assigned by profsample::start() at every sampling run, released by stopAndReport (profsample.hpp:42-53, 90-131)
+B g_match                areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_maxErr               areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_memAfter             seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_memBefore            seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_miss                 areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_n                    assigned by profsample::start() at every sampling run, released by stopAndReport (profsample.hpp:42-53, 90-131)
+B g_nextInputAtStart     written when g_attemptFed flips, on every attempt's first processCommands (hooks_gamelayer.cpp:6550-6553); read by the slice check after a flight (level_slice.hpp:714)
+B g_nonFinite            zeroed at every section search's head (hooks_gamelayer.cpp:4613)
+B g_nonFiniteId          written on g_nonFinite's 0->1 step (hooks_gamelayer.cpp:7950-7954), read only under g_nonFinite > 0 (hooks_gamelayer.cpp:5147)
+B g_nonFiniteUid         written on g_nonFinite's 0->1 step (hooks_gamelayer.cpp:7950-7954), read only under g_nonFinite > 0 (hooks_gamelayer.cpp:5147)
+B g_nonFiniteX           written on g_nonFinite's 0->1 step (hooks_gamelayer.cpp:7950-7954), read only under g_nonFinite > 0 (hooks_gamelayer.cpp:5147)
+B g_nonFiniteY           written on g_nonFinite's 0->1 step (hooks_gamelayer.cpp:7950-7954), read only under g_nonFinite > 0 (hooks_gamelayer.cpp:5147)
+B g_objAfter             print only (cfg cpflightobj, default -1): a 3-update countdown armed at a take or start (hooks_gamelayer.cpp:3049, 3109)
+B g_objects              seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_offMiss              areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_outside              areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_outsideMs            zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_overlayMs            zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_pad2                 cleared at every section search's head (hooks_gamelayer.cpp:4282-4284), refilled by secPushP2
+B g_partSaid             cleared at every attempt's head run (seek_cp.hpp:185) and every seek restore (hooks_gamelayer.cpp:3012)
+B g_passing              set and cleared around one call (hooks_playmenu.cpp:540-542, 628-630)
+B g_placeholderGroups    assigned from cfg slicekeepgroups before every slice build (level_slice.hpp:217)
+B g_postMissCrossT       written with g_coinMissPostPending (repair.hpp:7412-7414), read only when that flag was taken (repair.hpp:7528, 8132); dpsolve::start clears the flag (repair.hpp:6359)
+B g_preludePendingAttempt written with g_preludeResetPending (hooks_gamelayer.cpp:6545-6546); the flag is cleared at every attempt's start (hooks_playlayer.cpp:287)
+B g_probeAtT             a probe's and its control's books: written when the probe starts (hooks_gamelayer.cpp:3148), cleared when it is captured and ended (cp_flight.hpp:1370-1372, 1470, 1496); read only under g_probeFlying / g_controlFlying
+B g_probeCap             a probe's and its control's books: written when the probe starts (hooks_gamelayer.cpp:3148), cleared when it is captured and ended (cp_flight.hpp:1370-1372, 1470, 1496); read only under g_probeFlying / g_controlFlying
+B g_rectMiss             areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_restoreMs            seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_sampled              areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_secPhase             crash breadcrumbs: written before each phase of a section search, g_secPhase back to 0 at its end (hooks_gamelayer.cpp:4907-6125)
+B g_secPhaseDepth        crash breadcrumbs: written before each phase of a section search, g_secPhase back to 0 at its end (hooks_gamelayer.cpp:4907-6125)
+B g_secPhaseNode         crash breadcrumbs: written before each phase of a section search, g_secPhase back to 0 at its end (hooks_gamelayer.cpp:4907-6125)
+B g_secRungFailAttempt   reset at every rung's start (repair.hpp:8687-8688); read only under g_secRung && g_on (repair.hpp:1328)
+B g_secRungPrefixFails   reset at every rung's start (repair.hpp:8687-8688); read only under g_secRung && g_on (repair.hpp:1328)
+B g_secSaveCkpt          saved at every rung's start (repair.hpp:8672-8695), read only to put the cfg back when that rung ends (repair.hpp:1347-1351, hooks_gamelayer.cpp:6327-6331, session.hpp:241)
+B g_secSaveMaxAttempts   saved at every rung's start (repair.hpp:8672-8695), read only to put the cfg back when that rung ends (repair.hpp:1347-1351, hooks_gamelayer.cpp:6327-6331, session.hpp:241)
+B g_secSavePractice      saved at every rung's start (repair.hpp:8672-8695), read only to put the cfg back when that rung ends (repair.hpp:1347-1351, hooks_gamelayer.cpp:6327-6331, session.hpp:241)
+B g_secSaveTargetDepth   saved at every rung's start (repair.hpp:8672-8695), read only to put the cfg back when that rung ends (repair.hpp:1347-1351, hooks_gamelayer.cpp:6327-6331, session.hpp:241)
+B g_secScreenWasOn       written when a render hold begins and read when it is released, under g_secRenderWas (session_hotkeys.hpp:196-209)
+B g_seekBatches          reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekBlindDone        reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekBlindMs          reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekBlindNow         reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekDrawMs           reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekFrames           reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekFromCp           interactive only: set with g_seekRestart by the seekfrom command (session.hpp:386), taken and cleared by the restore that restart runs (hooks_gamelayer.cpp:2995)
+B g_seekT0               reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekVisCalls         reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekVisMs            reset at every seek's start (itermap.hpp:1327-1331)
+B g_seekVisSkip          set before and cleared after every update of a batch (hooks_gamelayer.cpp:1947-1951)
+B g_shaderSigPending     print only (cfg secshadersig): set at a search's end, consumed by the next real reset (hooks_playlayer.cpp:515-519)
+B g_shaderSkips          zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_sliceEnd             written with g_sliceEnded (hooks_gamelayer.cpp:1515-1516), read only when it is set
+B g_sliceEnded           zeroed at every section search's head (hooks_gamelayer.cpp:4463-4470)
+B g_snapEMActive         assigned at every section search's head (hooks_gamelayer.cpp:4073)
+B g_thinned              seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_thr                  assigned by profsample::start() at every sampling run, released by stopAndReport (profsample.hpp:42-53, 90-131)
+B g_tick0                assigned by profsample::start() at every sampling run, released by stopAndReport (profsample.hpp:42-53, 90-131)
+B g_toggles              seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170); areaenv::g_objects shares the name (see below)
+B g_uiArmedLevel         cleared at every level entry, armed or not (hooks_playlayer.cpp:103)
+B g_unenveloped          areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_valueMiss            areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_varying              areaenv::resetTallies(), from grouptrace::build at a level's first attempt whenever grouptrace is on (grouptrace.hpp:157, hooks_playlayer.cpp:330-332; resetSessionState clears the owner); they move only under envActive(), which needs grouptrace on (hooks_area.cpp:16); areaenv::g_objects too
+B g_visAvRead            the exception filter's scratch, written just before the line that prints it (playlayer_helpers.hpp:21-47)
+B g_visAvRet             the exception filter's scratch, written just before the line that prints it (playlayer_helpers.hpp:21-47)
+B g_visAvRip             the exception filter's scratch, written just before the line that prints it (playlayer_helpers.hpp:21-47)
+B g_vy2                  cleared at every section search's head (hooks_gamelayer.cpp:4282-4284), refilled by secPushP2
+B g_xRemoving            set and cleared around removeCheckpoint (takeover.hpp:229-231)
+B areaenv::g_calls       areaenv::resetTallies() with the other tallies (areaenv.hpp:211)
+B areaenv::g_objects     areaenv::resetTallies() with the other tallies (areaenv.hpp:211)
+B areaenv::g_rows        areaenv::resetTallies() with the other tallies (areaenv.hpp:212)
+B p1::profsample::g_t0   assigned by profsample::start() at every sampling run (profsample.hpp:50)
+B p1::seekcp::g_checked  seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_cps      seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_from     seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_plan     seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_restores seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_restoring seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_step     seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_takeMs   seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+B p1::seekcp::g_taken    seekcp::resetSession(), which PlayLayer::onQuit calls before resetSessionState (hooks_playlayer.cpp:170)
+#
+# (S) process lifetime by design.
+S g_actHook              the objwatch hook: resolved once per process (hooks_gamelayer.cpp:312); enabled to match g_objWatch at every sync (hooks_gamelayer.cpp:337-339)
+S g_actHookOn            the objwatch hook: resolved once per process (hooks_gamelayer.cpp:312); enabled to match g_objWatch at every sync (hooks_gamelayer.cpp:337-339)
+S g_attemptSerial        monotone serial: only copied and compared for equality (repair.hpp:229, 6670)
+S g_cfgDefaults          captured once, before the first autorun.cfg is applied (session.hpp:746): what a key nobody wrote runs with
+S g_ckMx                 a mutex
+S g_gtSerial             file-name serial, unique per process (cp_flight.hpp:1006)
+S g_levelDirChecked      the suite's order check, once per suite (level_entry.hpp:21)
+S g_nextId               monotone id counter (phase.hpp:87, 134)
+S g_remSecHook           the section hooks: resolved once per process (hooks_gamelayer.cpp:345-346), switched by syncSectionHooks from the current mode
+S g_remSecOn             the section hooks: resolved once per process (hooks_gamelayer.cpp:345-346), switched by syncSectionHooks from the current mode
+S g_rotGameplayCalls     monotone counter, read only as an equality snapshot inside one search (hooks_gamelayer.cpp:4577, 5206)
+S g_secHookFlips         print cap: the first four hook switches of the process
+S g_secSnapMs            running totals, read only as one search's own difference (hooks_gamelayer.cpp:4935-4936, 5995)
+S g_secStepMs            running totals, read only as one search's own difference (hooks_gamelayer.cpp:4935-4936, 5995)
+S g_secThrows            print cap: three C++-exception lines per process from the crash filter
+S g_secThrowsDone        fault injection (cfg secthrowkind, default 0): the injected throws per process
+S g_swapReq              the swaplevel command: its timing spans the swap into the next layer by design (hooks_playlayer.cpp:148-159)
+S g_swapT0               the swaplevel command: its timing spans the swap into the next layer by design (hooks_playlayer.cpp:148-159)
+S g_swapTiming           the swaplevel command: its timing spans the swap into the next layer by design (hooks_playlayer.cpp:148-159)
+S g_uiCoins              the play menu's choices, loaded from the mod's saved values (hooks_playmenu.cpp:591-592): the person's, not a level's
+S g_uiGlitch             the play menu's choices, loaded from the mod's saved values (hooks_playmenu.cpp:591-592): the person's, not a level's
+S g_updSecHook           the section hooks: resolved once per process (hooks_gamelayer.cpp:345-346), switched by syncSectionHooks from the current mode
+S g_updSecOn             the section hooks: resolved once per process (hooks_gamelayer.cpp:345-346), switched by syncSectionHooks from the current mode
+S p1::phase::g_mu        a mutex
+S p1::stallwatch::g_phase the stall watchdog's view of the main thread: one per process, set by every Mark scope (stallwatch.hpp:28-35)
+S p1::stallwatch::g_run  the stall watchdog's thread, started once per process (stallwatch.hpp:40)
+#
+# (C) not storage of its own.
+C g_every                a reference to itermap::g_seekCpEvery (a cfg key)
+C clearance::g_mode      never written: declared 1 (clearance.hpp:28), read only
+"""
+
 # Buckets that mean "accounted for and safe". Everything else in the allowlist
 # is a finding that stays on the report and keeps the exit status non-zero.
-SAFE_BUCKETS = {"B", "C", "S"}
+SAFE_BUCKETS = {"B", "C", "S", "K"}
 
 # ---------------------------------------------------------------------------
 # RATCHET -- src/ globals not cleared by resetSessionState as of 2026-09-04.
@@ -716,7 +1216,18 @@ RATCHET = """
   g_xq g_yq
   g_beside g_besideKills g_checkM g_checkLast g_checked g_differed g_m g_held
   g_plainBesideMode
+  g_cpAhead g_cpLine g_onActive g_testGap
+  g_snapExtras
 """
+# g_snapExtras (src/mod/hooks_gamelayer.cpp) was added 2026-10-09 with MOD_ALLOWLIST_DATA: it is
+# index-parallel to g_snaps, a ratchet entry, filled beside it (:926) and read only through a
+# g_snaps index (:1307-1309), so it has g_snaps's lifetime and is decided with it.
+# The g_cpAhead line above was added 2026-10-09 when the scanner learned to read a function pointer's
+# declarator (`inline bool (*g_cpAhead)(...) = nullptr;`): the four were not new, only newly
+# visible. All four are hooks the mod installs once and never per session -- itermap::g_cpAhead and
+# g_cpLine and secsolve::g_onActive at start-up (hooks_gamelayer.cpp:347-349), phase::g_testGap
+# only by tools/phase_fixture.cpp (101/104). The fifth one the fix uncovered, g_cpFlightSummary, is
+# set by dpsolve::start().
 # The last two lines above were added 2026-09-29 with a reason, as the header asks: process lifetime
 # by design, around the second copy of the core. g_beside (src/mod/dp_bridge.cpp) is the plain
 # search beside a ladder, every field refilled by its start(); g_besideKills is summed into
@@ -753,10 +1264,12 @@ def main():
     # arrays sat outside the audit -- and "0 problems" from an instrument that
     # matched nothing is the failure mode this whole file exists to avoid.
     declared, tokens = set(), set()
+    scanned = {}
     for _, sub, _, _ in SCOPES:
         root = base / sub
         if root.is_dir():
-            declared |= set(scan_globals(root, base))
+            scanned[sub] = scan_globals(root, base)
+            declared |= {i["name"] for i in scanned[sub].values()}
             for p in sorted(root.rglob("*")):
                 if p.is_file() and p.suffix in SUFFIXES:
                     tokens |= set(re.findall(
@@ -773,28 +1286,54 @@ def main():
             print(f"      {u}")
         print()
 
+    # One resolver over every scanned global, so a token in one root that names
+    # a global of the other (dp::g_levelCsv, written by the mod) finds it, and a
+    # mod global is never taken for a dp one of the same name. The file-scope
+    # using-directives of the tree (`using namespace p1;`) apply everywhere, as
+    # they do in a translation unit of chained headers.
+    every = {q for d in scanned.values() for q in d}
+    file_usings = set()
+    for _, sub, _, _ in SCOPES:
+        for p in sorted((base / sub).rglob("*")) if (base / sub).is_dir() else ():
+            if p.is_file() and p.suffix in SUFFIXES:
+                file_usings |= set(FileCtx(strip_comments(p.read_text(
+                    encoding="utf-8", errors="replace"))).file_usings)
+    resolver = Resolver(every, sorted(file_usings))
+
     for scope, sub, entries, mode in SCOPES:
         root = base / sub
         if not root.is_dir():
             print(f"!! {scope}: {root} missing")
             rc = 1
             continue
-        g = scan_globals(root, base)
+        g = scanned[sub]
+        # The bare name a table line uses means the FIRST declaration of it in
+        # file order -- the one the bare-name scanner kept, and so the one every
+        # line written before qualified names meant. Any other global of that
+        # name needs its own line, under its qualified name.
+        first = {}
+        for q, i in g.items():
+            first.setdefault(i["name"], q)
+        def key(q, table):
+            if q in table:
+                return q
+            n = g[q]["name"]
+            return n if first[n] == q and n in table else None
+        seen_names |= set(g) | set(first)
         bodies = collect_bodies(root)
         for e in entries:
             if entry_key(e) not in bodies:
                 print(f"!! {scope}: reset entry point {e}() not found -- the "
                       f"audit would report everything as unreset")
                 rc = 1
-        done, touched = reset_set(bodies, entries, set(g))
-        done |= {n for n in g if n in MEMBERWISE}
+        done, touched, ambiguous = reset_set(bodies, entries, set(g), resolver)
+        done |= {q for q in g if q in MEMBERWISE or g[q]["name"] in MEMBERWISE}
         missing = sorted(set(g) - done)
-        seen_names |= set(g)
-        uses = find_uses(base, set(missing))
+        uses = find_uses(base, set(missing), resolver)
 
         if a.writers:
             for n in sorted(missing):
-                if re.search(a.writers, n):
+                if re.search(a.writers, n) or re.search(a.writers, g[n]["name"]):
                     print(f"{n}  ({g[n]['file']}:{g[n]['line']})")
                     for where, line, mut in uses[n] or [("(none)", "", 0)]:
                         print(f"    {'W' if mut else 'r'} {where}  {line}")
@@ -811,19 +1350,34 @@ def main():
         if touched:
             print(f"   note: named in a reset body but never mutated there "
                   f"(not coverage): {', '.join(sorted(touched))}")
+        if ambiguous:
+            print(f"   note: tokens in a reset body that name more than one "
+                  f"global, so they cover none: "
+                  + "; ".join(f"{n} -> {', '.join(sorted(c))}"
+                              for n, c in sorted(ambiguous.items())))
 
-        known = ALLOW if mode == "allowlist" else \
-            {n: ("ratchet", "carried from the 2026-09-04 baseline, "
-                            "not individually classified") for n in ratchet}
-        unaccounted = [n for n in missing if n not in known and n not in const]
-        findings = [n for n in missing
-                    if known.get(n, ("?",))[0] not in SAFE_BUCKETS
-                    and n in known and mode == "allowlist"]
+        if mode == "allowlist":
+            known = dict(ALLOW)
+        else:
+            known = {n: ("ratchet", "carried from the 2026-09-04 baseline, "
+                                    "not individually classified") for n in ratchet}
+            both = sorted(ratchet & set(MOD_ALLOW))
+            if both:
+                rc = 1
+                print(f"!! {scope}: in RATCHET and MOD_ALLOWLIST_DATA both (two "
+                      f"verdicts for one name; keep one): {', '.join(both)}")
+            known.update(MOD_ALLOW)
+        verdict = {q: known[k] for q in missing if (k := key(q, known))}
+        unaccounted = [n for n in missing if n not in verdict and n not in const]
+        # A ratchet entry is no verdict, so it is neither safe nor a finding.
+        findings = [n for n in missing if n in verdict
+                    and verdict[n][0] not in SAFE_BUCKETS
+                    and verdict[n][0] != "ratchet"]
 
         if a.list:
             for n in missing:
                 b, why = ("C", "never assigned") if n in const else \
-                    known.get(n, ("?", "UNACCOUNTED"))
+                    verdict.get(n, ("?", "UNACCOUNTED"))
                 i = g[n]
                 print(f"   [{b}] {i['qual']:<34} {i['file']}:{i['line']}  "
                       f"{i['type']} = {i['init'] or '{}'}   {why}")
@@ -835,9 +1389,9 @@ def main():
                   f"level N's value into level N+1:\n")
             for n in findings:
                 i = g[n]
-                print(f"      [{known[n][0]}] {i['file']}:{i['line']}  "
+                print(f"      [{verdict[n][0]}] {i['file']}:{i['line']}  "
                       f"{i['qual']}")
-                print(f"          {known[n][1]}")
+                print(f"          {verdict[n][1]}")
             print()
 
         if unaccounted:
@@ -847,7 +1401,7 @@ def main():
                     if mode == "allowlist" else
                     "A global has landed since the baseline. Add a line to "
                     "resetSessionState (or to the right per-lifetime reset), "
-                    "or add the name to RATCHET with a reason")
+                    "or decide its bucket in MOD_ALLOWLIST_DATA")
             print(f"\n   !! {len(unaccounted)} global(s) neither reset nor "
                   f"accounted for. {what}:\n")
             for n in unaccounted:
@@ -859,7 +1413,7 @@ def main():
     # A name in the allowlist or the ratchet that no longer exists means the
     # table has drifted from the code -- and a drifted table is one that has
     # stopped being read, so it fails too rather than rotting quietly.
-    stale = sorted((set(ALLOW) | ratchet) - seen_names)
+    stale = sorted((set(ALLOW) | set(MOD_ALLOW) | ratchet) - seen_names)
     if stale:
         rc = 1
         print(f"!! {len(stale)} allowlist/ratchet entries name globals that no "

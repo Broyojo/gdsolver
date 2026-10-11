@@ -15,12 +15,26 @@ from pathlib import Path
 _INPUT_RE = re.compile(r"\s*input=(-?\d+)\s*,\s*(\d+)")
 
 
+def is_attempt_sequence(path: Path | str) -> bool:
+    """True when the file holds an attempt sequence: `attempt=<N>` blocks (mod/plan_io.hpp). Its blocks are
+    several attempts of ONE layer, run in order; flattened into one plan they would be a different plan."""
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        if line.startswith("attempt="):
+            return True
+    return False
+
+
 def read_inputs(path: Path | str) -> list[tuple[int, int]]:
     """Read a plan as a sequence of (tick, down), sorted by ascending tick.
 
     Raises if an `input=` line cannot be parsed. Dropping such lines silently is
     exactly how the BOM case above hides: only one line disappears.
+    Raises on an attempt sequence too: reading its blocks as one plan would silently merge attempts. Hand
+    such a file to the mod as `planfile=<path>` (verify_solutions does).
     """
+    if is_attempt_sequence(path):
+        raise ValueError(f"{path}: an attempt sequence (attempt= blocks), not a single plan; "
+                         f"use is_attempt_sequence() and give it to the mod as planfile=")
     out: list[tuple[int, int]] = []
     skipped = 0
     for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():

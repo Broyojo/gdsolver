@@ -51,19 +51,25 @@ COIN_PREFIXES = ("coin:", "coingd:", "coincmp:")
 
 
 def verify_one(worker_id: int, path: Path, level: int, timeout_s: float,
-               workers_root: Path, force_coins: bool = False) -> Verdict:
+               workers_root: Path, force_coins: bool = False,
+               extra_cfg: list[str] | None = None) -> Verdict:
     # a coin solution claims "clear + all coins", so make it report the count too.
     # the coin gate is inside solve=1, so coins=1 does not change a bare replay.
     # --coins turns it on for EVERY file, which is how the coin observation is
     # measured against runs that were never planned to collect anything: what a
     # solution picks up by accident is exactly the baseline the routing work needs.
     coins = "coins=1" if (force_coins or "_coins" in path.name) else "coins=0"
+    # An attempt sequence (prelude attempts, then the clearing one) is run whole, from a fresh layer, by the mod
+    # itself: planfile=<path>. That is the only replay that counts for such a level -- a clear in the middle of
+    # a session, after earlier attempts, is not a clear of the level from its start.
+    plan_cfg = ([f"planfile={path.resolve()}"] if plan.is_attempt_sequence(path)
+                else plan.read_input_lines(path))
     cfg = [
         "enabled=1", f"level={level}", "attempts=1", "quitwhendone=1",
         "blockinput=1", "cbs=0", "cos=1", "notrace=1",
         "fastdt=0.0166667", "fastloops=1800", "skiprender=1",
         "solve=0", "music=mute", coins,
-    ] + plan.read_input_lines(path)
+    ] + list(extra_cfg or []) + plan_cfg
     r = run_session(worker_id, cfg, timeout_s=timeout_s, workers_root=workers_root)
     clear, detail = results.clear_verdict(r.lines)
     if r.timed_out and not clear:
@@ -88,6 +94,10 @@ def main(argv=None) -> int:
     ap.add_argument("--coins", action="store_true",
                     help="run every file with coins=1 and report the coin lines "
                          "(the mod's own pickup test beside GD's own)")
+    # A coins=1 replay builds the mod's level tables, which a bare one does not, so a mod cfg that
+    # changes that pass (obbnolatch) has to be passed to compare the two.
+    ap.add_argument("--cfg", nargs="+", default=[], metavar="KEY=VAL",
+                    help="extra autorun.cfg keys for every replay")
     a = ap.parse_args(argv)
 
     workers_root = Path(a.workers_root)
@@ -121,7 +131,7 @@ def main(argv=None) -> int:
         out = []
         for p, lv in buckets[w]:
             try:
-                out.append(verify_one(w, p, lv, timeout_s, workers_root, a.coins))
+                out.append(verify_one(w, p, lv, timeout_s, workers_root, a.coins, a.cfg))
             except Exception as e:                       # noqa: BLE001
                 out.append(Verdict(p.name, lv, False, f"ERROR {e}", w, []))
         return out

@@ -37,6 +37,28 @@ inline int privateMB() {
     return -1;
 #endif
 }
+// ...and the working set (MB), the same call's other field, for the memory census (cfg memcensus).
+inline int workingSetMB() {
+#ifdef GEODE_IS_WINDOWS
+    struct PMC {
+        DWORD cb; DWORD PageFaultCount;
+        SIZE_T PeakWorkingSetSize, WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage, PeakPagefileUsage;
+    };
+    using Fn = BOOL(WINAPI*)(HANDLE, PMC*, DWORD);
+    static Fn fn = (Fn)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                      "K32GetProcessMemoryInfo");
+    if (!fn) return -1;
+    PMC pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!fn(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1;
+    return (int)(pmc.WorkingSetSize / (1024 * 1024));
+#else
+    return -1;
+#endif
+}
 
 // Emit one line to both result.txt and crash_postmortem.txt.
 // result.txt is truncated at the next session start, so keep an append-only copy

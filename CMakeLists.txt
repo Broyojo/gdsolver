@@ -26,28 +26,35 @@ if (MSVC)
     endforeach()
 endif()
 
-# The solver core is an INTERFACE target (header-only), so it is always added: the mod links
-# it too. Only the leveldp CLI is gated on GDSOLVER_BUILD_DP.
+# The solver core's library (gdsolver_dpcore) is always added: the mod links it too. Only the
+# leveldp CLI and its drivers are gated on GDSOLVER_BUILD_DP.
 add_subdirectory(dp)
 
 if (GDSOLVER_BUILD_MOD)
     file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
+    # The second copy of the core is not a mod source: it is compiled as the CLI's code is,
+    # below, without the mod's options and prelude.
+    list(REMOVE_ITEM SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/mod/dp_bridge2.cpp)
     add_library(${PROJECT_NAME} SHARED ${SOURCES})
     # src/mod/*.hpp include each other and the solver/ headers by path from src/
     target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    # ...and dp/src for the solver core (src/mod/dp_bridge.cpp and its second copy,
-    # dp_bridge2.cpp, are the only TUs that use it).
+
+    # The mod's DP must behave exactly like the dev CLI -- that equality is an acceptance
+    # criterion, not an aspiration -- so the mod does not compile the solver at all. Its first
+    # copy is the CLI's own compiled core (gdsolver_dpcore), and its second copy
+    # (src/mod/dp_bridge2.cpp, the solver's headers again under a renamed namespace) is a library
+    # of its own with the same options. The mod sees dp/src/dpcore.hpp through
+    # src/mod/dp_bridge.hpp; the only other dp/ header it includes is dp/band_rows.hpp, a file
+    # format shared with dptest that compiles no solver code.
+    add_library(gdsolver_dpcore2 STATIC src/mod/dp_bridge2.cpp)
+    target_include_directories(gdsolver_dpcore2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(gdsolver_dpcore2 PRIVATE gdsolver_dp)
+    set_target_properties(gdsolver_dpcore2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    gdsolver_dp_options(gdsolver_dpcore2)
+
     # Plain signature on purpose: Geode's setup_geode_mod links without keywords, and CMake
     # refuses to mix the two forms on one target.
-    target_link_libraries(${PROJECT_NAME} gdsolver_dp)
-    # Match the CLI's code generation for the solver TUs. The mod's DP must behave exactly like
-    # the dev CLI -- that equality is an acceptance criterion, not an aspiration -- so it is
-    # compiled with the same inlining budget rather than the mod's default.
-    if (MSVC)
-        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/mod/dp_bridge.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/mod/dp_bridge2.cpp
-            PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Ob2>")
-    endif()
+    target_link_libraries(${PROJECT_NAME} gdsolver_dpcore gdsolver_dpcore2)
 
     if (NOT DEFINED ENV{GEODE_SDK})
         message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode (or configure with -DGDSOLVER_BUILD_MOD=OFF)")

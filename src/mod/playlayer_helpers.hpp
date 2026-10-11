@@ -92,3 +92,16 @@ inline void noteCkpt(const char* what, PlayerObject* p, void* obj, long long sol
         p ? p->m_totalTime : -1.0);
     writeResult(cb);
 }
+
+// Whether PlayLayer::updateVisibility is skipped outright: the fast loop with render skip, burning
+// through the end-zone effects, and a section solve's search (the first three early-outs of the
+// hook, hooks_playlayer), and a seek's screen-off stretch (cfg seekblind). The visibility pass is
+// what puts a moved object's node at its real position, so with it off the node keeps where the
+// object was when the pass last saw it.
+inline bool visibilityPassOff() {
+    if (g_started && !g_sessionOver && g_cfg.fastdt > 0 && g_cfg.skipRender && !g_realtimeOverride)
+        return true;
+    if (g_endzoneBurn) return true;
+    if (itermap::g_seekBlindNow) return true;
+    return g_secRenderWas >= 0;
+}

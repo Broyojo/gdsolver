@@ -51,6 +51,12 @@ PCT_FLOOR = 95.0
 # goal is a completion whatever the percentage says. Same value as the mod's
 # g_clearMargin, so the two authorities cannot disagree about a saved solution.
 CLEAR_MARGIN_X = 400.0
+# The mod's own nodeath passes (repair.hpp: the bootstrap recording before a solve, the deep re-recording over the
+# deepest plan). Such a pass runs the level with death off, so its `complete:` is the level running out under a
+# player that cannot die -- no plan's clear. A replay that turned into a solving session ends its first such pass
+# this way (seqify.replay with the run's dpsolve=1, 10-09).
+NODEATH_PASS = ("dpsolve: recording what the level does on its own",
+                "dpsolve: no anchor left - re-recording the moving geometry")
 
 
 def read_lines(path: Path | str) -> list[str]:
@@ -168,13 +174,31 @@ def clear_verdict(lines: list[str], pct_floor: float = PCT_FLOOR) -> tuple[bool,
     BACKWARDS (lv22 completes at 96.1% because its last section retreats 2,232px);
     distance alone cannot tell that same ending from a level that raised
     levelComplete in a sub-area (the measured false clear: x=2,458 of 19,570).
+
+    A `complete:` that ends one of the mod's nodeath passes (NODEATH_PASS: the first death/complete after its
+    line) is not a clear and is passed over; when it is the only one, the verdict says so. `step=` is no marker
+    of that: it is GD's m_currentStep, and genuine clears print 0 as well.
     """
     cl = None
+    nodeath, passed = False, []
     for l in lines:
+        if l.startswith(NODEATH_PASS):
+            nodeath = True
+            continue
+        if l.startswith(DEATH):
+            nodeath = False
+            continue
         if l.startswith(COMPLETE) and "levelMaxX=" in l:
+            if nodeath:
+                passed.append(l)
+                nodeath = False
+                continue
             cl = l
             break
     if cl is None:
+        if passed:
+            return False, (f"NODEATH PASS: the only complete ends the mod's own nodeath pass, not a replay of the "
+                           f"plan: {passed[0]}")
         d = first(lines, DEATH)
         return False, d or "(no complete:/death: line)"
     c = parse_complete(cl)

@@ -152,7 +152,7 @@ def solver_flags(log: str) -> dict | None:
 
 
 def ride_pairing(log: str, consumer_default: bool) -> dict:
-    """Per anchored solver call: the hist payload's version (4 carries the ride's facts, below
+    """Per anchored solver call: the hist payload's version (4 and 5 carry the ride's facts, below
     4 does not) against whether dp's consumer was on for that call (its built-in default, then
     --anchorride / --no-anchorride in argv order). Four counts; the two mixed ones must be 0."""
     out = {"v4_on": 0, "v4_off": 0, "old_on": 0, "old_off": 0}

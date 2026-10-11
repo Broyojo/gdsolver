@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // The iteration map: where the repair loop spent its rounds, drawn over the level.
 //
 // A cold run reports one number -- "cleared in 129 rounds" -- and that number says nothing about
@@ -23,6 +23,8 @@
 // give-up, because a run that did NOT clear is the one whose map is worth reading. It is also
 // producible after the fact from a run's log (py/itermap_from_log.py), so the maps of every run
 // already on disk exist without re-solving anything.
+#include <chrono>
+#include <map>
 #include <mutex>
 
 #include "mod/config.hpp"
@@ -231,6 +233,79 @@ constexpr long long kStepUndershoot = 16;   // comfortably more than one batch
 // it. Two seconds of level at 1x.
 constexpr float kSeekLead = 240.f;
 inline bool seeking() { return g_seekTick >= 0 || g_seekRestart; }
+// What a seek cost, printed when it ends: wall time from the ask, the frames it took, the physics
+// batches it ran, and how much of the wall time went to the visibility pass and to the draw. The
+// update hook and the playlayer hooks add to these only while seeking().
+inline std::chrono::steady_clock::time_point g_seekT0{};
+inline long long g_seekFrames = 0, g_seekBatches = 0, g_seekVisCalls = 0;
+inline double g_seekVisMs = 0.0, g_seekDrawMs = 0.0;
+// cfg `seekvisevery` (0 or 1 = every batch): while a seek runs, the visibility pass runs on every
+// Nth batch of a frame and always on the frame's last one, so the picture drawn is current. Its
+// cost is proportional to the level's object count, and a seek runs up to kSeekLoopsMax batches a
+// frame. The default is every batch, as before: the visibility pass is part of the physics -- it
+// activates and deactivates objects (m_isActivated, which staticObjectsInRect takes whatever the
+// groups) and syncs a moved object's node, which a landing's stair snap reads -- and a pass on the
+// frame's last batch only lands wherever the frame boundaries fall (SubZero 4002: a wall activated
+// on one frame-end pass and never deactivated stopped a spider). 400 (= kSeekLoopsMax, the last
+// batch only) is the fast arm: a heavy custom level's seeks took 12.1 s and 11.6 s with every batch, 6.2 s and
+// 5.8 s with the last only (2026-10-05), before the section hooks were made lazy.
+inline int g_seekVisEvery = 1;
+// Set by the update hook around each batch: this batch's visibility pass may be skipped.
+inline bool g_seekVisSkip = false;
+// cfg `seekblind` (on by default since 2026-10, `seekblind=0` turns it off; needs seekcp): a seek
+// runs screen off -- no visibility pass, no
+// draw, as the solver's own flights run -- up to the last checkpoint slot at or before the target,
+// laying checkpoints on the way, then loads that checkpoint (a resetLevel, so the visibility state
+// the draw walks is rebuilt) and runs the rest with the visibility pass on every batch. The update
+// hook owns the switch (g_seekBlindNow); g_seekBlindDone keeps a seek from going blind twice.
+inline bool g_seekBlind = true;
+inline bool g_seekBlindNow = false;
+inline bool g_seekBlindDone = false;
+inline double g_seekBlindMs = 0.0;
+// cfg `profsample` (mod/profsample.hpp). Kept here because the cfg reader comes before that file.
+inline bool g_profSample = false;
+// cfg `sectionhooklazy` (on by default; hooks_gamelayer.cpp, syncSectionHooks). Here for the same
+// reason.
+inline bool g_sectionHookLazy = true;
+// cfg `seekcp` (mod/seek_cp.hpp): the seek bar's checkpoint spacing in ticks, 0 = off; 600 by
+// default since 2026-10. Kept here for the cfg reader; seek_cp.hpp comes later in the include chain,
+// so it reaches the seek through the two hooks below, which the game layer installs.
+inline long long g_seekCpEvery = 600;
+// ...the instrument's keys: take checkpoints only in [from, to] (cfg seekcpfrom / seekcpto), keep them
+// when a restored run parts (cfg seekcpkeep, print only), and the checkpoint a seek must start from
+// (cmd `seekfrom <cp tick> <target>`, -1 = the latest at or before the target).
+inline long long g_seekCpFrom = 0, g_seekCpTo = -1;
+inline bool g_seekCpKeep = false;
+inline long long g_seekFromCp = -1;
+inline long long g_latchAt = 0;   // cfg latchat (print only, hooks_gamelayer latchLine)
+inline bool g_headCheck = false;  // cfg headcheck (print only, seek_cp.hpp)
+inline long long g_batchFrom = -1, g_batchTo = -1;   // cfg batchlog=from:to (print only, hooks_gamelayer)
+inline long long g_pauseAtTick = 0;
+inline std::vector<int> g_objWatch;   // cfg objwatch (print only, hooks_gamelayer cpAfterUpdate)
+inline bool g_groupCheck = false;
+// cfg actcensus (print only, hooks_gamelayer actCensus): switched-off objects GD's collision queries return
+// near a player because they are activated -- per object its id, kind (0 solid, 1 hazard), first and last
+// tick and update boundaries; and the run's boundaries with one or more, out of those checked.
+inline bool g_actCensus = false;
+struct ActCensusObj { long long first = -1, last = -1, boundaries = 0; int id = 0, kind = 0; };
+struct ActCensus { std::map<int, ActCensusObj> objs; long long boundaries = 0, checked = 0; };
+inline ActCensus g_actCensusState;
+inline std::string actCensusLine() {
+    const auto& c = g_actCensusState;
+    std::string s = "actcensus: summary - boundaries with a switched-off activated object near a player "
+        + std::to_string(c.boundaries) + " of " + std::to_string(c.checked) + ", objects " + std::to_string(c.objs.size()) + ":";
+    int n = 0;
+    for (const auto& [uid, e] : c.objs) {
+        if (++n > 30) { s += " ..."; break; }
+        s += " " + std::to_string(uid) + "/" + std::to_string(e.id) + (e.kind ? "h" : "s") + "@" + std::to_string(e.first)
+             + "-" + std::to_string(e.last) + "x" + std::to_string(e.boundaries);
+    }
+    return s;
+}   // cfg groupcheck (print only, hooks_gamelayer groupSectionCheck)   // cfg pauseattick (hooks_gamelayer, next to pauseatx)
+inline long long g_regionAt = 0;   // cfg regionat / regionbox (print only, hooks_gamelayer regionLine)
+inline float g_regionBox[4] = {0.f, 0.f, 0.f, 0.f};
+inline bool (*g_cpAhead)(long long now, long long target) = nullptr;   // a checkpoint to jump ahead to
+inline std::string (*g_cpLine)() = nullptr;                            // its counts, after each seek
 
 // ---- where the bar's playhead belongs ----
 //
@@ -342,6 +417,15 @@ inline void clearLocked() {
 inline void clear() {
     std::lock_guard<std::mutex> lk(g_mu);
     clearLocked();
+}
+
+// What the map holds allocated (capacities), for the memory census (cfg memcensus).
+inline size_t heldBytes() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    size_t n = g_deaths.capacity() * sizeof(Death) + g_fixups.capacity() * sizeof(Fixup)
+               + g_vetoes.capacity() * sizeof(Veto) + g_paths.capacity() * sizeof(Path);
+    for (const Path& p : g_paths) n += p.xy.capacity() * sizeof(float);
+    return n;
 }
 
 // ---- the loop's side ----
@@ -1245,9 +1329,16 @@ inline void seekToTick(long long targetTick) {
     // old x version there is nothing to look up and nothing to be unknown about a place the run
     // has not been yet.
     g_seekBarTick = targetTick;
-    // Forced scroll has no reverse, so the only way back is to run the level again from the top.
-    g_seekRestart = (targetTick <= g_nowTick);
+    // Forced scroll has no reverse, so the only way back is to run the level again from the top --
+    // or from a checkpoint at or before the target (cfg seekcp), which the restart then picks.
+    // Forward, a checkpoint well past the player is a jump ahead, taken the same way.
+    g_seekRestart = (targetTick <= g_nowTick) || (g_cpAhead && g_cpAhead(g_nowTick, targetTick));
     if (g_sessionOver) g_seekRevive = true;
+    g_seekT0 = std::chrono::steady_clock::now();
+    g_seekFrames = g_seekBatches = g_seekVisCalls = 0;
+    g_seekVisMs = g_seekDrawMs = 0.0;
+    g_seekBlindNow = g_seekBlindDone = false;
+    g_seekBlindMs = 0.0;
     char b[192];
     snprintf(b, sizeof(b), "itermap: seek to t=%lld from t=%lld (%s%s; speed stays %gx)",
              (long long)targetTick, (long long)g_nowTick,
@@ -1262,12 +1353,24 @@ inline void seekToTick(long long targetTick) {
 // which is the same mistake the note at g_visResetPending records.
 inline void endSeek(const char* why) {
     if (!seeking()) return;
-    char b[160];
-    snprintf(b, sizeof(b), "itermap: seek ended (%s) at t=%lld, back to %gx",
-             why, (long long)g_nowTick, (double)g_watchSpeed);
+    char b[320];
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_seekT0).count();
+    snprintf(b, sizeof(b),
+             "itermap: seek ended (%s) at t=%lld, back to %gx (%.0f ms, %lld frames, %lld batches, "
+             "visibility %lld calls %.0f ms, draw %.0f ms)",
+             why, (long long)g_nowTick, (double)g_watchSpeed, ms, g_seekFrames, g_seekBatches,
+             g_seekVisCalls, g_seekVisMs, g_seekDrawMs);
     g_seekTick = -1;
     g_seekRestart = false;
+    g_seekBlindNow = false;
     writeResult(b);
+    if (g_seekBlindDone) {
+        snprintf(b, sizeof(b), "itermap: the seek ran screen off for its first %.0f ms (cfg seekblind)",
+                 g_seekBlindMs);
+        writeResult(b);
+    }
+    if (g_cpLine && g_seekCpEvery > 0) writeResult(g_cpLine());
 }
 
 // How many physics batches this frame should run for the seek. 0 = nothing pending, or the target

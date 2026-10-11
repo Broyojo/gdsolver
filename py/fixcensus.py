@@ -478,10 +478,10 @@ def census(a, tmp: runtmp.RunTmp) -> int:
                          + [Path(str(plan) + s) for s in
                             (".groups.txt", ".groups.deep.txt",
                              ".groups.live.txt", ".groups.bank.txt")])
-        # gdref/lv*.bandtrack.txt is deliberately NOT watched as an input: this
-        # run rewrites it itself, so its state beforehand says nothing. It is
-        # claimed inside quick_regress.band_track_args right after our write,
-        # which is what lets the guard tell our rewrite from a second process's.
+        # The band recording is not watched as an input: band_track_args writes it
+        # in a directory of this process's own (no longer gdref/lv*.bandtrack.txt,
+        # 2026-10-09) and claims it right after the write, which is what lets the
+        # guard tell our write from a second process's.
         gd = read_ref(lv)
         if not gd:
             continue

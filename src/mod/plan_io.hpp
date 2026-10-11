@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Per-session state reset, plan_in.txt input loader, inject=/stopat= extras.
 #include "mod/speedgate.hpp"
 
@@ -24,9 +24,42 @@ inline bool onVerifyDeath(long long dt, float deathX);
 inline bool maybeCheckWall();
 inline bool onGiveUp(const char* reason);
 inline std::string summary();
+inline size_t heldBytes();   // what the slice holds allocated (cfg memcensus)
 }  // namespace levelslice
 
+// ATTEMPT SEQUENCE. A plan file may hold several attempts: `attempt=<N>` starts block N, its `input=` lines are
+// relative to that attempt's own tick 0, and `until=<tick>` ends a block that does not end in a death by
+// restarting the level at that tick (a person pressing restart). A level that is not the same on its first
+// attempt (an Item Persistence / attempt-count start, see level_warnings) is cleared by running the earlier
+// blocks and then the last one in ONE layer, in order, with nothing pinned. `# ...` lines (a lineage id) are
+// comments. A file without `attempt=` lines is one attempt, as before: out gets its inputs and the globals
+// below are not touched. With them, out gets the LAST block (what every consumer already flies) and
+// g_prelude the blocks before it.
+struct PreludeAttempt {
+    std::vector<InputCmd> in;
+    long long until = -1;   // restart the level when this attempt's tick reaches it (-1: only a death ends it)
+};
+inline std::vector<PreludeAttempt> g_prelude;
+inline std::vector<InputCmd> g_finalInputs;   // the last block, kept while a prelude swaps g_cfg.inputs
+inline long long g_preludePendingAttempt = -1;   // the attempt the restart was asked for: a stale one is dropped
+inline bool g_preludeResetPending = false;     // asked at an `until`; the level restarts at the next safe point
+inline long long g_preludeResets = 0;
+
+// A solve has run since its memory was last let go (dpsolve::releaseSolveMemory, repair.hpp):
+// raised by dpsolve::start, lowered by the release, so leaving the level after a session end that
+// has already released does not do it again.
+inline bool g_solveMemHeld = false;
+namespace dpsolve {
+inline void releaseSolveMemory(const char* where);
+inline void memCensus(const char* where);   // cfg memcensus (print only), repair.hpp
+}
+
 inline void resetSessionState() {
+    g_solveMemHeld = false;   // (onQuit releases first, then calls this)
+    g_prelude.clear();
+    g_finalInputs.clear();
+    g_preludeResetPending = false;
+    g_preludeResets = 0;
     g_started = false; g_sessionOver = false; g_uiSession = false;
     g_attempt = 0; g_finishedAttempts = 0;
     g_nextInput = 0; g_nextToggle = 0;
@@ -59,10 +92,17 @@ inline void resetSessionState() {
     solver::g_log.clear();
     orbtrace::reset();
     padtrace::reset();
+    // ...and orbtrace's 400-line cap, which its reset() leaves (it runs per attempt; padtrace's clears
+    // its own). Left behind, once one level had printed 400 lines no later level printed any.
+    orbtrace::g_lines = 0;
+    // The dead-tick counters printed at every session's end (endSession) are the session's.
+    deadstat::g_total = deadstat::g_dead = deadstat::g_streak = 0;
+    deadstat::g_maxStreak = deadstat::g_episodes = 0;
     // ...and the activations the anchor payload is built from. Left behind,
     // one level's touched triggers would seed the next level's anchors, which
     // is the same shape as the recording leak that hid under a green 22/22.
     touchseed::reset();
+    touchfire::reset();
     portalseed::reset();
     padseed::reset();
     ringseed::reset();
@@ -118,6 +158,18 @@ inline void resetSessionState() {
     // and HUD leaks above, and just as convincing to look at.
     itermap::clear();
     levelslice::reset();
+    // ...and the human takeover: its checkpoint belongs to this level's layer, and a mode left
+    // live would lift the next session's input block.
+    takeover::resetState();
+    // cfg singlereset: the last real reset's layer and processCommands count. The skip asks only
+    // whether both are unchanged, and a new level's layer can stand where the last one stood, so
+    // left behind they could make its first reset read as a second. The count of skips is printed
+    // at every session's end, so it is the session's, and so is its print cap.
+    g_resetMarkLayer = nullptr;
+    g_resetMarkPc = -1;
+    g_resetsSkipped = 0;
+    // cfg actcensus: the summary at the session's end is this level's objects, not the run's.
+    itermap::g_actCensusState = itermap::ActCensus{};
     // The PREFERENCE is deliberately not reset here. Until someone expresses one it is not a
     // stored value at all -- mapWanted() reads it off the session's mode, so a solve draws the map
     // and a replay does not without anything having to be reset between them. Once F10 or cfg
@@ -137,10 +189,11 @@ inline void resetSessionState() {
     if (g_dump.is_open()) g_dump.close();
 }
 
-inline bool loadInputsFile(const std::string& path, std::vector<InputCmd>& out) {
+inline bool loadInputsFile(const std::string& path, std::vector<InputCmd>& out, bool keepPrelude = false) {
     std::ifstream f(path);
     if (!f) return false;
     out.clear();
+    std::vector<PreludeAttempt> blocks;   // only when the file has attempt= lines
     std::string line;
     bool first = true;
     while (std::getline(f, line)) {
@@ -153,10 +206,42 @@ inline bool loadInputsFile(const std::string& path, std::vector<InputCmd>& out) 
                 && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
                 line.erase(0, 3);
         }
+        if (line.rfind("attempt=", 0) == 0) {
+            blocks.emplace_back();
+            continue;
+        }
+        if (line.rfind("until=", 0) == 0) {
+            if (!blocks.empty()) blocks.back().until = atoll(line.c_str() + 6);
+            continue;
+        }
         if (line.rfind("input=", 0) != 0) continue;
         int t = 0, d = 0;
-        if (sscanf(line.c_str() + 6, "%d,%d", &t, &d) == 2)
-            out.push_back({t, d != 0});
+        if (sscanf(line.c_str() + 6, "%d,%d", &t, &d) == 2) {
+            // The level is a bitmask of the buttons held from that tick: bit 0 is player 1's jump,
+            // and every other bit is reserved for buttons this version does not drive (a second
+            // player's jump, platformer moves). A plan that uses one is refused, not replayed with
+            // those buttons dropped.
+            if (d & ~1) {
+                writeResult("plan: " + path + " holds buttons this version does not drive (input="
+                            + std::to_string(t) + "," + std::to_string(d) + ") - not loaded");
+                out.clear();
+                return false;
+            }
+            if (blocks.empty()) out.push_back({t, (d & 1) != 0});
+            else blocks.back().in.push_back({t, (d & 1) != 0});
+        }
+    }
+    if (!blocks.empty()) {
+        // the last block is the clearing attempt; the ones before it are the prelude
+        out = blocks.back().in;
+        blocks.pop_back();
+        if (!keepPrelude) {
+            g_prelude = blocks;
+            g_finalInputs = out;
+        }
+    } else if (!keepPrelude) {
+        g_prelude.clear();   // a plain plan: the session has no prelude (nothing left from the file before)
+        g_finalInputs.clear();
     }
     return !out.empty();
 }
@@ -170,6 +255,24 @@ inline bool writeInputsFile(const std::string& path, const std::vector<InputCmd>
     if (!f) return false;
     for (const InputCmd& c : plan)
         f << "input=" << c.step << "," << (c.down ? 1 : 0) << "\n";
+    return true;
+}
+
+// An attempt sequence out: the prelude blocks, then the clearing one, each as `attempt=<N>`, an optional
+// `until=<tick>`, and its inputs. `lineage` is written as a comment next to each block (the start state's id).
+inline bool writeAttemptSequence(const std::string& path, const std::vector<PreludeAttempt>& prelude,
+                                 const std::vector<InputCmd>& clearing, const std::string& lineage = "") {
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) return false;
+    int n = 0;
+    auto block = [&](const std::vector<InputCmd>& in, long long until) {
+        f << "attempt=" << ++n << "\n";
+        if (!lineage.empty()) f << "# lineage=" << lineage << "\n";
+        if (until >= 0) f << "until=" << until << "\n";
+        for (const InputCmd& c : in) f << "input=" << c.step << "," << (c.down ? 1 : 0) << "\n";
+    };
+    for (const PreludeAttempt& p : prelude) block(p.in, p.until);
+    block(clearing, -1);
     return true;
 }
 

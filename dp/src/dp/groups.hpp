@@ -214,17 +214,6 @@ inline GroupTimeline loadGroupTimeline(const std::string& path,
     return parseGroupTimeline(bytes, path, endOut, initOut);
 }
 
-// --groupholdend <n>: the bootstrap takes over only n ticks AFTER the overriding
-// recording ends, so its last row holds for those ticks. 0 (the default) is the
-// old behaviour. Why n > 0 is needed: the live recording is the GD replay of the
-// plan that just DIED, and it stops on the tick of the death -- while the kill is
-// decided on the model's NEXT row. That row therefore always comes from the
-// bootstrap, where the killer can be somewhere else entirely or switched off.
-// Measured on lv20 (census v0.1.4, iterations 6-9, one plan sent four times):
-// moving spike uid13068 is at x 24,350.46 with on=1 in the live recording's last
-// row (t=16,252); the bootstrap has it at x 26,376 with on=0 on t=16,253, so the
-// model's hazard never saw it and GD killed the same plan four times.
-inline int g_groupHoldEnd = 0;
 // The last tick the --groups recordings cover (the largest `end,<tick>` trailer among the
 // files; -1 = no trailer, or no recording). Read by --ridebox to tell a ride the recording
 // saw end from one it was still inside when it stopped.
@@ -312,9 +301,9 @@ inline int bootAlignShift(const std::vector<DynSample>& live,
 // holds for one tick before the recordings under it take over. The producer
 // says so, not dp: the mod appends the flag only when it passes the live
 // recording, which it writes only after a replay died (harvestGroups), and that
-// file is always the last overlay. The hold was asked to be tied
-// to a death-terminated recording rather than applied to every overlay, which is
-// what --groupholdend does.
+// file is always the last overlay. The hold is tied to a death-terminated recording
+// rather than applied to every overlay (an earlier form held every overlay's last row for a
+// number of ticks; it is gone).
 //
 // Why a tick: the live recording stops on the tick GD killed the player, and dp
 // decides that kill on its NEXT row, which otherwise comes from the recording
@@ -369,9 +358,8 @@ inline void overlayGroupTimeline(GroupTimeline& base, const GroupTimeline& over,
                 sHi = nRetimed ? std::max(sHi, s) : s;
                 ++nRetimed;
             }
-            const int hold = (deathEnd && s == 0) ? std::max(1, g_groupHoldEnd)
-                                                  : g_groupHoldEnd;
-            if (hold > g_groupHoldEnd) ++nHeld;
+            const int hold = (deathEnd && s == 0) ? 1 : 0;
+            if (hold > 0) ++nHeld;
             for (const DynSample& b : it->second) {
                 DynSample c = b;
                 c.t -= s;

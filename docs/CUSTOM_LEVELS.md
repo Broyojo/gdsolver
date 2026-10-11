@@ -33,33 +33,37 @@ are the same as everywhere: while the mod drives, nothing is recorded.
 
 ## What the measurements say
 
-300 rated levels were drawn at random from the level server and solved cold with
-the release build — the same loop as the official ones, each level given up to
-20 minutes. The 300 are three draws of 100: one from rated levels of every
-version, which cleared 67, and two from levels saved in 1.8 or earlier (the
-second only from 1.8 levels with slopes and no dual), which cleared 95 and 96.
-The older levels are over-represented on purpose, so the total is not a rate for
-custom levels in general; every level saved in 2.0 or later below comes from the
-first draw. Grouped by the game version the level was last saved in:
+100 rated levels drawn at random from the level server, from every game version,
+are solved cold with each release build — the same loop as the official ones,
+each level given up to 20 minutes. On the v0.5.0 build **93 of the 100 cleared**
+(v0.4.0: 67). Grouped by the game version the level was last saved in:
 
-| saved in | parts it can contain | levels | cleared | the rest | rounds (median, cleared) |
+| saved in | parts it can contain | levels | cleared (v0.4.0) | the rest | rounds (median, cleared) |
 |---|---|--:|--:|---|--:|
-| before 1.8 | cube, ship, ball, UFO; the early portals, pads and rings | 78 | 76 | 2 ran out of time | 0 |
-| 1.8 | slopes and dual added | 125 | 118 | 5 ran out of time, 2 gave up at a wall | 2 |
-| 1.9 | wave added | 10 | 10 | — | 2.5 |
-| 2.0 | robot, teleports, move and toggle triggers | 9 | 8 | 1 ran out of time | 6 |
-| 2.1 | spider, dash rings, many triggers | 49 | 35 | 14 ran out of time | 11 |
-| 2.2 | swing, area effects, many more triggers | 29 | 11 | 16 ran out of time, 2 gave up at a wall | 11 |
-| all | | 300 | 258 | | |
+| before 1.9 | cube, ship, ball, UFO, slopes and dual; the early portals, pads and rings | 3 | 3 (3) | — | 0 |
+| 1.9 | wave added | 10 | 10 (10) | — | 2.5 |
+| 2.0 | robot, teleports, move and toggle triggers | 9 | 8 (8) | 1 ran out of time | 3.5 |
+| 2.1 | spider, dash rings, many triggers | 49 | 46 (35) | 3 ran out of time | 6.5 |
+| 2.2 | swing, area effects, many more triggers | 29 | 26 (11) | 2 ran out of time, 1 stopped at once (likely a game bug) | 10.5 |
+| all | | 100 | 93 (67) | | |
+
+The level that stopped at once did so in a way that points to a bug on the game's
+side rather than to the solver; it stays in the hundred as a level that did not
+clear. The 20 minutes are the measurement's time box, not a verdict: the
+levels that ran out of time were still making progress, and the runs share one
+machine, several levels at a time, so a level close to the limit can land on
+either side of it.
 
 The version a level was saved in is only a guess at what it uses: a level saved in
-2.1 may hold nothing newer than 1.8. Grouped instead by the newest object a level
-actually holds (each object dated by the oldest game version of a server level
-that contains it), the 215 levels with nothing from 2.0 on cleared 206 times; the
-85 with an object from 2.0 on, 52 times. That is the line the play menu's yellow
-note draws.
+2.1 may hold nothing newer than 1.8. On the v0.4.0 build the survey also took 200
+levels saved in 1.8 or earlier (the second hundred only 1.8 levels with slopes and
+no dual), which cleared 95 and 96. Over all 300, grouped by the newest object a
+level actually holds (each object dated by the oldest game version of a server
+level that contains it), the 215 levels with nothing from 2.0 on cleared 206 times;
+the 85 with an object from 2.0 on, 52 times. That is the line the play menu's
+yellow note draws.
 
-Where the model and the game came apart, per 10,000 ticks the game flew (each
+On the v0.4.0 build, where the model and the game came apart, per 10,000 ticks the game flew (each
 level's deepest attempt; a place counts once however many rounds died there, and a
 death where only the kill differed counts once the model, replayed on its own,
 has confirmed it — the few that could not be checked are left out):
@@ -74,7 +78,8 @@ The ten wave levels are a small sample; their rates rest on 18 places. On the
 levels with newer objects the wave is the outlier, and the swing has barely been
 measured at all.
 
-*When and with what:* 2026-10-02, on the v0.4.0 build.
+*When and with what:* the hundred, 2026-10-11 on the v0.5.0 build and 2026-10-02
+on v0.4.0; the 200 older levels and the rates per mode, 2026-10-02 on v0.4.0.
 
 ## Levels that usually solve
 
@@ -106,30 +111,38 @@ measured at all.
 The model cannot plan through these, so the loop can get past them only where the
 section solver finds a way through the game itself — slowly, and not always.
 
-* **The gravity trigger (2.2).** A level that changes the strength of gravity is
-  flown by the game with the new value and planned by the model with the old one.
-* **Most teleports of 2.1 and 2.2.** The model keeps x as its clock, so a teleport
-  portal whose exit is elsewhere in x is a jump it cannot take; nor does it read a
-  portal that keeps the player's height, one that pushes the player (a static or
-  redirected force), or one whose exit the game draws from several objects, and
-  it has no teleport orb or teleport trigger at all. A portal whose exit is right
-  above or below it is modelled.
+* **Some teleports.** The teleport portal, the teleport trigger and the teleport
+  orb are modelled, as are a portal that pushes the player or keeps their height,
+  and an exit right above or below. Not yet: an exit elsewhere in x (the model
+  keeps x as its clock, so that is a jump it cannot take), an orb that pushes the
+  player, an exit the game draws from several objects, and a teleport trigger set
+  off by touch or a spawn, or one that keeps the player's offset.
+* **Some gravity triggers.** The gravity trigger (2.2) is modelled when the player
+  crossing it sets it off; one set off by touch or a spawn, or one for player 2,
+  is flown by the game with the new gravity and planned by the model with the old.
+* **Some Follow Player Y triggers**: one with a delay, one set off by touch or a
+  spawn, or more of them running at once than the model's state holds.
+* **Two-player levels.** The second player has a button of its own, which the bot
+  never presses; the model has no such mode.
 * **Levels that change from one attempt to the next.** An Item Compare or Item
   Edit can read the attempt count, and Item Persistence keeps items across
   attempts, so a level can, say, skip its intro from the second attempt on. The
   loop records the moving geometry on one attempt and flies its plans on later
-  ones, and a solution replayed as a first attempt meets a different level.
-* **Randomness the model cannot box in.** An Area Move with a random variance is
-  planned against the whole box it can land in. Area Rotate and Area Scale with a
-  variance, and an Advanced Follow's, are not covered yet; the session's
-  `areaenv:` line counts them. While the bot drives, the game's random seeds are
-  set to the same values before every attempt, so each attempt meets the same draw
-  and a solution is one for that draw; the play menu says when a level has a
-  Random or Advanced Random trigger, or an area or enter effect with a random
-  variance (a spawn delay's or an Advanced Follow's variance is not detected yet).
-  The section solver's checkpoint restores start it from the attempt's
-  first values too, so a stretch it solves after a Random trigger can still fail
-  on the replay from the start, which then refuses it.
+  ones, and a solution replayed as a first attempt meets a different level. Three
+  settings, off by default, pin what such a level reads, so that every attempt
+  meets the same level: `attemptone` (every bot attempt is the level's first),
+  `attemptcount=k`, and `persistworld=k` / `persistitems` (every reset starts from
+  one fixed table of kept items).
+* **Randomness.** While the bot drives, the game's random seeds are set to the same
+  values before every attempt, so each attempt meets the same draw — an Area Move's
+  distance, a Random trigger's choice — and the model plans against the positions
+  the game's own recording shows. A solution is one for that draw: played without
+  the mod, or by another tool, it can meet other positions. The play menu says
+  when a level has a Random or Advanced Random trigger, or an area or enter effect
+  with a random variance (a spawn delay's or an Advanced Follow's variance is not
+  detected yet). The section solver's checkpoint restores start it from the
+  attempt's first values too, so a stretch it solves after a Random trigger can
+  still fail on the replay from the start, which then refuses it.
 
 ### In the model, but measured less
 
@@ -199,8 +212,9 @@ level with more turns the routing off and says so. See [COINS.md](COINS.md).
 Whatever a level uses, the loop tries, and a level clears if the game lets it.
 The play menu says up front where that is less likely
 ([RUNNING.md](RUNNING.md#the-play-menu)): a red
-line when a level holds something the model cannot express (the teleports and
-the gravity trigger above, or a level that changes from one attempt to the
-next), and a yellow one on a custom level with objects from 2.0 on. What is
+line when a level holds something the model cannot express (the teleports,
+gravity and follow triggers above, a two-player level, or a level that changes
+from one attempt to the next), and a yellow one on a custom level with objects
+from 2.0 on. What is
 still planned is saying it afterwards too: a clear reported as either the
 model's alone or one with stretches the section solver found.

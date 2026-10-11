@@ -25,9 +25,10 @@ pre-release that is not supported ([docs/ANDROID.md](docs/ANDROID.md)).
 ## A few of the Extreme Demons it has solved
 
 <p align="center">
-  <a href="https://youtu.be/1ORlnG4zFfc"><img src="https://img.youtube.com/vi/1ORlnG4zFfc/maxresdefault.jpg" width="32%" alt="Video: Bloodbath solved by gdsolver"></a>
-  <a href="https://youtu.be/lPco2GpVe2c"><img src="https://img.youtube.com/vi/lPco2GpVe2c/maxresdefault.jpg" width="32%" alt="Video: Antarctic Lights solved by gdsolver"></a>
-  <a href="https://youtu.be/b1taOeFYbY0"><img src="https://img.youtube.com/vi/b1taOeFYbY0/maxresdefault.jpg" width="32%" alt="Video: Amethyst solved by gdsolver"></a>
+  <a href="https://youtu.be/1ORlnG4zFfc"><img src="https://img.youtube.com/vi/1ORlnG4zFfc/maxresdefault.jpg" width="24%" alt="Video: Bloodbath solved by gdsolver"></a>
+  <a href="https://youtu.be/lPco2GpVe2c"><img src="https://img.youtube.com/vi/lPco2GpVe2c/maxresdefault.jpg" width="24%" alt="Video: Antarctic Lights solved by gdsolver"></a>
+  <a href="https://youtu.be/b1taOeFYbY0"><img src="https://img.youtube.com/vi/b1taOeFYbY0/maxresdefault.jpg" width="24%" alt="Video: Amethyst solved by gdsolver"></a>
+  <a href="https://youtu.be/TIzsdUE_3t0"><img src="https://img.youtube.com/vi/TIzsdUE_3t0/maxresdefault.jpg" width="24%" alt="Video: Thinking Space II solved by gdsolver"></a>
 </p>
 
 | Level | Uploaded by |
@@ -35,18 +36,19 @@ pre-release that is not supported ([docs/ANDROID.md](docs/ANDROID.md)).
 | Bloodbath | Riot |
 | Antarctic Lights | declanlc |
 | Amethyst | iMist |
+| Thinking Space II | Cairox |
 
-These three were solved cold by the v0.4.0 build, the way any level is — its play
+These four are solved cold by the v0.5.0 build, the way any level is — its play
 button, **Solve**, and nothing else: no seeds, no previous solution, no hints,
 nothing but the level — for the end of the level (Antarctic Lights has three coins,
-the other two none).
+the other three none).
 
 These are other people's levels, solved by a bot. A solution is a TAS, not a
 completion: while the mod drives nothing is recorded, and its replays are marked as
 bot input (see [Safety](#safety--community-notes)). They are also custom levels,
 and unlike the official levels they are not guaranteed to solve: of 100 rated
-levels drawn at random, 67 cleared, and of the 29 of those saved in 2.2, 11
-([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)).
+levels drawn at random, 93 cleared within 20 minutes each, and of the 29 of those
+saved in 2.2, 26 ([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)).
 
 Give it a level and it looks for an input sequence that clears it. It does not
 re-implement the game's physics: an approximate, measured-where-it-matters model
@@ -79,7 +81,7 @@ Those levels are also the supported set — see [What's next](#whats-next) for
 where custom levels and platformer mode stand.
 
 The per-level results — repairs and times for the 22 official levels and the 17
-spin-off levels, with and without coins, and how they compare with v0.3.2 — are in
+spin-off levels, with and without coins, and how they compare with v0.4.0 — are in
 [docs/RESULTS.md](docs/RESULTS.md).
 
 ## How it works
@@ -151,10 +153,9 @@ Around that loop:
   tick the last replay died to a recording of the level played with no input.
   Some of it the game draws from random seeds (an Area Move's distance, Random
   triggers). While the bot drives, the seeds are set to the same values before
-  every attempt, so every attempt meets the same draw; the model still treats the
-  whole box an Area Move can land in as deadly while the object is solid, so its
-  plans do not depend on the draw (Area Rotate and Area Scale with a variance, and
-  an Advanced Follow's, are not covered yet; the `areaenv:` line counts them).
+  every attempt, so every attempt meets the same draw and the model plans against
+  the positions the recording shows; a solution is one for that draw, and played
+  without the mod it can meet other positions.
 
 * **`dp/`** — the solver core (`leveldp`, also linked into the mod). States are
   *exact*; the per-layer hash only deduplicates and never snaps a state, so every
@@ -175,15 +176,13 @@ Around that loop:
 
 ## What's next
 
-**Custom levels — most older ones solve; the newest gimmicks often do not yet.**
+**Custom levels — most solve now; some of the newest gimmicks do not yet.**
 Nothing in the loop is specific to the official levels, and any level can be
-picked. On the release build, 100 rated levels drawn at random, and 200 more
-drawn only from levels saved in 1.8 or earlier, were each given up to 20 minutes.
-Of the 100, 67 cleared cold. Levels built only from parts that existed before 2.0
-mostly solve as they are — 206 of the 215 across both draws that use nothing from
-2.0 on, and the model disagreed with the game about a fifth as often per tick on
-them as on the rest. Levels that lean on the 2.1 and 2.2 gimmicks often do not
-solve yet: of the levels saved in those versions, 35 of 49 and 11 of 29 cleared.
+picked. On the release build, 100 rated levels drawn at random were each given up
+to 20 minutes, and 93 cleared cold (67 on v0.4.0). Levels built only from parts
+that existed before 2.0 mostly solve as they are; most of this release's model
+work went into the 2.1 and 2.2 gimmicks, and of the levels saved in those
+versions 46 of 49 and 26 of 29 cleared (35 and 11 on v0.4.0).
 The regression covers the official levels only, so a custom level's result is
 outside what it keeps honest. The play menu says so up front: a yellow line on a
 custom level that uses objects from 2.0 on, and a red one when a level holds
@@ -204,12 +203,28 @@ The work on custom levels:
 * **Custom levels in the regression**, so that a change is measured on them too.
 * **Heavy levels** — the speed of levels with very many objects.
 
-**The next milestone: the search as a plug-in.** Today the reachability DP and
-the physics model are written together. The plan is to separate them, so that the
-search can be swapped without touching the physics and new searches can be tried
-side by side — one search tuned for every level may not exist. The search is also
-the part that needs no knowledge of Geometry Dash's physics, so it is where
-contributions are most welcome.
+**The next milestone: two-player levels, the gimmicks the model does not cover
+yet, and divergences.**
+
+* **Two-player levels.** The second player has a button of its own, which the bot
+  does not press yet, so such a level is planned with presses the game never gives
+  it. Plans already carry a button mask (bit 0 is player 1's jump, the other bits
+  are reserved); the second player's button is next.
+* **The gimmicks the play menu names in red** — teleports that move you sideways
+  or have several exits, orbs that push you, triggers set off by touch or a spawn,
+  and the rest ([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)) — each measured
+  against the game before it is modelled.
+* **Divergences**, where the model and the game come apart on what it does cover.
+
+**The search as a plug-in — partly done.** v0.5.0 separates the search from the
+physics model: the model steps states and fires the triggers, the rules credit,
+kill and score, and a search only decides which states to keep and which inputs
+to try. Two more searches sit behind that interface beside the reachability DP —
+Beam and Monte Carlo, experimental, picked in the play menu's Options — since one
+search tuned for every level may not exist. What is left is the rest of the
+interface, the parts the searches still read directly, and a way to measure a
+search without running the game. The search is the part that needs no knowledge
+of Geometry Dash's physics, so it is where contributions are most welcome.
 
 **Platformer levels are outside the formulation, not merely unmeasured.** The
 search rests on there being no steering input; a platformer level hands the player

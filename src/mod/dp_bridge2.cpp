@@ -8,9 +8,10 @@
 // of it); the gdapprox types it includes carry no state.
 //
 // Used for one thing: the plain search that ends a cap ladder, started beside the ladder instead
-// of after it (cli.hpp PlainElsewhere; the hooks are in dp_bridge.cpp). Compiled with the same
-// options as dp_bridge.cpp (CMakeLists.txt), so the second copy steps the model exactly as the
-// first does.
+// of after it (cli.hpp PlainElsewhere; the hooks are in dp_bridge.cpp). Compiled outside the mod
+// target, as library gdsolver_dpcore2, with the same options as the first copy (dp/src/dpcore.cpp,
+// dp/CMakeLists.txt gdsolver_dp_options), so the second copy steps the model exactly as the first
+// does. Like dpcore.cpp it sees no Geode, cocos or Windows header.
 #undef NEAR
 #undef FAR
 #undef near
@@ -38,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -125,6 +127,11 @@ inline int fflush(::FILE* f) { return f == stdout ? 0 : ::std::fflush(f); }
 
 namespace dpbridge::second {
 
+void setFileSigHints(const std::unordered_map<std::string, std::string>& hints) {
+    dp::g_fileSigHint.clear();
+    for (const auto& kv : hints) dp::g_fileSigHint[kv.first] = kv.second;
+}
+
 int solve(const std::string& csv, const std::vector<std::string>& argv) {
     std::vector<std::string> a = argv;
     std::vector<char*> ptr;
@@ -142,7 +149,7 @@ int solve(const std::string& csv, const std::vector<std::string>& argv) {
 }
 
 SolveOutcome outcome() {
-#include "mod/dp_bridge_outcome.inl"
+#include "dpcore_outcome.inl"
 }
 
 std::string takeOutput() {
@@ -158,6 +165,22 @@ void cancel(bool on) {
 
 long long envKillsTotal() {
     return dp::g_envKills.load(std::memory_order_relaxed);
+}
+
+void releaseCaches() { dp::releaseCrossCallCaches(); }
+std::size_t cacheBytes() { return dp::crossCallCacheBytes(); }
+std::size_t groupCacheBytes() { return dp::crossCallGroupBytes(); }
+
+bool runBegin(int level, unsigned long long seed, std::string& why) {
+    return dp::runBegin(level, seed, why);
+}
+std::string runVerified(const std::vector<std::pair<long long, int>>& flown, long long deathT,
+                        double x, bool cleared, long long divT) {
+    return dp::runVerified(flown, deathT, x, cleared, divT);
+}
+std::string runEnd() { return dp::runEnd(); }
+void runNoteSplice(const std::vector<std::pair<long long, int>>& edges, long long t0) {
+    dp::runNoteSplice(edges, t0);
 }
 
 }  // namespace dpbridge::second

@@ -398,6 +398,21 @@ inline Cut cut(const std::string& raw, const std::vector<LiveObj>& live, const O
 // matched the level itself on every column except the camera shake (which two runs of the level
 // itself do not share) and, with the triggers cut, the trigger queue cursor.
 inline constexpr int kPlaceholderId = 1292;
+// cfg slicekeepgroups (on by default): a placeholder keeps its object's groups (key 57) too, so
+// every group has as many members in the copy as in the level. The game's optimizeMoveGroups
+// (0x230a20) takes the groups move, rotate, follow, scale and area triggers act on and, for each
+// with exactly one member (getGroup()->count() == 1), moves that object to a static group
+// (moveObjectToStaticGroup 0x231410), which it then moves and buckets differently. A custom level:
+// a spike's own group held the spike and three decorations in the level, the spike alone in the
+// copy, and in the copy the spike stopped being returned by the damaging-objects query near the
+// player -- the same plan lived past the spike there and died on it in the level.
+// The member list is read beyond that test: tryGetObject (0x224590) and teleportPlayer pick a
+// random member by count and order when a group has no parent and more than one member (a Move in
+// target mode, a dynamic rotate, follow speed), so the copy keeps every member, not just the count.
+// The same flag keeps key 274 (the groups the object is the parent of; key 34 objects are kept
+// whole by the cut): tryGetMainObject (0x224520) and the Rotate centre read the group's registered
+// parent (setGroupParent 0x224680) before the member count.
+inline bool g_placeholderGroups = true;
 inline void appendPlaceholder(std::string& out, std::string_view p, char kind) {
     const std::string_view x = kvGet(p, "2"), y = kvGet(p, "3"), hd = kvGet(p, "103");
     out += "1,";
@@ -409,6 +424,12 @@ inline void appendPlaceholder(std::string& out, std::string_view p, char kind) {
     out.append(y.empty() ? std::string_view("0") : y);
     if (kind == 1 && kvGet(p, "121") == "1") out += ",121,1";
     if (!hd.empty()) { out += ",103,"; out.append(hd); }
+    if (g_placeholderGroups) {
+        const std::string_view g = kvGet(p, "57");
+        if (!g.empty()) { out += ",57,"; out.append(g); }
+        const std::string_view pg = kvGet(p, "274");
+        if (!pg.empty()) { out += ",274,"; out.append(pg); }
+    }
 }
 
 // The level string without the dropped objects, except those whose string x lies in one of the

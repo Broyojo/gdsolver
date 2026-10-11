@@ -53,10 +53,10 @@ next change is measured against the known state.
     reference recorded for a different worldline all the same -- which is why a
     reference that dies far behind its truncation point is worth less than one
     that dies right after it (the index carries `death-trunc`).
-  * `quick_regress.band_track_args` writes `gdref/lvN.bandtrack.txt`, which the
-    whole suite reads. Rebuilding it from a death trace would poison every
-    other instrument, so the band track of a reference is written next to that
-    reference and nowhere else.
+  * The band track of a reference is written next to that reference and
+    nowhere else. (`quick_regress.band_track_args` used to write
+    `gdref/lvN.bandtrack.txt`, which the whole suite read; since 2026-10-09 it
+    writes in the caller's own directory and gdref is only read.)
   * The GD side is a disposable session per truncation (`attempts=1
     quitwhendone=1`), exactly as gdref is recorded. A resident servemode worker
     would be much faster, but bands and stair snaps carry across attempts
@@ -530,8 +530,7 @@ def anchor_tick(gd: dict[int, dict], death: int, window: int) -> int | None:
 def band_args(level: int, trunc: int, gd: dict[int, dict]) -> list[str]:
     """Write this reference's own band track and point --bandtrack at it.
 
-    Never `gdref/lvN.bandtrack.txt`: that file belongs to the verified solution
-    and quick_regress / fixcensus read it.
+    Never into gdref: that directory belongs to the verified solution.
     """
     dst = band_path(level, trunc)
     rows, prev = 0, None

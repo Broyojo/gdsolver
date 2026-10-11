@@ -12,25 +12,20 @@ at dx = dy = 27, where
     the rect   (the 42.4 bound)   overlaps   |27| <= 21.2 + 15
     the box    (15/15 at 45 deg)  does not   38.2 >  15 + 21.2   (the object's axis)
 
-so the three arms have to disagree in one direction only:
+so the model's default (the box decides stage 1) has to let it live:
 
     no flag                  the box decides stage 1  -> survives
-    --hazaabb --no-obb-all   stage 1 is the rect      -> dies
-    --hazaabb                ...and stage 2 is the box -> survives again
 
-(--obb-all, the second stage, has been on by default since 2026-09-21, so the
-rect-only arm is the one that has to switch it off.)
+(The rect-only stage 1, formerly --hazaabb, and the pair with --no-obb-all were switched
+off by default and are removed: the rect-only shape kills in a region the game leaves
+alone. --obb-all, the second stage, has been on by default since 2026-09-21.)
 
-The third arm is here because the second alone was measured once as if it were the
-pair (the flag's first cold run had no stage 2 for any mode but the wave, which reads
-as "the pair is wrong" when it was never tried).
-
-WHICH ARM IS THE GAME'S IS NOT WHAT THIS FIXTURE SAYS. The rig
+WHICH SHAPE IS THE GAME'S IS NOT WHAT THIS FIXTURE SAYS. The rig
 (data/rigs/calib_hazrot_wave.lvl, swept 2026-09-18 at rot 0/8/15/45, three columns on
 the 45) puts the game's boundary on the recorded box against the player's box
 UNTURNED, which is the first test's own shape -- so the second test, which turns the
-player, is the one that differs from the game. This fixture pins the three arms apart
-so that a change to any of them is visible; it does not vote on them.
+player, is the one that differs from the game. This fixture pins the default so that
+a change to it is visible; it does not vote on the second test.
 """
 
 from __future__ import annotations
@@ -108,12 +103,6 @@ class TestTurnedHazardHasTwoStages(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             return "DIED" in (r.stdout + r.stderr)
 
-    def test_the_three_arms_disagree_in_one_direction(self):
+    def test_the_box_decides_stage_one(self):
         # stage 1 with the box: the position is outside it, so nothing happens
         self.assertFalse(self.arm([]), "the box in stage 1 should let this position live")
-        # stage 1 with the rect: the game's first test, and this position is inside it
-        self.assertTrue(self.arm(["--hazaabb", "--no-obb-all"]),
-                        "the rect in stage 1 should kill here")
-        # ...and the game's second test (on by default) puts the box back, which
-        # saves it again
-        self.assertFalse(self.arm(["--hazaabb"]), "stage 2 should re-apply the box")

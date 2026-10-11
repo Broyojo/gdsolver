@@ -3,6 +3,41 @@
 
 using namespace p1;
 
+// cfg persistworld (config.hpp): put the world's kept items in place before a head reset copies them
+// into the live counts. The first lines say what the table held before (what the last attempt left).
+static void persistWorldApply(GJEffectManager* em) {
+    static int s_logs = 0;
+    std::string was, now;
+    for (auto& kv : em->m_persistentItemCountMap)
+        was += std::to_string(kv.first) + ":" + std::to_string(kv.second) + " ";
+    em->m_persistentItemCountMap.clear();
+    em->m_persistentTimerItemSet.clear();
+    if (g_cfg.persistWorld > 0) {
+        const std::string& s = g_cfg.persistItems;
+        size_t p = 0;
+        while (p < s.size()) {
+            size_t q = s.find(',', p);
+            if (q == std::string::npos) q = s.size();
+            const std::string one = s.substr(p, q - p);
+            const size_t c = one.find(':');
+            if (c != std::string::npos) {
+                const int id = std::atoi(one.substr(0, c).c_str());
+                const int v = std::atoi(one.substr(c + 1).c_str());
+                em->m_persistentItemCountMap[id] = v;
+                now += std::to_string(id) + ":" + std::to_string(v) + " ";
+            }
+            p = q + 1;
+        }
+    }
+    if (s_logs < 6) {
+        ++s_logs;
+        writeResult("persistworld: k=" + std::to_string(g_cfg.persistWorld) + " attempt "
+                    + std::to_string(g_attempt) + ": kept items {" + was + "} -> {" + now + "}"
+                    + (g_cfg.persistWorld > 0 && g_cfg.persistItems.empty()
+                           ? " (no persistitems: the empty table, as k=0)" : ""));
+    }
+}
+
 class $modify(PlayLayer) {
     // Catch auto-checkpoint creation (cfg `ckpttrace=1`). In 2.208 creation and storage are
     // separate, and storage is delayed/retried until the state is safe, so both are marked
@@ -55,9 +90,25 @@ class $modify(PlayLayer) {
             m_leftSectionIndex = m_rightSectionIndex = 0;
             m_bottomSectionIndex = m_topSectionIndex = 0;
         }
+        // cfg cpvisafter (off by default): not inside a checkpoint restore's reset. That pass runs with
+        // the camera where the reset put it, before the restore puts the flight's camera back, and
+        // activates what is in view THERE -- on SubZero 4002 four walls the head run never had activated,
+        // which a toggle then switched off while they stayed activated and in staticObjectsInRect. The
+        // restore runs the pass itself once the camera is back (cpRestoreState).
+        if (g_cfg.cpVisAfter && (seekcp::g_restoring || cpflight::g_starting || takeover::g_restoring)) return;
+        // A seek's batch that is not the frame's last (cfg seekvisevery, itermap.hpp).
+        if (itermap::g_seekVisSkip) return;
         // When visibility does run, SEH guard: if it trips an inconsistency, only that
         // frame's visibility pass is dropped and execution continues (display preparation
         // only; unrelated to physics / determinism)
+        if (itermap::seeking()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            this->safeUpdateVisibility(dt);
+            ++itermap::g_seekVisCalls;
+            itermap::g_seekVisMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            return;
+        }
         this->safeUpdateVisibility(dt);
     }
 
@@ -74,6 +125,7 @@ class $modify(PlayLayer) {
 #endif
     }
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        dpsolve::g_phaseLabelsLive = false;   // until start() has reset this level's labels (phase.hpp)
         // A session is configured here for the level the play menu's Start was pressed for, in
         // the mode it chose. Level selection is the game's own UI as is (custom levels included).
         // A session in progress (g_started && !g_sessionOver) (including autorun.cfg
@@ -149,13 +201,21 @@ class $modify(PlayLayer) {
         // Exiting from the pause menu = session aborted. endSession alone is not enough:
         // if bookkeeping leftovers remain, hooks that do not check !g_sessionOver keep
         // running during subsequent normal play and break behaviour. Full reset on exit
+        // The seek bar's checkpoints belong to this layer (cfg seekcp): let them go with it.
+        seekcp::resetSession();
         if (g_started) {
             if (!g_sessionOver) {
                 log::info("session ended by level exit");
                 endSession("level_exit");
             }
+            // The solving's memory, if the session end had to leave it (a search was still
+            // running then): asked again before the reset forgets that a solve ran.
+            if (g_solveMemHeld) dpsolve::releaseSolveMemory("level exit");
             resetSessionState();
+            dpsolve::memCensus("level exit");   // cfg memcensus (print only), before g_cfg is reset
             g_cfg = Config{};
+        } else {
+            dpsolve::memCensus("level exit");   // ...and when the player leaves a level they played
         }
         // Hand the audio engine back untouched: a pitch left over from the spectating notch
         // would follow the player into the menu music
@@ -168,16 +228,31 @@ class $modify(PlayLayer) {
     }
 
     void resetLevel() {
+        // A person has the input (mod/takeover.hpp): whatever asked for this reset -- GD after a
+        // death, most often -- gets a restore of the takeover's checkpoint instead, at the next
+        // frame boundary (takeoverRestore), and never a run from the head.
+        if (takeover::takesReset() && this == PlayLayer::get()) {
+            takeover::g_restorePending = true;
+            return;
+        }
         // GD's random seeds first, before anything the reset draws from them (see g_rngFix):
         // every attempt and every checkpoint restore of a session starts from the same values.
         rngFixApply();
+        phase::Scope resetPhase("resetting", dpsolve::g_phaseLabelsLive ? dpsolve::g_anchorT : -1,
+                                dpsolve::g_phaseLabelsLive ? dpsolve::g_iter : -1);
         // A reset of an old layer (embers awaiting the scene swap) must not touch the books
         if (this != PlayLayer::get()) { PlayLayer::resetLevel(); rngFixAfterReset(this); restoreProgress(); return; }
         // A section-solver restore is "inside the search", so it must not touch the mod's
         // bookkeeping at all. Letting it through runs a grouptrace rebuild, POI rebuild and
         // retry logging on every restore, turning a restore that should take 2ms into tens
         // of ms and mixing up the recordings too.
-        if (secsolve::g_active) { PlayLayer::resetLevel(); rngFixAfterReset(this); restoreProgress(); return; }
+        if (secsolve::g_active) {
+            PlayLayer::resetLevel();
+            // cfg singlereset: the loop's next flight resets again straight after the search's last one.
+            g_resetMarkLayer = this;
+            g_resetMarkPc = g_pcCalls;
+            rngFixAfterReset(this); restoreProgress(); return;
+        }
         hookdepth::Guard hg(hookdepth::RESET);
         stallwatch::Mark sm(stallwatch::RESET);
         // Early heap-corruption check (cfg `heapcheck=N`). Fired at attempt boundaries so
@@ -240,11 +315,21 @@ class $modify(PlayLayer) {
                            // (orb pointers are reused)
         if (!ckptRestore) {
             ++g_attempt;
+            ++g_attemptSerial;
             solver::g_cpInjected = false;   // the state-injection probe runs once per attempt
             g_injectNext = 0;               // analysis injections are also re-read from the
                                             // start of the attempt
             g_stopFired = false;
             g_nextInput = 0;
+            // An attempt sequence (plan_io.hpp): attempt N flies block N, the last one after the prelude.
+            g_preludeResetPending = false;   // a restart asked by the attempt that has just ended is moot
+            if (!g_prelude.empty() && g_started && !g_sessionOver) {
+                const size_t idx = (size_t)(g_attempt > 0 ? g_attempt - 1 : 0);
+                g_cfg.inputs = idx < g_prelude.size() ? g_prelude[idx].in : g_finalInputs;
+                writeResult("sequence: attempt " + std::to_string(g_attempt) + " flies "
+                            + (idx < g_prelude.size() ? "prelude block " + std::to_string(idx + 1) : std::string("the clearing block"))
+                            + " (" + std::to_string(g_cfg.inputs.size()) + " inputs)");
+            }
             g_attemptFed = false;
             g_nextToggle = 0;
             g_tick = 0;
@@ -259,7 +344,9 @@ class $modify(PlayLayer) {
             // portal as spent, the model did not fire it, and GD did.
             portalseed::reset();
             touchseed::reset();
+            touchfire::reset();
             itermap::onAttemptStart();   // ...and so is the seek bar's tick -> x record
+            seekcp::onAttemptBegin(this);   // a head run, unless a seek's restore says otherwise after it
             // The HUD's best coin count, before the attempt that got them is cleared.
             solver::g_coinBest = std::max(solver::g_coinBest, solver::coinsThisAttempt());
             solver::g_coinPickupTick.assign(solver::g_coins.size(), -1);
@@ -306,7 +393,7 @@ class $modify(PlayLayer) {
             // ever runs
             if ((g_cfg.coinMode || clearance::g_on || g_cfg.dpSelfTest || g_cfg.dpSolve)
                 && !solver::g_poisBuilt) {
-                solver::buildPois(this);
+                solver::buildPois(this, g_cfg.obbNoLatch);
                 solver::g_poisBuilt = true;
                 // cfg routeprereq: what each coin needs entered first (solver/route.hpp), read off
                 // the same objects before the first solve can ask.
@@ -340,7 +427,128 @@ class $modify(PlayLayer) {
                 m_player1 ? (m_player1->m_isDead ? 1 : 0) : -1, (long long)g_tick);
             writeResult(rb);
         }
-        PlayLayer::resetLevel();
+        // cfg resetlog: what the reset starts from (read-only).
+        auto resetLogLine = [this](const char* when, const char* kind) {
+            if (!(g_cfg.resetLog && g_started && !g_sessionOver)) return;
+            static int n = 0;
+            if (++n > 2000) return;
+            std::string items;
+            int tuples = (int)m_spawnTuples.size(), acts = -1;
+            if (m_effectManager) {
+                acts = (int)m_effectManager->m_spawnTriggerActions.size();
+                int shown = 0;
+                for (auto& kv : m_effectManager->m_persistentItemCountMap) {
+                    if (++shown > 12) { items += "..."; break; }
+                    items += std::to_string(kv.first) + ":" + std::to_string(kv.second) + "/live" + std::to_string(m_effectManager->countForItem(kv.first)) + " ";
+                }
+            }
+            int disabled = 0;
+            if (m_objects)
+                for (unsigned i = 0; i < m_objects->count(); ++i) {
+                    auto* o = static_cast<GameObject*>(m_objects->objectAtIndex(i));
+                    if (o && o->m_isGroupDisabled) ++disabled;
+                }
+            writeResult(std::string("resetlog: ") + when + " " + kind + " attempt=" + std::to_string(g_attempt) + " tick=" + std::to_string((long long)g_tick)
+                        + " persistent{" + items + "} tuples=" + std::to_string(tuples) + " spawnActs=" + std::to_string(acts)
+                        + " groupDisabledObjs=" + std::to_string(disabled) + " pc=" + std::to_string(g_pcCalls));
+        };
+        const char* resetKind = ckptRestore ? "ckpt" : (cpflight::g_starting ? "cpstart" : "head");
+        resetLogLine("before", resetKind);
+        // The "after" line comes when the hook returns. Built only with the cfg on: a reset with it off does
+        // no extra work (no std::function, no allocation).
+        struct ResetLogAfter { std::function<void(const char*, const char*)> f; const char* k; ~ResetLogAfter() { f("after", k); } };
+        std::unique_ptr<ResetLogAfter> resetLogAfter;
+        if (g_cfg.resetLog) resetLogAfter.reset(new ResetLogAfter{resetLogLine, resetKind});
+        // cfg singlereset: no physics has run on this layer since its last reset, so the level is
+        // already as a reset leaves it; a second reset would count a persistent item twice and lose the
+        // start triggers (see g_cfg.singleReset).
+        if (g_cfg.singleReset && g_started && !g_sessionOver && !ckptRestore && !cpflight::g_starting
+            && !takeover::g_restoring && g_resetMarkLayer == this && g_resetMarkPc == g_pcCalls) {
+            ++g_resetsSkipped;
+            if (g_resetsSkipped <= 5)
+                writeResult("singlereset: reset skipped at attempt " + std::to_string(g_attempt) + " (no physics since the last one)");
+        } else {
+            if (g_cfg.singleReset && g_started && !g_sessionOver && !ckptRestore && !cpflight::g_starting && !takeover::g_restoring && m_effectManager) {
+                // A head reset that follows a checkpoint flight starts from the spawn bookkeeping the
+                // flight left (measured on a custom level at the start Item Compare: m_spawnTuples 2 and
+                // m_spawnTriggerActions 0 where a clean reset has 1 and 1), and the reset does not clear it:
+                // the compare's spawn of its group is then dropped and the start toggle never fires.
+                // Cleared here, the spawn goes through as on the first reset of a layer.
+                m_spawnTuples.clear();
+                m_effectManager->m_spawnTriggerActions.clear();
+            }
+            // cfg persistworld: the kept items this head reset copies in are the world's, not the last
+            // attempt's (persistWorldApply)
+            if (g_cfg.persistWorld >= 0 && g_started && !g_sessionOver && !ckptRestore && !cpflight::g_starting
+                && !takeover::g_restoring && m_effectManager)
+                persistWorldApply(m_effectManager);
+            PlayLayer::resetLevel();
+            g_resetMarkLayer = this;
+            g_resetMarkPc = g_pcCalls;
+            // cfg headbandfresh: the band's top that checkCollisions keeps from its last pass (layer+0x764,
+            // m_gameState+0x5bc; read at 0x213c4f as getMaxPortalY() minus it) starts at a fresh layer's 0, so every
+            // head flight's first pass sees the band move as a fresh attempt's does (g_cfg.headBandFresh).
+            if (g_cfg.headBandFresh && !ckptRestore && !cpflight::g_starting && !takeover::g_restoring) {
+                char* lb = reinterpret_cast<char*>(static_cast<GJBaseGameLayer*>(this));
+                char* gs = reinterpret_cast<char*>(&this->m_gameState);
+                static int s_hb = 0;
+                if (s_hb++ < 3) {
+                    float was = 0.f;
+                    std::memcpy(&was, gs + 0x5bc, 4);
+                    char b[180];
+                    snprintf(b, sizeof(b), "headbandfresh: layer+0x%llx (m_gameState+0x5bc) was %.3f, now 0",
+                             (long long)(gs + 0x5bc - lb), (double)was);
+                    writeResult(b);
+                }
+                std::memset(gs + 0x5bc, 0, 4);
+            }
+            // cfg resetdump (print only): player 1's whole object as a head reset leaves it, then the layer's
+            // GJBaseGameLayer part and the objects resetdumpuids names -- what the next attempt inherits, before
+            // its first tick touches any of it -- with the member tables once, to read a diff by name.
+            if (g_cfg.resetDump && m_player1 && !ckptRestore && !cpflight::g_starting && !takeover::g_restoring) {
+                auto dumpBytes = [&](const char* tag, const void* p, size_t size) {
+                    const unsigned char* pb = reinterpret_cast<const unsigned char*>(p);
+                    for (size_t base = 0; base < size; base += 0x80) {
+                        char b[620];
+                        int n = snprintf(b, sizeof(b), "%s attempt=%d o=%04zx", tag, g_attempt, base);
+                        for (size_t off = base; off < base + 0x80 && off < size && n < (int)sizeof(b) - 8; ++off)
+                            n += snprintf(b + n, sizeof(b) - n, " %02x", (unsigned)pb[off]);
+                        writeResult(b);
+                    }
+                };
+                static bool s_names = false;
+                if (!s_names) {
+                    s_names = true;
+                    char b[200];
+#define PO_SCALAR(n) snprintf(b, sizeof(b), "rdmem: P %s %zu %zu", #n, offsetof(PlayerObject, n), sizeof(PlayerObject::n)); writeResult(b);
+#define PO_OPAQUE(n) PO_SCALAR(n)
+#define GO_SCALAR(n) snprintf(b, sizeof(b), "rdmem: O %s %zu %zu", #n, offsetof(GameObject, n), sizeof(GameObject::n)); writeResult(b);
+#define GO_OPAQUE(n) GO_SCALAR(n)
+#define GB_SCALAR(n) snprintf(b, sizeof(b), "rdmem: L %s %zu %zu", #n, offsetof(GJBaseGameLayer, n), sizeof(GJBaseGameLayer::n)); writeResult(b);
+#define GB_OPAQUE(n) GB_SCALAR(n)
+#define EM_SCALAR(n)
+#define EM_OPAQUE(n)
+#include "../po_members.inc"
+#undef PO_SCALAR
+#undef PO_OPAQUE
+#undef GO_SCALAR
+#undef GO_OPAQUE
+#undef GB_SCALAR
+#undef GB_OPAQUE
+#undef EM_SCALAR
+#undef EM_OPAQUE
+                }
+                dumpBytes("rdump:", m_player1, sizeof(PlayerObject));
+                dumpBytes("rdumpL:", static_cast<GJBaseGameLayer*>(this), sizeof(GJBaseGameLayer));
+                if (!g_cfg.resetDumpUids.empty() && m_objects)
+                    for (auto* o : CCArrayExt<GameObject*>(m_objects))
+                        if (o && std::find(g_cfg.resetDumpUids.begin(), g_cfg.resetDumpUids.end(), o->m_uniqueID)
+                                     != g_cfg.resetDumpUids.end()) {
+                            const std::string tag = "rdumpO: uid=" + std::to_string(o->m_uniqueID);
+                            dumpBytes(tag.c_str(), o, sizeof(GameObject));
+                        }
+            }
+        }
         rngFixAfterReset(this);   // the trigger seed GD just drew from the clock (see g_rngFix)
         // cfg secshadersig (print only): the shader layer's hierarchy after a real reset -- the
         // first of every layer, and the first after a section search (secsolve::shaderSig).
@@ -392,8 +600,9 @@ class $modify(PlayLayer) {
                 wasEndAnim ? 1 : 0);
             writeResult(rb);
         }
-        // (Not for a flight from a checkpoint: the layer puts its hold back as the checkpoint had it.)
-        if (!ckptRestore && !cpStart && g_started && g_cfg.blockInput) {
+        // (Not for a flight from a checkpoint: the layer puts its hold back as the checkpoint had it.
+        // The same for the takeover's restore.)
+        if (!ckptRestore && !cpStart && !takeover::g_restoring && g_started && g_cfg.blockInput) {
             // Guard against a leftover hold: if the previous attempt ends while pressed, the
             // button carries over into tick 0 of the next attempt and it jumps continuously
             // from the very start (breaking reproduction of the same plan)
@@ -401,7 +610,8 @@ class $modify(PlayLayer) {
             this->handleButton(false, 1, true);
             g_injecting = false;
         }
-        if (g_started && g_finishedAttempts >= g_cfg.maxAttempts) {
+        // An attempt sequence's prelude attempts do not count against the cap: it is the clearing attempts' budget.
+        if (g_started && g_finishedAttempts >= g_cfg.maxAttempts + (int)g_prelude.size()) {
             endSession("max_attempts");
         }
     }
@@ -421,7 +631,8 @@ class $modify(PlayLayer) {
             log::warn("pause: refused - the layer has no scene to put the pause menu in");
             return;
         }
-        if (unfocused && g_started && !g_sessionOver) {
+        // (Not while a person plays a takeover: then the game pauses as it would for anyone.)
+        if (unfocused && g_started && !g_sessionOver && !takeover::personDriving()) {
             ++g_unfocusPauseBlocked;
             if (g_unfocusPauseBlocked <= 3)
                 writeResult("pause: ignored an unfocus-pause (automated session, n="
@@ -436,6 +647,32 @@ class $modify(PlayLayer) {
         // Observation of auto-checkpoint placement only (cfg `ckpttrace=1`)
         if (solver::ckpttrace::g_on)
             noteCkpt("store", m_player1, (void*)checkpoint, -1);
+        // The human takeover (mod/takeover.hpp): every checkpoint the game places while the person
+        // plays is stored here (PlayerObject::tryPlaceCheckpoint and markCheckpoint are the two
+        // callers). Its auto checkpoint was pending on the player, and the strict one taken when it
+        // appeared is committed; one stored at once (Z, a checkpoint in the level) gets a strict
+        // one at the next update boundary. Not the takeover's own store (a restore's).
+        if (takeover::personDriving() && !takeover::g_restoring && this == PlayLayer::get()) {
+            if (takeover::g_hasPending && checkpoint == takeover::g_pendingSrc) {
+                takeover::g_commitPending = true;
+            } else {
+                takeover::g_cpWanted = true;
+                takeover::g_wantedSrc = checkpoint;
+            }
+        }
+    }
+
+    // The game taking a checkpoint out, observed for the human takeover (takeover::gameRemoved):
+    // the game's own work always runs, and then a strict checkpoint that stood for the removed one
+    // goes with it. Which one goes is read before the call -- the newest, or with `first` the
+    // oldest, as the game's own removal takes them.
+    void removeCheckpoint(bool first) {
+        const void* gone = nullptr;
+        if (takeover::personDriving() && this == PlayLayer::get() && m_checkpointArray
+            && m_checkpointArray->count() > 0)
+            gone = first ? m_checkpointArray->objectAtIndex(0) : m_checkpointArray->lastObject();
+        PlayLayer::removeCheckpoint(first);
+        if (gone) takeover::gameRemoved(gone);
     }
 
     // Finalise the moving-geometry recording and tell result.txt which attempt it belongs
@@ -517,6 +754,10 @@ class $modify(PlayLayer) {
                 object ? object->getPositionX() : 0.f,
                 object ? object->getPositionY() : 0.f);
             writeResult(kb);
+            solver::g_killTick = (long long)g_tick;   // cfg voidband (repair.hpp checkVoidRun)
+            solver::g_killUid = object ? (int)object->m_uniqueID : -1;
+            solver::g_killX = object ? object->getPositionX() : 0.f;
+            solver::g_killY = object ? object->getPositionY() : 0.f;
             // cfg killersite=1: WHERE IN GD THE CALL CAME FROM. `killer:` above
             // names the object, and GD passes null for every rule that is not a
             // collision -- so an object-free death is reported as "something
@@ -727,11 +968,18 @@ class $modify(PlayLayer) {
                 rollGroupTrace();
                 flushAll();
                 cpflight::noteEnd(g_tick);   // the flight's work, by kind (cpflight summary)
+                cpflight::objLine(this, "death", g_tick);   // cfg cpflightobj (print only)
                 writeResult("death: attempt=" + std::to_string(g_attempt)
                     + " tick=" + std::to_string(g_tick)
                     + " x=" + std::to_string(pos.x)
                     + " wallMs=" + std::to_string(ms)
                     + " speedX=" + std::to_string(speed));
+                // A person's attempt (mod/takeover.hpp): written out whole, before GD's reset
+                // brings them back to the checkpoint.
+                if (takeover::personDriving()) takeover::died(g_tick, pos.x);
+                // ...and the plan dying before the point would fly the same death again on every
+                // attempt: said once, and the session ends.
+                else if (takeover::approaching()) takeover::diedBeforePoint(g_tick, pos.x);
                 if (g_serveMode) g_serveWait = true;  // stop at the start of the next attempt
                 // A rung's prefix that died before the head it was replaying to (session.hpp
                 // g_secRungPrefixFails). Given up after a second such attempt, and then this death
@@ -924,6 +1172,9 @@ class $modify(PlayLayer) {
                 // pct = GD's own progress percentage (a level-independent yardstick; used
                 // for false-clear detection)
                 + " pct=" + std::to_string(this->getCurrentPercent()));
+            // A person's clear ends the takeover (mod/takeover.hpp); the session then ends below
+            // the way a replay's clear does.
+            if (takeover::personDriving()) takeover::cleared(g_tick, cx);
             // The no-death recording pass reached the end of the level. That is NOT a clear --
             // nothing survived it, dying was simply switched off -- so it must never be filed
             // as a solution, and the session goes back to solving with what it recorded.

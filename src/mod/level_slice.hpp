@@ -214,6 +214,7 @@ inline void noteLevelUids(GJBaseGameLayer* l) {
 // objects each of its objects is, for the check once it has loaded.
 inline std::string copyString(size_t* kept) {
     size_t ph = 0;
+    slice::g_placeholderGroups = g_cfg.sliceKeepGroups;   // cfg slicekeepgroups
     std::string s = slice::build(g_cut, g_keepX, kept, g_cfg.sliceUids, &ph, &g_copyOrd);
     g_copyIds = slice::stringIds(s);
     g_placeholders = ph;
@@ -287,6 +288,7 @@ inline void forgetLayer() {
     orbtrace::reset();
     padtrace::reset();
     touchseed::reset();
+    touchfire::reset();
     portalseed::reset();
     padseed::reset();
     ringseed::reset();
@@ -352,6 +354,7 @@ inline void swapWhenClear(geode::Ref<GJGameLevel> keep, int frames, std::string 
     geode::Loader::get()->queueInMainThread([keep, frames, waitedFor, since] {
         if (!g_started || g_sessionOver) return;   // the session ended in the meantime
         const char* busy = sceneBusy();
+        if (frames == 0) phase::begin("waiting for the scene");   // ended where the scene is swapped
         std::string seen = waitedFor;
         if (busy && seen.find(busy) == std::string::npos) seen += std::string(seen.empty() ? "" : ", ") + busy;
         if (busy && std::chrono::steady_clock::now() - since < kSwapWait) {
@@ -365,7 +368,9 @@ inline void swapWhenClear(geode::Ref<GJGameLevel> keep, int frames, std::string 
                                + (seen.empty() ? "" : ": " + seen) + ")");
         g_forceCleanStart = true;
         g_swapInit = true;
+        phase::begin("cutting / swapping the level in (slice)");
         cocos2d::CCDirector::sharedDirector()->replaceScene(PlayLayer::scene(keep.data(), false, false));
+        phase::end();
     });
 }
 
@@ -631,6 +636,23 @@ inline bool onRefFlightEnd(long long end, double endX, bool cleared) {
     char b[360];
     g_phase = Sliced;
     g_hudPhase = "solving on the copy";
+    // ...but two first attempts that agree on a death BEFORE the copy's wall have said nothing about
+    // that wall: they never reached it. A custom level that turns a spike on at its start for an
+    // attempt count of 0 kills every first attempt at t=1 -- the check flight's and the fresh
+    // copy's alike, while the loop's own attempts (counts of 1 and up) live -- and taking that
+    // death for the wall put t=1 in g_checkedWall: the wall at t=7,243 was checked again on every
+    // round, 207 times, until the level's budget ran out. The wall being checked (g_refEnd, which
+    // maybeCheckWall also put in g_checkedWall) stays checked, nothing is put back, and the solve
+    // goes back to the copy.
+    if (pt < 0 && !cleared && end == g_levelDeath && end < g_refEnd) {
+        snprintf(b, sizeof(b), "slice: first attempts agree at t=%lld, before the copy's wall at "
+                 "t=%lld - the copy's first attempt of the plan dies there as the level's does, so "
+                 "the check says nothing about the wall; it is not checked again and nothing is "
+                 "put back", end, g_refEnd);
+        writeResult(b);
+        g_levelRows.clear();
+        return false;
+    }
     if (pt < 0 && !cleared && end == g_levelDeath) {
         snprintf(b, sizeof(b), "slice: first attempts agree - the copy's first attempt of the plan "
                  "dies at t=%lld as the level's does, the same way; the check's %s the copy's "
@@ -638,8 +660,15 @@ inline bool onRefFlightEnd(long long end, double endX, bool cleared) {
                  end, g_firstParting >= 0 ? "parting was" : "difference was");
         writeResult(b);
         g_levelRows.clear();
-        g_checkedWall = end;
-        g_ownWall = end;
+        // The wall this check was about is the COPY's (g_refEnd, the loop's g_bestDeath when
+        // maybeCheckWall fired), not the tick the two first attempts died on: the copy's deepest
+        // attempt can die earlier than a first attempt of the same plan. Marking `end` let the very
+        // next round find its wall unchecked and fly the same check again. A custom level: the copy's
+        // wall at t=15,834, both first attempts dying at 16,019 -- the check ran 125 times, the four
+        // lines identical each time, until the level's budget ran out. The wall stays checked until
+        // the loop's deepest death moves, which is maybeCheckWall's own "once per wall".
+        g_checkedWall = g_refEnd;
+        g_ownWall = g_refEnd;
         return false;
     }
     double partX;
@@ -869,6 +898,20 @@ inline bool onGiveUp(const char* reason) {
     g_hudPhase = "solving on the level itself";
     swapTo(g_orig, g_cut.objects);
     return true;
+}
+
+// What the slice holds allocated (capacities; the retained original level is counted as its string's
+// size only), for the memory census (cfg memcensus).
+inline size_t heldBytes() {
+    size_t n = g_raw.capacity() + g_cut.head.capacity() + g_cut.body.capacity() * sizeof(std::string_view)
+               + g_cut.objs.capacity() * sizeof(slice::StrObj) + g_cut.drop.capacity()
+               + g_keepX.capacity() * sizeof(std::pair<double, double>) + g_carry.capacity() * sizeof(InputCmd)
+               + (g_clearRows.capacity() + g_levelRows.capacity()) * sizeof(AnchorRow)
+               + (g_levelUid.capacity() + g_copyOrd.capacity() + g_copyIds.capacity()) * sizeof(int)
+               + g_verifyPlan.capacity() * sizeof(InputCmd);
+    for (const auto& v : g_levelExtra) n += v.capacity() * sizeof(int);
+    if (g_orig) n += g_orig->m_levelString.size();
+    return n;
 }
 
 inline std::string summary() {

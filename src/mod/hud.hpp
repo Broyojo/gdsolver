@@ -1,6 +1,7 @@
 #pragma once
 // On-screen HUD that stays visible while rendering is skipped.
 #include "mod/level_slice.hpp"
+#include "mod/takeover.hpp"         // the human takeover's line under the badge
 
 using namespace p1;
 
@@ -17,6 +18,7 @@ constexpr int HUD_TAG = 0x51D50;
 constexpr int KEYS_TAG = 0x51D52;
 constexpr int BADGE_TAG = 0x51D53;
 constexpr int ITERMAP_TAG = 0x51D54;
+constexpr int TAKEOVER_TAG = 0x51D55;
 
 // Every overlay is one column down the LEFT edge, laid out top to bottom in a single pass.
 //
@@ -186,17 +188,19 @@ inline void fillKeysHud(cocos2d::CCLabelBMFont* lbl) {
 // mod's own (mod.json, as the play menu reads it), never a literal.
 inline void fillBotBadge(cocos2d::CCLabelBMFont* lbl) {
     if (!lbl) return;
-    static bool s_wasSolving = false;
+    static int s_wasMode = -1;
     static const std::string s_version = geode::Mod::get()->getVersion().toVString();
     // The whole solve session, not only the moments the search thread is running. The loop
     // alternates searching with replaying its own candidates, and a badge driven by the narrow
     // predicate flipped to REPLAY and back on every iteration -- which reads as the mod changing
     // mode a dozen times rather than getting on with one job.
-    const bool solving = showingSolve();
-    if (!*lbl->getString() || solving != s_wasSolving) {
-        s_wasSolving = solving;
+    // A person playing through a takeover (mod/takeover.hpp) is still a bot session -- nothing it
+    // does is recorded -- and the badge says whose input it is.
+    const int mode = showingSolve() ? 1 : takeover::personDriving() ? 2 : 0;
+    if (!*lbl->getString() || mode != s_wasMode) {
+        s_wasMode = mode;
         const std::string text = "GDSOLVER BOT " + s_version
-                               + (solving ? " - SOLVING" : " - REPLAY");
+                               + (mode == 1 ? " - SOLVING" : mode == 2 ? " - HUMAN INPUT" : " - REPLAY");
         lbl->setString(text.c_str());
     }
 }
@@ -388,6 +392,17 @@ inline void updateOverlays(cocos2d::CCNode* gameLayer) {
     fillBotBadge(badge);
     fitBotBadge(badge);
     overlayAdvance(badge, cur);
+    // 1b. the human takeover: whose input it is and how to end it. Like the badge, not the
+    //     user's to hide -- it is the only place the end key is named while a person plays.
+    {
+        const std::string tk = botDriving() ? takeover::hudText() : std::string();
+        auto* lbl = overlayLabel(parent, TAKEOVER_TAG, "takeover-hud"_spr, "chatFont.fnt", 0.6f,
+                                 !tk.empty(), cur);
+        if (lbl) {
+            if (tk != lbl->getString()) lbl->setString(tk.c_str());
+            overlayAdvance(lbl, cur);
+        }
+    }
     const bool show = g_hudOn && !g_overlayHidden;
     // 2. what the solver is doing (solve sessions only)
     //    Visible for the whole solve, not only while the search thread runs: the loop's

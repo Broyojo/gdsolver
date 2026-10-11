@@ -62,6 +62,14 @@ inline std::map<long long, RefRow> g_refRows;
 // of magnitude looser than the agreement actually observed (both sides print
 // seven significant figures and match on all of them).
 inline double g_refEps = 0.01;
+// --tracestate (off): the replay's trace also carries `svy,sflip`, the state's own vy and flip.
+// Its `vy` and `flip` are what GD's dump shows, which the state is not on two kinds of row: the
+// tick a dash engages (the state keeps 0, the row shows GD's vy) and the row before a ship's or
+// UFO's fly ring is applied (the row shows the ring's vy and gravity a tick early, cli.hpp rowVy).
+// A search child is a state, so on those rows it never matches and the watch reported a stepping
+// difference that is not one (a custom level's UFO ring: the row 3.773, the state and the child
+// 1.595, all three equal on the next row). A trace that carries the columns is read through them.
+inline bool g_traceState = false;
 // Per-layer working state, all reset each tick.
 //
 // THE WATCH STOPS AT THE FIRST GATE and does not carry on past it. Following the
@@ -109,6 +117,19 @@ inline uint32_t g_rjOldNode = 0xffffffffu;   // arena node of the old path at th
 // --rejoinuse: stop at the first exact rejoin and emit the new prefix followed by
 // the old trace's own inputs (its `act` column) from the next tick on.
 inline bool g_rjUse = false;
+// --rejoinprobe N (default 5 since 2026-10; --no-rejoinprobe or N = 0 turns it off): a join whose own witness walk dies within N ticks of the join is
+// not the call's answer; the call searches again without --rejoinuse (cli.hpp, after the witness
+// walk). The old trace is the walk of an older model, and past the old plan's death it is only the
+// model's guess. A custom level: a search joins the old plan 2 ticks past its death, the joined walk
+// leaves the old one on the next tick and dies there, GD dies on that same tick, and the next search
+// joins again a little further on -- six rounds of one tick's progress each. The same search without
+// the join is SOLVED with a walk that does not die. Refusing every join whose walk dies anywhere was
+// measured and dropped (repair.hpp's dprejoinuse note): the old trace departs as a matter of course
+// and the refusals cost a second search each; this refuses only the joins that die at once.
+// A walk that dies before it reaches the join is not the join's doing (the search and its own walk
+// disagree on that stretch, and a search without the join meets the same stretch): it is left alone.
+inline long long g_rejoinProbe = 5;
+inline thread_local bool t_rejoinRetry = false;   // the retry's own call (not reset per invocation)
 inline bool g_rjFull = false;   // --rejoinfull: an exact rejoin also needs the dedupe key to match
 inline long long g_rjJoinT = -1;
 
@@ -134,6 +155,8 @@ inline bool loadTraceInto(const char* path, std::map<long long, RefRow>& rows) {
     const int cT = col("tick"), cX = col("x"), cY = col("y"),
               cV = col("vy"), cM = col("mode"), cA = col("act"),
               cF = col("flip"), cFr = col("frame"), cD = col("dead"), cK = col("key");
+    // --tracestate's columns, when the trace has them: the state's own vy and flip
+    const int cSv = col("svy"), cSf = col("sflip");
     if (cT < 0 || cY < 0 || cV < 0) return false;
     while (std::getline(f, line)) {
         std::vector<std::string> v;
@@ -151,6 +174,8 @@ inline bool loadTraceInto(const char* path, std::map<long long, RefRow>& rows) {
         r.flip = cF >= 0 && (int)v.size() > cF ? std::atoi(v[(size_t)cF].c_str()) : -1;
         r.frame = cFr >= 0 && (int)v.size() > cFr ? std::atoi(v[(size_t)cFr].c_str()) : -1;
         r.dead = cD >= 0 && (int)v.size() > cD ? std::atoi(v[(size_t)cD].c_str()) : -1;
+        if (cSv >= 0 && (int)v.size() > cSv) r.vy = std::atof(v[(size_t)cSv].c_str());
+        if (cSf >= 0 && (int)v.size() > cSf) r.flip = std::atoi(v[(size_t)cSf].c_str());
         if (cK >= 0 && (int)v.size() > cK && !v[(size_t)cK].empty()) {
             r.key = std::strtoull(v[(size_t)cK].c_str(), nullptr, 10);
             r.haveKey = true;
@@ -173,7 +198,8 @@ inline bool loadTraceInto(const char* path, std::map<long long, RefRow>& rows) {
 //
 // (The one place this is still not exact is a dash-ring tick, where the trace
 // deliberately emits GD's vy while the state keeps 0. That is a handful of ticks
-// per level and it is visible as a vy-only mismatch.)
+// per level and it is visible as a vy-only mismatch. The row before a fly ring is
+// the other; a trace written with --tracestate carries the state's own values.)
 inline void refWorldOf(const State& s, double& wy, double& wvy) {
     wy = (double)s.y;
     wvy = (double)s.vy;

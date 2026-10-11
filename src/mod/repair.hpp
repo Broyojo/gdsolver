@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <ctime>         // memCensus's wall clock
 #include <mutex>         // the checkpoint death handover (g_ckMx)
 #include <map>           // cfgDiffLine
 #include <set>
@@ -7,6 +8,7 @@
 #include <thread>        // the solver worker
 #if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
 #include <xmmintrin.h>   // _mm_getcsr: see the fpenv line in logSolverArgs
+#include "dp/band_rows.hpp"   // dp_band.txt's rows, shared with dptest (addWorldArgs)
 #endif
 // Stage C: the repair loop, inside the game.
 //
@@ -62,6 +64,9 @@ struct AnchorRow {
     int mini = 0;            // vehicle size < 0.9 (a size portal has been passed)
     int dual = 0;
     float y2 = 0.f, v2 = 0.f;
+    // ...and its x. A teleport trigger moves player 1 alone, so the pair can run apart for the
+    // rest of the dual (dp --p2xoff, which reads it as --startp2dx).
+    float x2 = 0.f;
     // g2 / g2b are the SECOND body's two contact flags, kept raw exactly like p1's pair above
     // and filtered by groundedOf2() where the anchor is built.
     int f2 = 0, g2 = 0, g2b = 0;
@@ -77,6 +82,10 @@ struct AnchorRow {
     // to be read.
     int dashing = 0;
     float dashSlope = 0.f;   // dy per px of x, from the ring's own rotation (0 for an upright one)
+    // ...and the second body's (histPayload, version 5): GD dashes each body on its own, and a
+    // dual pair that takes one dash ring together holds both while the button is.
+    int dashing2 = 0;
+    int dashRing2 = -1;      // the uid of the ring p2 dashes from, -1 for none
     // The player's SPRITE angle. State::rot is the only angle the turned-box test uses, and an
     // anchor without it re-accumulates from zero -- which mid-section is tens of degrees away
     // from GD and flips that test's verdict outright.
@@ -87,6 +96,11 @@ struct AnchorRow {
     int snapUid = -1;        // m_objectSnappedTo's uid, and how far it snapped
     float snapDist = 0.f;
     float pmin = 0.f, pmax = 0.f;   // GD's flight band (getMinPortalY / getMaxPortalY)
+    // ...and which band that is: 1 = branch A (read off the ground layers, moving with the camera:
+    // [layer+0x23c] != 0 and [layer+0x2a0] == 0, the test both getters open with), 0 = branch B
+    // (the portal's band). The dump's bandst / bandmode columns, folded the way the getters fold
+    // them; dp_band.txt's fifth column (dp bands.hpp BandTrackRow::src). -1 = not read.
+    int bandCam = -1;
     // GD's Free Mode byte [layer+0x311]: while set, checkCollisions (0x2139b8) clamps no
     // mode to the band at all. Copied from each mode portal the player takes, so it is
     // history --start does not carry; it rides in the hist payload (version 2).
@@ -101,6 +115,10 @@ struct AnchorRow {
     // set, the button is ignored entirely (id 2899, frames.hpp's g_ctrlWin note);
     // addWorldArgs turns runs of it into --ctrlwin under cfg `dpctrlwin`.
     int ctrlOff = 0;
+    // ...and the second body's (the dump's p2ctrlOff), which the Options trigger sets apart from
+    // player 1's (processOptionsTrigger 0x223d50: +0x754 player 1, +0x758 player 2). Runs of it
+    // become --ctrlwin2. -1 = no second body.
+    int ctrlOff2 = -1;
     // The press latch, bytes [player+0x985] (held) and [player+0x986] (a press
     // not yet consumed), per body. dp's State::pressSpent is "held, and the
     // press already spent" -- set by a consumer, cleared on release -- so it is
@@ -180,12 +198,33 @@ struct Seeds {
     std::vector<std::pair<int, int>> rings;           // ringseed::g_fired
     std::unordered_map<int, int> touch;               // touchseed::g_first
     std::unordered_map<int, int> portal, portal2;     // portalseed::g_first / g_first2
+    std::unordered_map<int, int> touchFire;           // touchfire::g_first (--rectouch)
+    std::vector<std::pair<int, int>> rings2;          // ringseed::g_fired2 (p2's rings, --spentorb2)
 };
 inline Seeds g_seedsDead;
 inline Seeds g_seedsDeepest;
 // Follows g_src rather than keeping a pointer of its own: several callers save g_src, call
 // ladderOn(false) and put g_src back by hand, and a second pointer would be left behind.
 inline const Seeds& seeds() { return g_src == &g_deepest ? g_seedsDeepest : g_seedsDead; }
+// Which attempt (g_attemptSerial) the dead / deepest rows are, -1 = none yet; serial() follows g_src
+// as seeds() does (--recprov).
+inline long long g_deadSerial = -1;
+inline long long g_deepestSerial = -1;
+inline long long serial() { return g_src == &g_deepest ? g_deepestSerial : g_deadSerial; }
+// cfg recprovchain: an attempt restored from a checkpoint (cp_flight.hpp onAttemptStart) -> the tick it
+// was restored at and the attempt (serial) whose checkpoint it was. Its rows and its world up to that
+// tick are that attempt's (its own up to ITS checkpoint, and so on). Head starts have no entry.
+struct ProvLink { long long from; long long src; };
+inline std::unordered_map<long long, ProvLink> g_provChain;
+// The attempt whose world attempt `s` holds at tick t.
+inline long long provOrigin(long long s, long long t) {
+    for (int guard = 0; guard < 256; ++guard) {
+        const auto it = g_provChain.find(s);
+        if (it == g_provChain.end() || t > it->second.from) return s;
+        s = it->second.src;
+    }
+    return s;
+}
 
 inline void onAttemptStart() { g_live.clear(); }
 inline void reset() {
@@ -196,6 +235,27 @@ inline void reset() {
     g_src = &g_dead;
     g_seedsDead = Seeds{};
     g_seedsDeepest = Seeds{};
+    g_deadSerial = -1;
+    g_deepestSerial = -1;
+    g_provChain.clear();
+}
+// The bytes the row buffers hold allocated (capacities), for releaseSolveMemory's line.
+inline size_t heldBytes() {
+    size_t n = (g_live.capacity() + g_dead.capacity() + g_deepest.capacity()) * sizeof(AnchorRow);
+    for (const auto& v : g_deepestCoinPos) n += v.capacity() * sizeof(solver::CoinPos);
+    return n + g_deepestCoinPos.capacity() * sizeof(std::vector<solver::CoinPos>);
+}
+// ...and the buffers with it, for when the solving is over (dpsolve::releaseSolveMemory): reset()
+// clears, which keeps each row buffer's allocation for the next attempt to refill. Swapped with
+// empty containers: `v = {}` is the initializer-list assignment, which keeps the buffer (and an
+// unordered_map's bucket array) as clear() does.
+inline void release() {
+    reset();
+    { decltype(g_live) e; g_live.swap(e); }
+    { decltype(g_dead) e; g_dead.swap(e); }
+    { decltype(g_deepest) e; g_deepest.swap(e); }
+    { decltype(g_deepestCoinPos) e; g_deepestCoinPos.swap(e); }
+    { decltype(g_provChain) e; g_provChain.swap(e); }
 }
 
 // Hand the finished attempt to the solver side.
@@ -203,7 +263,8 @@ inline void bank() {
     g_dead.swap(g_live);
     g_live.clear();
     g_seedsDead = Seeds{padseed::g_first, ringseed::g_fired, touchseed::g_first,
-                        portalseed::g_first, portalseed::g_first2};
+                        portalseed::g_first, portalseed::g_first2, touchfire::g_first, ringseed::g_fired2};
+    g_deadSerial = g_attemptSerial;   // still the ending attempt's: the next one counts it up
 }
 
 // This attempt got further than any before it: keep its trajectory with its plan.
@@ -217,6 +278,7 @@ inline void keepAsDeepest() {
     g_deepestCoinPos = solver::g_coinPosLog;
     route::g_onTickDeepest = route::g_onTick;   // cfg routeprereq: its switches, same attempt
     g_seedsDeepest = g_seedsDead;
+    g_deepestSerial = g_deadSerial;
 }
 
 inline void ladderOn(bool useDeepest) { g_src = useDeepest ? &g_deepest : &g_dead; }
@@ -276,6 +338,7 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.mini = (p->m_vehicleSize < 0.9f) ? 1 : 0;
     r.dual = l->m_gameState.m_isDualMode ? 1 : 0;
     r.y2 = (r.dual && l->m_player2) ? l->m_player2->getPositionY() : 0.f;
+    r.x2 = (r.dual && l->m_player2) ? l->m_player2->getPositionX() : 0.f;
     r.v2 = (r.dual && l->m_player2) ? (float)l->m_player2->m_yVelocity : 0.f;
     r.f2 = (r.dual && l->m_player2 && l->m_player2->m_isUpsideDown) ? 1 : 0;
     r.g2 = (r.dual && l->m_player2 && l->m_player2->m_isOnGround) ? 1 : 0;
@@ -292,6 +355,14 @@ inline void record(GJBaseGameLayer* l, long long t) {
         const double rot = reinterpret_cast<GameObject*>(p->m_dashRing)->getRotation();
         r.dashSlope = (float)std::tan(-rot * 3.14159265358979 / 180.0);
     }
+    // p2's by its ring's uid: the hist payload carries integers, and dp rebuilds the slope from
+    // that ring's angle as its own dash start does.
+    if (r.dual && l->m_player2 && l->m_player2->m_isDashing) {
+        r.dashing2 = 1;
+        r.dashRing2 = l->m_player2->m_dashRing
+                          ? reinterpret_cast<GameObject*>(l->m_player2->m_dashRing)->m_uniqueID
+                          : -1;
+    }
     r.rot = p->getRotation();   // the dump's `rot` column, from the same call
     r.rot2 = (r.dual && l->m_player2) ? l->m_player2->getRotation() : 0.f;   // `p2rot`
     r.speed = (float)p->m_playerSpeed;
@@ -300,12 +371,16 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.snapDist = p->m_snapDistance;
     r.pmin = l->getMinPortalY();
     r.pmax = l->getMaxPortalY();
+    r.bandCam = (*reinterpret_cast<const float*>(reinterpret_cast<const char*>(l)
+                                                 + gdoff::kLayerUnkPoint17Y) != 0.f
+                 && !*(reinterpret_cast<uint8_t const*>(l) + gdoff::kLayerUnkBool1)) ? 1 : 0;
     r.freeMode = *(reinterpret_cast<uint8_t const*>(l) + gdoff::kLayerFreeMode) ? 1 : 0;
     // The velocity-limit exemption has no bindings name; the offset is the one
     // updateJump's clamp gate reads (0x38ca9f: cmp [player+0x952],0), pinned
     // to 2.2081 like every other raw offset here.
     r.boost = *(reinterpret_cast<uint8_t const*>(p) + gdoff::kPlayerAccelerating) ? 1 : 0;
     r.ctrlOff = p->m_controlsDisabled ? 1 : 0;
+    r.ctrlOff2 = (r.dual && l->m_player2) ? (l->m_player2->m_controlsDisabled ? 1 : 0) : -1;
     // The press latch (see AnchorRow::b985). Raw 2.2081 offsets: pushButton sets
     // both at 0x397fbc, releaseButton clears them, a consumer clears 0x986.
     r.b985 = *(reinterpret_cast<uint8_t const*>(p) + gdoff::kPlayerJumpBuffered) ? 1 : 0;
@@ -337,10 +412,11 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.coins = 0;
     r.item1 = r.item2 = -1;
     r.cnt1 = r.cnt2 = 0;
-    if (g_cfg.coinRoute) {
-        for (size_t i = 0; i < solver::g_coinGdTick.size() && i < 8; ++i)
-            if (solver::g_coinGdTick[i] >= 0 && solver::g_coinGdTick[i] <= t)
-                r.coins |= 1 << i;
+    if (g_cfg.coinRoute || g_cfg.worldGates) {   // (the counters are the gates' too)
+        if (g_cfg.coinRoute)
+            for (size_t i = 0; i < solver::g_coinGdTick.size() && i < 8; ++i)
+                if (solver::g_coinGdTick[i] >= 0 && solver::g_coinGdTick[i] <= t)
+                    r.coins |= 1 << i;
         // solver::g_itemCounts is ordered, so "the two lowest ids" is its first
         // two entries.
         int n = 0;
@@ -358,6 +434,7 @@ inline void record(GJBaseGameLayer* l, long long t) {
 
 }  // namespace p1
 #include "mod/cp_flight.hpp"   // follows the anchors' buffers (cfg cpflight)
+#include "mod/seek_cp.hpp"     // the seek bar's checkpoints (cfg seekcp), on cp_flight's records
 namespace p1 {
 
 // ============================================================
@@ -381,11 +458,14 @@ struct TouchTog { int uid; double cx, cy, hw, hh; };
 inline std::vector<TouchTog> g_touchToggles;
 // Every touch-triggered object (touch=1, any id), for --touchentered.
 inline std::vector<TouchTog> g_touchBoxes;
+// cfg dpseedpickups: every pickup (objrects type 30), for --touchseed beside the touch Toggles.
+inline std::vector<TouchTog> g_touchPickups;
 
 inline void loadRotObjs(const std::string& csv) {
     g_rotObjs.clear();
     g_touchToggles.clear();
     g_touchBoxes.clear();
+    g_touchPickups.clear();
     std::istringstream in(csv);
     std::string line;
     std::getline(in, line);   // header: id,type,cx,cy,...,uid,...
@@ -408,6 +488,8 @@ inline void loadRotObjs(const std::string& csv) {
             }
             if (col == 44 && (int)f[43] == 1 && (int)f[7] > 0)
                 g_touchBoxes.push_back({(int)f[7], f[2], f[3], f[4] * 0.5, f[5] * 0.5});
+            if (col == 44 && (int)f[1] == 30 && (int)f[7] > 0)
+                g_touchPickups.push_back({(int)f[7], f[2], f[3], f[4] * 0.5, f[5] * 0.5});
         }
         if (!rot && !tog) continue;
         RotObj o{};
@@ -470,12 +552,75 @@ inline std::string touchEnteredArg(long long t0) {
     return out.empty() ? std::string("-") : out;
 }
 
+// dp's --slambox among the extra arguments (cfg dparg): the last of --slambox / --no-slambox decides, as the
+// CLI reads them. --slambox is on by default in the CLI since 2026-10, so this starts on too: a default read
+// as off here would send no --rectouch, and the flag would have no recorded touches to judge by. Off,
+// --rectouch is not passed.
+inline bool solverSlamBox() {
+    bool on = true;
+    for (const auto& a : g_cfg.dpArgs) {
+        if (a == "--slambox") on = true;
+        else if (a == "--no-slambox") on = false;
+    }
+    return on;
+}
+// ...and --formularec, the same way: --recprov goes out only under it. --formularec is on by default in the
+// CLI since 2026-10, so this starts on too: a default that read as off here would send no --recprov, and the
+// flag would read a recording from another attempt (the hole --recprov closes). --no-formularec turns both off.
+inline bool solverFormulaRec() {
+    bool on = true;
+    for (const auto& a : g_cfg.dpArgs) {
+        if (a == "--formularec") on = true;
+        else if (a == "--no-formularec") on = false;
+    }
+    return on;
+}
+
+// --rectouch: the touch triggers GD itself fired in the attempt the anchor rows come from -- touchfire's
+// map (playerTouchedTrigger, banked with that attempt as anchors::seeds().touchFire), the record-side
+// identity of the box the recording's motion came from -- each dated with
+// touchEnteredArg's test over that attempt's WHOLE recorded rows, not only up to t0, because dp compares
+// the date with its own entry tick and needs the two on the same test. `uid:-1` = GD fired it but the rows
+// never enter its box. Sorted by uid so the argument does not depend on the map's order.
+inline std::string recTouchArg() {
+    std::vector<std::pair<int, int>> out;
+    for (const auto& kv : anchors::seeds().touchFire) {
+        int date = -1;
+        for (const TouchTog& T : g_touchBoxes) {
+            if (T.uid != kv.first) continue;
+            const long long n = anchors::depth();
+            for (long long t = 1; t < n && date < 0; ++t) {
+                const AnchorRow* r = anchors::row(t);
+                if (!r) continue;
+                const double half = (r->mode == 4) ? (r->mini ? 2.0 : 5.0)
+                                  : (r->mode == 6) ? (r->mini ? 8.1 : 13.5)
+                                                   : (r->mini ? 9.0 : 15.0);
+                if (std::fabs((double)r->x - T.cx) < T.hw + half
+                    && std::fabs((double)r->y - T.cy) < T.hh + half)
+                    date = (int)t;
+            }
+            break;
+        }
+        out.emplace_back(kv.first, date);
+    }
+    std::sort(out.begin(), out.end());
+    std::string s;
+    for (const auto& e : out)
+        s += (s.empty() ? "" : ",") + std::to_string(e.first) + ":" + std::to_string(e.second);
+    return s.empty() ? std::string("-") : s;
+}
+
 // cfg dpspentpad: dp's --spentpad, the pads this attempt had latched before t0 (padseed). Empty
 // when there are none -- dp then seeds only the pads in contact at t0, as without the cfg.
+// In uid order: the seeds are an unordered_map, whose iteration order is not fixed, and dp fills
+// its four usedPad slots in the order given, so the same pads could reach dp as a different call.
 inline std::string spentPadArg(long long t0) {
-    std::string out;
+    std::vector<int> uids;
     for (const auto& kv : anchors::seeds().pads)
-        if (kv.second < t0) out += (out.empty() ? "" : ",") + std::to_string(kv.first);
+        if (kv.second < t0) uids.push_back(kv.first);
+    std::sort(uids.begin(), uids.end());
+    std::string out;
+    for (const int u : uids) out += (out.empty() ? "" : ",") + std::to_string(u);
     return out;
 }
 
@@ -485,6 +630,23 @@ inline std::string spentPadArg(long long t0) {
 inline std::string spentOrbArg(long long t0) {
     std::string out;
     for (const auto& f : anchors::seeds().rings)
+        if (f.second < t0) out += (out.empty() ? "" : ",") + std::to_string(f.first);
+    return out;
+}
+// ...and p2's (dp --spentorb2), unless the call's extra arguments turn dp's --spentp2 off (the last of
+// --spentp2 / --no-spentp2 decides, as the CLI reads them). --spentp2 is on by default in the CLI since
+// 2026-10, so this starts on too; off, the argument list stays as it was.
+inline bool solverSpentP2() {
+    bool on = true;
+    for (const auto& a : g_cfg.dpArgs) {
+        if (a == "--spentp2") on = true;
+        else if (a == "--no-spentp2") on = false;
+    }
+    return on;
+}
+inline std::string spentOrb2Arg(long long t0) {
+    std::string out;
+    for (const auto& f : anchors::seeds().rings2)
         if (f.second < t0) out += (out.empty() ? "" : ",") + std::to_string(f.first);
     return out;
 }
@@ -526,7 +688,18 @@ inline std::string xtrackArg(long long t0) {
 
 inline std::string touchSeedArg(long long t0) {
     std::string out;
-    for (const TouchTog& T : g_touchToggles) {
+    // cfg dpseedpickups: the pickups too. dp makes a pickup that switches a group on a box of its
+    // own (triggers.hpp, --activators), and an anchor past it can open that box from nothing else:
+    // nothing it switches on moves, and it is not a touch trigger, so --touchentered never names it.
+    // SubZero 4002: the key uid 6166 (switches on group 683, the slabs under the second coin) is
+    // taken at t=10,524; a resim anchored at 13,533 kept the slabs off and its ball fell through
+    // them at 13,820, where GD lands on them (y 795). Seeded as 6166:10,524 it lands there too.
+    std::vector<const TouchTog*> list;
+    for (const TouchTog& T : g_touchToggles) list.push_back(&T);
+    if (g_cfg.dpSeedPickups)
+        for (const TouchTog& T : g_touchPickups) list.push_back(&T);
+    for (const TouchTog* TP : list) {
+        const TouchTog& T = *TP;
         for (long long t = 1; t <= t0; ++t) {
             const AnchorRow* r = anchors::row(t);
             if (!r || r->gframe != 0) continue;
@@ -696,6 +869,10 @@ inline std::atomic<bool> g_finished{false};  // the worker thread has set g_rc
 // after repeated ESC-quits" and "sound leaks during Solve" reports.
 inline std::atomic<int> g_generation{0};
 inline int g_resultGeneration = -1;          // set by the worker before g_finished, like g_rc
+// A job is in flight: started and not yet finished. g_running alone also covers a job that has finished
+// and whose result nobody has taken yet -- its thread is gone and the solver's state is safe to read and
+// to release.
+inline bool jobInFlight() { return g_running.load() && !g_finished.load(); }
 // A start() arrived while g_running was still held by an earlier session's orphaned worker.
 // Starting a second thread there would race the first on g_csv/g_plan/g_planPath (plain globals,
 // not per-job), so the request is queued here instead of dropped; poll() retries it once the
@@ -706,6 +883,23 @@ inline std::string g_planPath;
 inline std::string g_tailPath;
 inline std::chrono::steady_clock::time_point g_t0;
 inline std::string g_csv;          // the level, built once at session start
+// ...and its size/fnv, in the shape fileSig gives a file (the same FNV-1a, low 32 bits): every call's
+// `input sig` line carries it as `level=`. The table is not a file argument -- the solver gets it in
+// memory -- and a level slice swaps the scene between the level and a copy of it, rebuilding g_csv
+// and re-exporting objrects.txt at each swap (level_slice.hpp forgetLayer). Without this, a call made
+// before the last swap could not say which table it had, and a rebuild from a kit took the last one:
+// a copy numbered unlike the level then put the recordings on the wrong objects. Set with g_csv.
+inline std::string g_csvSig;
+inline std::string bytesSig(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const char c : s) {
+        h ^= (uint8_t)c;
+        h *= 1099511628211ULL;
+    }
+    char out[48];
+    snprintf(out, sizeof(out), "%zu/%08x", s.size(), (unsigned)(h & 0xffffffffULL));
+    return out;
+}
 inline int g_horizon = 0;
 inline bool g_argsLogged = false;  // the `solver args:` line has been printed for THIS session
 inline std::string g_argsLast;     // ...and what it said, so a CHANGE gets its own line
@@ -910,6 +1104,13 @@ inline std::map<long long, int> g_phantomScale;
 // evidence that it helps stops.
 constexpr int kPhantomScaleMax = 2;
 inline std::vector<std::string> g_phantomBands;   // --deadband strings, in the order found
+// cfg voidband (checkVoidRun): the x spans of objects reaching below kVoidTop, read from g_csv once a session
+inline std::vector<std::pair<float, float>> g_voidLow;
+inline bool g_voidLowRead = false;
+// ...and the last run it closed: the death tick, and where the run began (-1 = none this round)
+inline long long g_voidDt = -1, g_voidT0 = -1;
+inline float g_voidX0 = 0.f;
+inline void voidDeeper(const char* how);
 inline bool g_phantomLifted = false;      // released once; never veto again after that
 // A KILL-ONLY DEATH IS WORTH TWO ORDINARY ONES. When the recorder finds that the
 // game killed the player where the model did not AND the transition physics
@@ -940,6 +1141,9 @@ inline bool g_stop = false;               // the loop has given up; do not start
 // What the worker thread produced (read on the main thread after g_finished)
 inline bool g_haveNewPlan = false;
 inline long long g_anchorT = -1;
+// The phase log's labels (g_anchorT, g_iter) belong to the level only once start() has reset them; a reset that
+// runs while the level is still being built would print the previous level's tick and iteration.
+inline bool g_phaseLabelsLive = false;
 inline float g_anchorX = 0.f;
 // A candidate has cleared and the session should turn into a showing of it. Raised from
 // levelComplete, acted on at the next frame boundary (see onCleared / poll).
@@ -986,6 +1190,14 @@ inline int g_escalations = 0;         // how many times the ladder has been give
 // the solver just emitted.
 inline std::string planFnv(const std::vector<InputCmd>& p);
 inline std::string fileSig(const std::string& path);
+// The signature of every recording the mod itself wrote, keyed by the path it wrote it to, taken
+// WHILE writing it (copyRecording): fileSig hands it back instead of reading the file again, and
+// timedSolve passes it to dp, whose groups cache then skips the read as well. A 293 MB boot
+// recording cost ~0.5 s of FNV per call here and 0.3-0.7 s of read-and-compare in dp. Written only
+// by copyRecording and the recorder's copy of a file whose signature it holds; emptied at a
+// level's start, where the recordings are removed.
+inline std::unordered_map<std::string, std::string> g_sigKnown;
+inline bool copyRecording(const std::string& src, const std::string& dst);
 
 inline std::string num(double v) {
     char b[40];
@@ -1078,6 +1290,9 @@ inline int g_autoChain = 0;              // walls in a row right behind the pin 
 // section solve instead of laddering (set on the main thread before spawn, read by the job and
 // then by poll).
 inline bool g_autoRecordThenRung = false;
+// cfg dpsecrecaway: the reason the deferred rung was due, for its line once the recorder has run
+// (empty: the dpsecsolved reason).
+inline std::string g_autoRecordWhy;
 // cfg dpsecrent: WORK, NOT TIME. A wall clock would make the loop's decisions depend on the
 // machine's load -- the same run would fire its rungs at different rounds on a busy machine, and
 // the [fp] lines could no longer be compared. Every quantity below is a count the run produces
@@ -1378,12 +1593,33 @@ constexpr int kOffBoardTicks = 2;
 // before GD's own death, where the camera-driven band has fallen behind the rising player -- and
 // no other.
 constexpr float kOffBoardTpDy = 100.f;
+// cfg `offboardfree` (on by default since 2026-10-06): A BAND IN FREE MODE IS NOT A PLAYFIELD. While the layer's
+// Free Mode byte is set (AnchorRow::freeMode, [layer+0x311]) checkCollisions clamps no mode to the
+// band, and the band itself goes its own way. A custom level's ship flies at y~128 for over two
+// thousand ticks with the band at 1,054/1,376, then the band jumps to 2,213/2,616 at t=7,243 and the
+// credit fired there on every attempt, while GD flew on and died at t=7,272..7,724, each attempt
+// on its own route. Such rows neither credit nor clear the arming; the check reads the band again
+// once Free Mode is off.
+// cfg `offboardband` (default on since 2026-10): A BAND THAT JUMPS WITHOUT THE PLAYER. A custom level's cutscene
+// at t=21,124 turns the controls off and zooms the camera from 0.9 to 3 in one tick, and GD rewrites
+// pmin/pmax around the zoomed camera, 796/1,154 -> 5,391/5,499, while the robot runs on along its
+// floor at y=975. The credit fired there on every attempt, 4,400 px "below the board", while GD ran
+// on through the cutscene and died at t=24,183 on a hazard 4,119 px further on. A row whose band
+// moved by more than kOffBoardTpDy at either edge from the last row's disarms the check, and it
+// re-arms the usual way, on the first row back inside the band. A step into, out of or within Free
+// Mode does not count: that band goes its own way (above), and counting it moved a level's credits
+// after a UFO's free flight. A copy of this check replayed over the dumps of every kit whose run
+// credited a death (27 kits, 1,480 attempts) drops that cutscene's credits (12 attempts) and moves
+// no other.
 inline long long offBoardTick(long long upTo, float& xAt) {
     bool armed = false;
     long long outT = -1;
     float outX = 0.f;
     bool haveY = false;
     float lastY = 0.f;
+    bool haveBand = false;
+    float lastLo = 0.f, lastHi = 0.f;
+    bool lastFree = false;
     for (long long t = 1; t <= upTo; ++t) {
         const AnchorRow* r = anchors::row(t);
         if (!r) continue;
@@ -1393,7 +1629,21 @@ inline long long offBoardTick(long long upTo, float& xAt) {
         }
         lastY = r->y;
         haveY = true;
+        if (g_cfg.offBoardBand) {
+            const bool bandOk = r->pmax > r->pmin;
+            if (haveBand && bandOk && !r->freeMode && !lastFree
+                && (std::fabs(r->pmin - lastLo) > kOffBoardTpDy
+                    || std::fabs(r->pmax - lastHi) > kOffBoardTpDy)) {
+                armed = false;
+                outT = -1;
+            }
+            haveBand = bandOk;
+            lastLo = r->pmin;
+            lastHi = r->pmax;
+            lastFree = r->freeMode != 0;
+        }
         if (r->pmax <= r->pmin) { outT = -1; continue; }
+        if (g_cfg.offBoardFree && r->freeMode) { outT = -1; continue; }
         if (!armed) {
             if (r->y < r->pmin || r->y > r->pmax) continue;
             armed = true;
@@ -1427,6 +1677,51 @@ inline long long offBoardTick(long long upTo, float& xAt) {
 // Where the moving geometry actually was, taken from the run's own replays (see harvestGroups).
 inline std::string g_groupsPath;
 inline long long g_groupsDepth = -1;
+// ...and which attempt (g_attemptSerial) recorded it, -1 = none: harvestGroups keeps the DEEPEST
+// recording, so the attempt behind g_groupsPath need not be the one an anchor's rows come from
+// (--recprov).
+inline long long g_groupsSerial = -1;
+// --recprov <recording>,<anchor>,<reach>: the attempt behind the last --groups recording, the attempt the
+// anchor's rows are from (both g_attemptSerial, -1 = unknown) and the tick the recording reached. dp's
+// --formularec reads the recording as the state's own world only when the two are one attempt, and only
+// up to that tick; a recording from another attempt holds that attempt's switches at the same ticks.
+inline std::string recProvArg() {
+    // cfg recprovchain: two attempts that hold one world up to a tick L (checkpoint flights,
+    // anchors::g_provChain) are one attempt for the recording's ticks up to L. The origin of each
+    // changes only at a link's tick, so it is enough to compare the two at those ticks, in order.
+    // Measured on a custom level: the recording was attempt 18's and the anchor's rows (t0 6,829)
+    // a flight from attempt 18's checkpoint at 7,200; the recording went unread, and five platform
+    // blocks placed by the formula sat 118.6 px below where the game and the recording had them, so
+    // the swing landing on one at 6,994 was not carried and the loop died at 7,229 twenty times.
+    const long long rec = g_groupsSerial, anc = anchors::serial();
+    if (g_cfg.recProvChain && rec >= 0 && anc >= 0 && rec != anc && g_groupsDepth >= 0) {
+        std::vector<long long> ticks;
+        for (long long s : {rec, anc})
+            for (int guard = 0; guard < 256; ++guard) {
+                const auto it = anchors::g_provChain.find(s);
+                if (it == anchors::g_provChain.end()) break;
+                ticks.push_back(it->second.from);
+                s = it->second.src;
+            }
+        std::sort(ticks.begin(), ticks.end());
+        long long agree = -1;   // the last tick of [0, agree] on which the two worlds are one
+        long long lo = 0;
+        for (const long long T : ticks) {
+            if (T < lo) continue;
+            if (anchors::provOrigin(rec, T) != anchors::provOrigin(anc, T)) break;
+            agree = T;
+            lo = T + 1;
+        }
+        if (agree == (ticks.empty() ? -1 : ticks.back()) && agree >= 0
+            && anchors::provOrigin(rec, agree + 1) == anchors::provOrigin(anc, agree + 1))
+            agree = g_groupsDepth;
+        if (agree >= 0) {
+            const long long reach = std::min(agree, g_groupsDepth);
+            return std::to_string(rec) + "," + std::to_string(rec) + "," + std::to_string(reach);
+        }
+    }
+    return std::to_string(rec) + "," + std::to_string(anc) + "," + std::to_string(g_groupsDepth);
+}
 // The signature of the groups recording last copied beside a died plan (dp_groups_itN), so a
 // level's copies are made only when the recording has changed. Reset with the level.
 inline std::string g_groupsCopiedSig;
@@ -2015,28 +2310,28 @@ inline void addWorldArgs(std::vector<std::string>& a) {
             auto m = [](int k) { return k == 1 || k == 2 || k == 3 || k == 4 || k == 6 || k == 7; };
             return a && (m(a->mode) || m(a->m2));
         };
-        float lf = -1e9f, lc = -1e9f;
-        char lk = 0;
-        long long rows = 0;
+        // Only changes: the reader holds the last row's value until the next, so flat stretches
+        // cost one row instead of thousands. The rows themselves are dp's band_rows.hpp, which
+        // dptest also runs against the reader: an I/D row when the kind or the values change, with
+        // the band's source as a fifth column, and an S row when only the source does (a reader
+        // that knows four columns stops before the fifth, and skips an S row as unreadable).
+        std::vector<dp::BandSample> samples;
         const long long n = anchors::depth();
         for (long long t = 1; t < n; ++t) {
             const AnchorRow* r = anchors::row(t);
             // No row at all is not the same as a row saying there is no band:
             // this side genuinely has nothing to say about that tick.
             if (!r) continue;
-            if (!bandMode(r) && !bandMode(anchors::row(t - 1)) && !bandMode(anchors::row(t + 1)))
-                continue;
-            const char k = (r->pmax > r->pmin) ? 'I' : 'D';
-            // Only changes: the reader holds the last row's value until the
-            // next, so flat stretches cost one row instead of thousands.
-            if (k == lk && r->pmin == lf && r->pmax == lc) continue;
-            lk = k; lf = r->pmin; lc = r->pmax;
-            if (k == 'I')
-                bf << t << ",I," << r->pmin << ',' << r->pmax << '\n';
-            else
-                bf << t << ",D," << r->pmin << ',' << r->pmin << '\n';
-            ++rows;
+            dp::BandSample s;
+            s.t = t;
+            s.written = bandMode(r) || bandMode(anchors::row(t - 1)) || bandMode(anchors::row(t + 1));
+            s.pmin = r->pmin;
+            s.pmax = r->pmax;
+            s.cam = r->bandCam;
+            samples.push_back(s);
         }
+        long long rows = 0;
+        bf << dp::bandRows(samples, &rows);
         bf.close();
         // cfg `dpbandtrack=0` withholds it. Passing the recorded band at all is
         // what 81f2a09 started doing in-process, and the bisect puts lv22's
@@ -2064,26 +2359,38 @@ inline void addWorldArgs(std::vector<std::string>& a) {
     // plan the windows were recorded on. A window still open at the last
     // recorded tick closes there; past the recording the model has no windows,
     // which is the hole it always had.
-    std::string wins;
-    long long t0 = -1, last = -1;
+    // ...and the second body's own windows the same way (--ctrlwin2, from ctrlOff2): the Options
+    // trigger switches the two players separately, and the model uses these only under
+    // --ctrlwinp2.
     const long long n = anchors::depth();
-    for (long long t = 1; t < n; ++t) {
-        const AnchorRow* r = anchors::row(t);
-        if (!r) continue;
-        last = t;
-        if (r->ctrlOff && t0 < 0) t0 = t;
-        if (!r->ctrlOff && t0 >= 0) {
-            wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
-                    + std::to_string(t - 1);
-            t0 = -1;
+    auto windows = [&](bool second) {
+        std::string wins;
+        long long t0 = -1, last = -1;
+        for (long long t = 1; t < n; ++t) {
+            const AnchorRow* r = anchors::row(t);
+            if (!r) continue;
+            last = t;
+            const bool off = second ? r->ctrlOff2 == 1 : r->ctrlOff != 0;
+            if (off && t0 < 0) t0 = t;
+            if (!off && t0 >= 0) {
+                wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
+                        + std::to_string(t - 1);
+                t0 = -1;
+            }
         }
-    }
-    if (t0 >= 0)
-        wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
-                + std::to_string(last);
+        if (t0 >= 0)
+            wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
+                    + std::to_string(last);
+        return wins;
+    };
+    const std::string wins = windows(false), wins2 = windows(true);
     if (!wins.empty()) {
         a.push_back("--ctrlwin");
         a.push_back(wins);
+    }
+    if (!wins2.empty()) {
+        a.push_back("--ctrlwin2");
+        a.push_back(wins2);
     }
     // The level's own compatibility flags, written beside objrects when the session opened.
     // This one is NOT under dpWorld: kA39 changes the SHAPE of every circular hazard's test
@@ -2141,6 +2448,9 @@ inline void addWorldArgs(std::vector<std::string>& a) {
     // to the loop, so a cold run kept the doubled push that the replay suite had already lost.
     const std::string fids = std::string(DATA_DIR) + "/forceblocks.txt";
     if (std::filesystem::exists(fids, ec)) { a.push_back("--forceids"); a.push_back(fids); }
+    // The area triggers (solver.hpp writes areas.txt at session start); read by dp only under --areamove.
+    const std::string areas = std::string(DATA_DIR) + "/areas.txt";
+    if (std::filesystem::exists(areas, ec)) { a.push_back("--areas"); a.push_back(areas); }
     // The 2.2 rotation queue's inputs (solver.hpp writes rotgameplay.txt at session
     // start). UNDER dpWorld, unlike levelsettings above: a queue entry is a trigger
     // sitting at a position, i.e. world state, whereas kA39 changes the shape of a
@@ -2210,10 +2520,15 @@ inline std::string snapFile(const std::string& path) {
 // and the same `input sig` and still read different inputs (measured
 // 2026-09-19 22:42, a call attributed as "same input" was reading dp_rejoin.trace.csv). A flag that
 // takes a file goes in here, or both lines stay silent about what it read.
+// --xtrack and --items were not, and the first one is the one that mattered: GD's x on every tick of
+// the attempt the anchor came from, a file in the session's data dir that the next run overwrites or
+// removes. A rebuild of a call from its argv then read another run's track or none ("xtrack: 0
+// rows"), dated the triggers behind the anchor by the x estimate instead, and on a custom level put a
+// Move 31 ticks early -- a divergence that the call itself never had.
 inline constexpr const char* kFileArgs[] = {
     "--groups", "--fixups", "--bandtrack", "--rejoinwatch", "--replay",
     "--triggers", "--objgroups", "--obb", "--levelsettings", "--rotgameplay",
-    "--forceids"};
+    "--forceids", "--xtrack", "--items", "--areas"};
 inline bool isFileArg(const std::string& s) {
     for (const char* f : kFileArgs)
         if (s == f) return true;
@@ -2295,8 +2610,50 @@ inline int g_plainBesideMode = 0;
 inline int timedSolve(const std::string& csv, const std::vector<std::string>& a,
                       const char* kind) {
     const auto c0 = std::chrono::steady_clock::now();
+    // The HUD's search bar takes over at the dp's first progress report; until then (reading the
+    // inputs, building the level) this is what it shows. The resim has no search to hand over to.
+    static constexpr const char* kStart = "starting the search (loading inputs)";
+    const bool isResim = std::strcmp(kind, "resim") == 0;
+    phase::Scope ph(isResim ? "replaying the plan through the model (resim)" : kStart, g_anchorT, g_iter);
+    // The start ends where the dp reports its first progress (the HUD's search bar takes over
+    // there); the dp pushes nothing, so a watcher polls the same flag the HUD reads.
+    struct StartWatch {
+        std::atomic<bool> stop{false};
+        std::thread th;
+        explicit StartWatch(bool on, phase::Id id) {
+            if (!on) return;
+            th = std::thread([this, id] {
+                while (!stop.load(std::memory_order_acquire)) {
+                    if (dpbridge::progress().running) { phase::endId(id); return; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+            });
+        }
+        ~StartWatch() {
+            stop.store(true, std::memory_order_release);
+            if (th.joinable()) th.join();
+        }
+    } startWatch(!isResim, ph.id());
     dpbridge::plainBeside(g_plainBesideMode);   // cfg dpplainbeside (config.hpp) or the menu
-    const int rc = dpbridge::solveInProcess(csv, a);
+    {   // the signatures of the recordings this call reads, for dp's groups cache (g_sigKnown)
+        std::unordered_map<std::string, std::string> hints;
+        for (size_t i = 0; i + 1 < a.size(); ++i)
+            if (isFileArg(a[i])) {
+                const auto k = g_sigKnown.find(a[i + 1]);
+                if (k != g_sigKnown.end()) hints[a[i + 1]] = k->second;
+            }
+        dpbridge::setFileSigHints(hints);
+    }
+    std::vector<std::string> aa;
+    const std::vector<std::string>* av = &a;
+    if (g_cfg.dpSigCheck) {   // cfg dpsigcheck: dp checks its signature hits against the bytes too
+        aa = a;
+        aa.push_back("--groupsigcheck");
+        aa.push_back("--levelcachecheck");   // ...and its replay level cache against the level it stored
+        av = &aa;
+    }
+    const int rc = dpbridge::solveInProcess(csv, *av);
+    dpbridge::setFileSigHints({});
     {   // the cap ladder's account of the call, for a change to the ladder to be checked against
         const std::string lad = dpbridge::outcome().ladder;
         if (!lad.empty()) writeResult(std::string("dpsolve:   [ladder] ") + kind + " " + lad);
@@ -2371,6 +2728,8 @@ inline void logSolverArgs(const std::vector<std::string>& a) {
     for (size_t i = 0; i + 1 < a.size(); ++i)
         if (isFileArg(a[i]))
             sig += " " + a[i].substr(2) + "=" + fileSig(a[i + 1]);
+    // ...and the level table the solver gets in memory (g_csvSig)
+    sig += " level=" + (g_csvSig.empty() ? std::string("-") : g_csvSig);
     writeResult(sig);
     // ...and, under cfg dpsnapshot, the bytes themselves (snapFile), for the same files. The
     // static ones cost one copy per level: a copy is named by its contents and kept once.
@@ -2381,6 +2740,28 @@ inline void logSolverArgs(const std::vector<std::string>& a) {
                 const std::string n = snapFile(a[i + 1]);
                 snap += " " + a[i].substr(2) + "=" + (n.empty() ? "-" : n);
             }
+        // The level table as the solver had it (LF line ends, unlike objrects.txt's text-mode CRLF), so
+        // the copy's own fileSig is the `level=` above: about 20 MB on a large level, once per distinct
+        // table -- typically one, two when a level slice swaps to its copy and back.
+        std::string lvl = "-";
+        if (!g_csvSig.empty()) {
+            std::string tag = g_csvSig;
+            for (char& c : tag) if (c == '/') c = '_';
+            const std::string name = "snaps/objrects_" + tag + ".txt";
+            const std::filesystem::path dst = std::filesystem::path(DATA_DIR) / name;
+            std::error_code ec;
+            std::filesystem::create_directories(dst.parent_path(), ec);
+            if (std::filesystem::exists(dst, ec)) {
+                lvl = name;
+            } else {
+                std::ofstream f(dst, std::ios::binary | std::ios::trunc);
+                f.write(g_csv.data(), (std::streamsize)g_csv.size());
+                f.close();
+                if (f) lvl = name;
+                else std::filesystem::remove(dst, ec);
+            }
+        }
+        snap += " level=" + lvl;
         writeResult(snap);
     }
 }
@@ -2411,8 +2792,15 @@ inline std::vector<std::string> baseArgs(const std::string& out,
     // search SHARES a placement between states, which a replay (one state, its own fire ticks)
     // never did. Always passed here since the 0.4.0 clean-up removed cfg dpgroupfire.
     a.push_back("--groupfire");
+    // cfg dpsearch (config.hpp): another search than the layer DP answers these calls.
+    if (g_cfg.dpSearch != "dp") {
+        a.push_back("--search");
+        a.push_back(g_cfg.dpSearch);
+    }
     // cfg dpcapladder: a small cap first, raised only where the search runs out of states.
-    // Not on the tiers: those are the escalation that asked for MORE states on purpose.
+    // Not on the tiers: those are the escalation that asked for MORE states on purpose. The DP's
+    // own mechanism: with another search (cfg dpsearch) it is passed all the same, and the solver
+    // runs it only for a call that search declines (cli.hpp cliMain).
     if (g_cfg.dpCapLadder > 0 && !tiered) {
         a.push_back("--capladder");
         a.push_back(std::to_string(g_cfg.dpCapLadder));
@@ -2477,14 +2865,18 @@ inline std::vector<std::string> baseArgs(const std::string& out,
     }
     // (The witness resim inside this search fires the item gates too: the solver's fixed
     // behaviour since the 0.4.0 clean-up removed --walkgates.)
+    // cfg worldgates: the item gates are the world's without coinroute too (dp --worldgates).
+    if (g_cfg.worldGates) a.push_back("--worldgates");
     // ...and the pickups a Count trigger counts (items.txt, written beside the
-    // level dump). Passed only with the flag: nothing else reads a counter.
-    if (g_cfg.coinRoute) {
+    // level dump). Passed only with the gates: nothing else reads a counter.
+    if (g_cfg.coinRoute || g_cfg.worldGates) {
         const std::string ip = std::string(DATA_DIR) + "/items.txt";
         if (std::filesystem::exists(ip, ec)) {
             a.push_back("--items");
             a.push_back(ip);
         }
+    }
+    if (g_cfg.coinRoute) {
         // ...and how far inside a coin this run has learnt to plan (see
         // g_coinMarginNow). 0 is dp's default, so it is passed only once it has
         // grown -- a run that never has a coin refused looks exactly as before.
@@ -2626,6 +3018,17 @@ inline int swingPendingAt(const std::vector<InputCmd>& plan, long long t0) {
         lastStep = c.step;
     }
     return (lastStep == t0 - 1 && last == 1 && prev == 0) ? 1 : 0;
+}
+
+// dp --p2xoff's anchor: the second dual body's x offset from the first (p2x - x), as `--startp2dx`.
+// Written only for a pair that has run apart, so every other argv is as before; dp reads it only
+// under the flag.
+inline void addStartP2dx(std::vector<std::string>& a, const AnchorRow* r) {
+    if (!r || !r->dual) return;
+    const float d = r->x2 - r->x;
+    if (std::fabs(d) <= 0.01f) return;
+    a.push_back("--startp2dx");
+    a.push_back(num(d));
 }
 
 // The first 27 of the 30 fields of `--start`, in the order leveldp reads them
@@ -2783,15 +3186,23 @@ inline std::string anchorPayload(long long t0) {
 // mini UFO in the row for t=1,043 (upsideDown 0 -> 1, vy 6.648 -> 3.324), the payload named it
 // spent at 1,042, and the resim never flipped; with 212 left out it follows GD to GD's own death
 // (t=1,442).
+// In uid order, as spentPadArg: the seeds are unordered_maps, whose iteration order is not fixed --
+// one that grew on an earlier level of the same session keeps its buckets -- so the same portals
+// reached dp as a differently spelt argument depending on the levels solved before. dp sets one
+// latch bit per uid, so the order never changed what it did.
 inline std::string portalPayload(long long t0) {
-    std::string p1, p2;
     const bool lt = g_cfg.portalPayloadLt;
-    for (const auto& kv : anchors::seeds().portal)
-        if (lt ? kv.second < t0 : kv.second <= t0)
-            p1 += (p1.empty() ? "" : ",") + std::to_string(kv.first);
-    for (const auto& kv : anchors::seeds().portal2)
-        if (lt ? kv.second < t0 : kv.second <= t0)
-            p2 += (p2.empty() ? "" : ",") + std::to_string(kv.first);
+    auto spent = [&](const std::unordered_map<int, int>& seeds) {
+        std::vector<int> uids;
+        for (const auto& kv : seeds)
+            if (lt ? kv.second < t0 : kv.second <= t0) uids.push_back(kv.first);
+        std::sort(uids.begin(), uids.end());
+        std::string out;
+        for (const int u : uids) out += (out.empty() ? "" : ",") + std::to_string(u);
+        return out;
+    };
+    const std::string p1 = spent(anchors::seeds().portal);
+    const std::string p2 = spent(anchors::seeds().portal2);
     if (p1.empty() && p2.empty()) return std::string();
     return "owns=portal;portal=" + p1 + ";portal2=" + p2;
 }
@@ -2813,6 +3224,17 @@ inline std::string portalPayload(long long t0) {
 //                the anchor's own test); -1 off a ramp
 // The values are GD's, not the model's: which field an age goes into, and how the
 // clock's phase lines up with the model's counters, is decided in one place, dp's.
+// Version 5 (with version 4, cfg `histride`) adds the second body's dash:
+//   dashing2     p2's m_isDashing
+//   dashRing2    the uid of p2's m_dashRing, -1 for none (dp rebuilds the slope from it)
+// p1's dash rides --start (its 17th/18th fields); nothing carried p2's before, so an anchor
+// inside a dual dash started p2 falling.
+// Version 6 (with versions 4 and 5, cfg `histride`) adds the press latch's first byte raw:
+//   jumpBuf      [player+0x985], m_jumpBuffered
+//   jumpBuf2     the second body's, -1 for none
+// pressSpent (0x985 && !0x986) reads 0 both for a button that is up and for one held after
+// a ball's tap cleared 0x985 -- the hold a ship then does not thrust on; dp seeds its hold
+// latch from this under --holdseed.
 inline std::string histPayload(long long t0) {
     const AnchorRow* r = anchors::row(t0);
     if (!r || !r->valid) return std::string();
@@ -2822,7 +3244,7 @@ inline std::string histPayload(long long t0) {
     // the clock (none written this attempt) says nothing, and -1 leaves dp's default.
     const double since = r->totalTime - r->spiderStamp;
     const long long age = (since >= 0.0) ? std::llround(since * 240.0) : -1;
-    std::string s = std::string("owns=hist;hist=") + (g_cfg.histRide ? "4|9" : "3|4")
+    std::string s = std::string("owns=hist;hist=") + (g_cfg.histRide ? "6|13" : "3|4")
          + "|pressSpent:" + std::to_string(ps)
          + ",pressSpent2:" + std::to_string(ps2)
          + ",freeMode:" + std::to_string(r->freeMode)
@@ -2848,7 +3270,11 @@ inline std::string histPayload(long long t0) {
          + ",slopeUnder:" + std::to_string(r->slopeUnder)
          + ",slopeUid:" + std::to_string(r->slopeUid)
          + ",slopeAge:" + std::to_string(slopeAge)
-         + ",slopeLanded:" + std::to_string(landed);
+         + ",slopeLanded:" + std::to_string(landed)
+         + ",dashing2:" + std::to_string(r->dashing2)
+         + ",dashRing2:" + std::to_string(r->dashRing2)
+         + ",jumpBuf:" + std::to_string(r->b985)
+         + ",jumpBuf2:" + std::to_string(r->b985_2);
 }
 
 // The payloads joined, so a call site asks once. Any part may be absent; `owns`
@@ -3642,7 +4068,9 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
 // cfg dpsecauto: a real record went on file at tick t, for a death at deathTick. Counted for the
 // recorder run in progress, and -- when the death is at the deepest wall -- the earliest such tick
 // is where the model starts to part from GD there: the entry of the wall's section solve.
+inline long long g_verifyDivT = -1;   // the earliest record of the death in hand (runVerified)
 inline void autoNoteRecord(long long t, long long deathTick) {
+    if (g_verifyDivT < 0 || t < g_verifyDivT) g_verifyDivT = t;
     ++g_autoRecNow;
     if (rungWall() >= 0 && deathTick >= rungWall() - kAutoCreep
         && (g_autoHead < 0 || t < g_autoHead))
@@ -3703,6 +4131,7 @@ inline void keepRecorderInputs(const std::vector<std::string>& a, long long t0, 
                                            std::filesystem::copy_options::overwrite_existing, ec);
                 copy = ec ? std::string("copy-failed") : std::string(gp);
                 if (!ec) g_fixinGroupsBySig[gs] = copy;
+                if (!ec && gs != "-") g_sigKnown[dir + gp] = gs;   // a byte copy of a file whose sig is gs
             }
             groupsLine += (groupsLine.empty() ? "" : ";") + gs + "=" + copy;
             ++k;
@@ -3739,6 +4168,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
                                "--cap", std::to_string(kCap),
                                "--shipyq", num(kYq), "--shipvq", num(kVq),
                                "--threads", kThreads};
+    addStartP2dx(a, anchors::row(t0));   // dp --p2xoff
     if (!band.empty()) { a.push_back("--startband"); a.push_back(band); }
     {   // ...and the touch triggers GD had already set off by t0, and the
         // gravity portals it had already spent (cfg touchpayload, off by default,
@@ -3785,15 +4215,29 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
             a.push_back("--touchentered");
             a.push_back(touchEnteredArg(t0));
         }
+        // ...and, under dparg --slambox, the boxes GD fired in that attempt (recTouchArg).
+        if (solverSlamBox()) {
+            a.push_back("--rectouch");
+            a.push_back(recTouchArg());
+        }
+        // ...and, under dparg --formularec, whose attempt the recording and the rows are (recProvArg).
+        if (solverFormulaRec()) {
+            a.push_back("--recprov");
+            a.push_back(recProvArg());
+        }
         // ...and, under cfg dpspentpad, the pads it had already fired (spentPadArg).
         if (g_cfg.dpSpentPad) {
             const std::string sp = spentPadArg(t0);
             if (!sp.empty()) { a.push_back("--spentpad"); a.push_back(sp); }
         }
-        // ...and the rings (spentOrbArg).
+        // ...and the rings (spentOrbArg), and p2's under dp --spentp2 (spentOrb2Arg).
         {
             const std::string so = spentOrbArg(t0);
             if (!so.empty()) { a.push_back("--spentorb"); a.push_back(so); }
+            if (solverSpentP2()) {
+                const std::string so2 = spentOrb2Arg(t0);
+                if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
+            }
         }
         // ...and, under cfg dpxtrack, GD's x up to t0 (xtrackArg).
         if (g_cfg.dpXTrack) {
@@ -3810,8 +4254,9 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
     // This replay fires the item gates the search does, so it needs the gate tables (--coins) and
     // the same item givers (--items). The replay has no coin prune (that is the search's), so
     // --coins adds nothing else here.
-    if (g_cfg.coinRoute) {
-        a.push_back("--coins");
+    // ...and under cfg worldgates alone, the gates without the coins.
+    if (g_cfg.coinRoute || g_cfg.worldGates) {
+        a.push_back(g_cfg.coinRoute ? "--coins" : "--worldgates");
         const std::string ip = std::string(DATA_DIR) + "/items.txt";
         if (std::filesystem::exists(ip, ec)) {
             a.push_back("--items");
@@ -4093,7 +4538,9 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
 // Find and record where this replay's model and GD first parted. Runs on the worker thread,
 // before the ladder, because a record made now is used by the ladder's very first solve.
 inline void recordFixups(long long deathTick) {
+    g_verifyDivT = -1;   // this death's own records only
     if (!g_cfg.dpFixups || deathTick < 2 || g_fixupCount >= kFixupCap) return;
+    phase::Scope ph("recording what the model got wrong (fixup recorder)", deathTick, g_iter);
     // ALWAYS the attempt that just died. The ladder may have been pointed at the deepest
     // attempt's trajectory instead (a rewind), and comparing the model against a run it is not
     // replaying would record divergences that never happened.
@@ -4871,8 +5318,12 @@ inline bool runLadder(long long dt) {
         // keeps growing). Re-anchoring there sends the search off after a route that does not
         // exist. The margin is wide because legitimate play does leave the band: verified runs
         // clear its ceiling by up to 1,083px in rotated and tower sections.
-        if (r->pmax > r->pmin
-            && !(r->y >= r->pmin - 1200.f && r->y <= r->pmax + 1200.f)) {
+        // cfg anchorboardarm: by the off-board credit's own test instead (config.hpp)
+        float offX = 0.f;
+        const bool offBoard = g_cfg.anchorBoardArm
+            ? (offBoardTick(t0, offX) >= 0)
+            : (r->pmax > r->pmin && !(r->y >= r->pmin - 1200.f && r->y <= r->pmax + 1200.f));
+        if (offBoard) {
             writeResult("dpsolve:   anchor t=" + std::to_string(t0) + " y="
                         + std::to_string((int)r->y) + " is off the board (band "
                         + std::to_string((int)r->pmin) + ".."
@@ -4910,15 +5361,29 @@ inline bool runLadder(long long dt) {
                 a.push_back("--touchentered");
                 a.push_back(touchEnteredArg(t0));
             }
+            // ...and, under dparg --slambox, the boxes GD fired in that attempt, as the resim does.
+            if (solverSlamBox()) {
+                a.push_back("--rectouch");
+                a.push_back(recTouchArg());
+            }
+            // ...and, under dparg --formularec, the recording's and the rows' attempts, as the resim does.
+            if (solverFormulaRec()) {
+                a.push_back("--recprov");
+                a.push_back(recProvArg());
+            }
             // ...and, under cfg dpspentpad, the pads it had already fired, as the resim does.
             if (g_cfg.dpSpentPad) {
                 const std::string sp = spentPadArg(t0);
                 if (!sp.empty()) { a.push_back("--spentpad"); a.push_back(sp); }
             }
-            // ...and the rings.
+            // ...and the rings (p2's under dp --spentp2).
             {
                 const std::string so = spentOrbArg(t0);
                 if (!so.empty()) { a.push_back("--spentorb"); a.push_back(so); }
+                if (solverSpentP2()) {
+                    const std::string so2 = spentOrb2Arg(t0);
+                    if (!so2.empty()) { a.push_back("--spentorb2"); a.push_back(so2); }
+                }
             }
             // ...and, under cfg dpxtrack, GD's x up to t0, as the resim does.
             if (g_cfg.dpXTrack) {
@@ -4928,6 +5393,7 @@ inline bool runLadder(long long dt) {
         }
         a.push_back("--start");
         a.push_back(arg);
+        addStartP2dx(a, r);   // dp --p2xoff
         // ...and the coins GD had already credited by t0 (AnchorRow::coins).
         const std::string coinMask = g_cfg.coinRoute ? std::to_string(r->coins) : "";
         if (!coinMask.empty()) { a.push_back("--coinmask"); a.push_back(coinMask); }
@@ -4935,7 +5401,7 @@ inline bool runLadder(long long dt) {
         // the anchor are not in the window the model's own mask numbers, so the
         // history has to arrive as the number the Count trigger reads.
         std::string itemBase;
-        if (g_cfg.coinRoute && r->item1 >= 0) {
+        if ((g_cfg.coinRoute || g_cfg.worldGates) && r->item1 >= 0) {
             itemBase = std::to_string(r->item1) + ":" + std::to_string(r->cnt1);
             if (r->item2 >= 0)
                 itemBase += "," + std::to_string(r->item2) + ":"
@@ -5030,7 +5496,7 @@ inline bool runLadder(long long dt) {
                          "t=%lld", o.rejoinT);
             writeResult(jb);
         }        std::vector<InputCmd> cand;
-        loadInputsFile(g_tailPath, cand);
+        loadInputsFile(g_tailPath, cand, true);
         // A tail with no inputs at all is a legal plan -- "never press" is what some stretches
         // want -- so the file's EXISTENCE is the test, not whether it parsed any lines.
         // loadInputsFile answers the second question, and using it for the first would throw
@@ -5228,7 +5694,7 @@ inline bool runLadder(long long dt) {
                 const int frc = timedSolve(g_csv, fa, "fine");
                 const dpbridge::SolveOutcome of = dpbridge::outcome();
                 std::vector<InputCmd> fc;
-                loadInputsFile(g_tailPath, fc);
+                loadInputsFile(g_tailPath, fc, true);
                 const bool fHave = std::filesystem::exists(g_tailPath, ec);
                 // Past the wall by a margin, or alive at the window's end (a horizon-cut SOLVED,
                 // which the adoption below already tells from a goal-reaching one by horizonCut).
@@ -5376,6 +5842,28 @@ inline std::string planFnv(const std::vector<InputCmd>& p) {
 // level, the mod, or the seed changed) and the run proceeds from wherever GD actually put it.
 enum JobKind { JobFirstSolve = 0, JobLadder = 1, JobSeedPlan = 2 };
 
+// A job that finishes after its session has ended -- the player stopped the Solve or left the level, or a
+// give-up ended it, while a search was out. poll() takes a result only in the frames of a live session,
+// so nothing took this one: the slot stayed marked as running (a later Solve queued behind a thread long
+// gone, cfg memcensus read the solver as busy), and what the session end could not release while the
+// search ran -- the solver's caches above all, half a gigabyte on a custom level -- stayed until another
+// solve ended (the panel, 2026-10-09). The job queues this on the main thread as it finishes; Geode runs it
+// at the next frame, whatever the scene. A job whose own session is still on is left to poll().
+inline void reapOrphanedJob(int gen) {
+    if (!g_running.load() || !g_finished.load() || g_resultGeneration != gen) return;   // taken already
+    const bool live = g_started && !g_sessionOver;
+    if (live && gen == g_generation.load()) return;
+    g_running = false;
+    g_finished = false;
+    writeResult("dpsolve: a job finished after its session ended - its result dropped (gen "
+                + std::to_string(gen) + ", now " + std::to_string(g_generation.load()) + ")");
+    // No session: everything the solve kept. A new session is live (its Solve queued behind this job,
+    // or a replay): only the solver's caches, which no call is using now and the next search rebuilds.
+    if (!live) releaseSolveMemory("job end");
+    else dpbridge::releaseCaches();
+    memCensus("job reaped");
+}
+
 inline void spawn(int kind, long long arg, const char* phase) {
     g_running = true;
     g_finished = false;
@@ -5483,7 +5971,7 @@ inline void spawn(int kind, long long arg, const char* phase) {
                                    && !dpbridge::outcome().horizonCut;
             } else if (kind == JobSeedPlan) {
                 g_rc = 0;
-                ok = loadInputsFile(g_cfg.dpSeedPlan, g_plan);
+                ok = loadInputsFile(g_cfg.dpSeedPlan, g_plan, true);
                 // A seeded plan is somebody else's claim; the game is about to
                 // test it, so treat it as claiming the goal.
                 g_planClaimsGoal = ok;
@@ -5530,6 +6018,16 @@ inline void spawn(int kind, long long arg, const char* phase) {
                 // The PHYSICAL death: under cfg coinmisspost a death can be ranked at a coin it
                 // passed (g_lastDeath), but what GD and the model disagree about is where it died.
                 recordFixups(g_lastDeathPhys >= 0 ? g_lastDeathPhys : g_lastDeath);
+                // ...and the run is told what the flight did (dp_bridge runVerified): the plan GD
+                // flew, where it died, and where the recorder saw the model part from GD.
+                {
+                    std::vector<std::pair<long long, int>> fe;
+                    for (const InputCmd& c : (flown ? g_flownPlan : g_plan))
+                        fe.emplace_back((long long)c.step, c.down ? 1 : 0);
+                    writeResult(dpbridge::runVerified(
+                        fe, g_lastDeathPhys >= 0 ? g_lastDeathPhys : g_lastDeath,
+                        (double)g_lastDeathX, false, g_verifyDivT));
+                }
                 // ...and what it learns there reopens the ladder only when the death IS where the
                 // ladder climbs from. A death cfg coinmisspost ranked at a missed coin was learnt
                 // from past that coin, which says nothing new about the anchors before it -- and
@@ -5586,6 +6084,8 @@ inline void spawn(int kind, long long arg, const char* phase) {
         g_haveNewPlan = ok;
         g_resultGeneration = gen;   // set before g_finished, same ordering convention as g_rc
         g_finished = true;
+        // ...and if its session has ended meanwhile, nothing will take the result (reapOrphanedJob)
+        Loader::get()->queueInMainThread([gen] { reapOrphanedJob(gen); });
     }).detach();
 }
 
@@ -5784,9 +6284,24 @@ inline void start(GJBaseGameLayer* l) {
     // The section search's settings, put back at session end -- taken when the run starts, not
     // on a level a slice swap brought in: the run goes on there, with whatever its rungs set.
     if (!carry) captureSecsolveSettings();
+    // ...and the search's run begins on the same terms (dp_bridge runBegin): with the level's
+    // solve, not on a level a slice swap brought in. A run still open from another level is a
+    // carry-over: refuse to solve rather than run this level on another's state.
+    if (!carry) {
+        std::string why;
+        if (!dpbridge::runBegin(g_cfg.levelId, (unsigned long long)g_cfg.dpSeed, why)) {
+            writeResult("dprun: refused - " + why);
+            g_paused = true;
+            endSession("run_carryover");
+            return;
+        }
+        writeResult("dprun: begin level=" + std::to_string(g_cfg.levelId) + " seed="
+                    + std::to_string(g_cfg.dpSeed));
+    }
     std::ostringstream oss;
     solver::writeObjRects(oss, l);
     g_csv = oss.str();
+    g_csvSig = bytesSig(g_csv);
     // A level the solver cannot represent is refused HERE, before any search, the way a
     // platformer is. It used to be found inside the first solve, where the loader called
     // std::exit on the solver's detached thread -- which ended the game itself (0xC0000409 in
@@ -5866,6 +6381,7 @@ inline void start(GJBaseGameLayer* l) {
         std::filesystem::remove(g_groupsPath, ec);   // the recordings are this run's, too
         std::filesystem::remove(g_groupsDeepPath, ec);
         std::filesystem::remove(g_groupsBootPath, ec);
+    g_sigKnown.clear();   // the recordings it described are gone
         // ...and the one they are all copied FROM. It is written by the recorder, not by this
         // loop, so it was not in this list -- and a level that records nothing (no grouped
         // objects at all) leaves the previous level's file sitting there under the name every
@@ -5879,6 +6395,7 @@ inline void start(GJBaseGameLayer* l) {
         g_fixupNoop = 0;
     }
     g_groupsDepth = -1;
+    g_groupsSerial = -1;
     g_groupsCopiedSig.clear();
     g_fixinGroupsBySig.clear();
     g_fixinPending = false;
@@ -5914,6 +6431,11 @@ inline void start(GJBaseGameLayer* l) {
         g_phantomBands.clear();
         g_phantomLifted = false;
     }
+    g_voidLowRead = false;   // cfg voidband: this session's level
+    g_voidLow.clear();
+    g_voidDt = -1;
+    g_voidT0 = -1;
+    g_voidX0 = 0.f;
     g_killVetoIter = -1;
     g_forcePortalBand.clear();
     g_cfg.noDeath = false;
@@ -5997,11 +6519,13 @@ inline void start(GJBaseGameLayer* l) {
     g_autoLastT0 = -1;
     g_autoCapTier = 0;
     g_autoLastDrawn = false;
+    g_autoLastWin = AutoWindow{};   // ...and the window drawn (stateFire reads it at a wall's second try)
     g_autoLastFound = true;
     g_autoLastCapBound = false;
     g_autoPinOut = false;
     g_autoChain = 0;
     g_autoRecordThenRung = false;
+    g_autoRecordWhy.clear();
     g_swWall = -1;           // cfg dpsecstate
     g_swPhase = 0;
     g_swEvent = -1;
@@ -6033,6 +6557,7 @@ inline void start(GJBaseGameLayer* l) {
     g_followPeak = -1;
     g_followForced = 0;
     g_anchorT = -1;
+    g_phaseLabelsLive = true;   // g_iter was set above (carry or 0) and g_anchorT now: the labels are this level's
     g_lastDeathX = 0.f;   // inert while g_lastDeath gates its only reader, but it is the same
                           // per-run pair and the two must not drift apart
     g_stop = false;
@@ -6049,6 +6574,7 @@ inline void start(GJBaseGameLayer* l) {
     g_argsLast.clear();   // ...or level N+1's first solve compares against level N's
     anchors::reset();
     cpflight::reset();          // ...and the checkpoints kept with them (cfg cpflight)
+    g_solveMemHeld = true;      // ...and let go of again when the solving is over (releaseSolveMemory)
     if (!carry) cpflight::resetCounts();   // the session's tally goes on across a carried run
     g_cpFlightSummary = &cpflight::summary;   // with the flag off too: its counts are then 0
     g_spawnRow = AnchorRow{};   // ...and so is the spawn: level N's must not start level N+1
@@ -6101,7 +6627,23 @@ inline void start(GJBaseGameLayer* l) {
 //
 // Files are summed as size/hash rather than compared whole -- the recordings run to tens of MB
 // and the point is only whether two runs fed the solver the same bytes.
+inline std::string fileSigScan(const std::string& path);
 inline std::string fileSig(const std::string& path) {
+    const auto known = g_sigKnown.find(path);
+    if (known != g_sigKnown.end()) {
+        if (g_cfg.dpSigCheck) {   // cfg dpsigcheck (debug): the scan as well, and say if they differ
+            const std::string scan = fileSigScan(path);
+            if (scan != known->second) {
+                writeResult("dpsolve:   [sigcheck] MISMATCH " + path + " known=" + known->second +
+                            " scan=" + scan);
+                return scan;
+            }
+        }
+        return known->second;
+    }
+    return fileSigScan(path);
+}
+inline std::string fileSigScan(const std::string& path) {
     std::error_code ec;
     if (path.empty() || !std::filesystem::exists(path, ec)) return "-";
     std::ifstream f(path, std::ios::binary);
@@ -6123,6 +6665,34 @@ inline std::string fileSig(const std::string& path) {
     char out[48];
     snprintf(out, sizeof(out), "%zu/%08x", n, (unsigned)(h & 0xffffffffULL));
     return out;
+}
+// copy_file, hashing as it copies: the destination's signature (fileSigScan's, byte for byte) goes
+// into g_sigKnown. On any failure the destination is forgotten, so the next reader scans it.
+inline bool copyRecording(const std::string& src, const std::string& dst) {
+    g_sigKnown.erase(dst);
+    std::ifstream in(src, std::ios::binary);
+    if (!in) return false;
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    uint64_t h = 1469598103934665603ULL;
+    size_t n = 0;
+    std::vector<char> buf(1 << 20);
+    while (in.read(buf.data(), (std::streamsize)buf.size()) || in.gcount()) {
+        const size_t got = (size_t)in.gcount();
+        n += got;
+        for (size_t i = 0; i < got; ++i) {
+            h ^= (uint8_t)buf[i];
+            h *= 1099511628211ULL;
+        }
+        out.write(buf.data(), (std::streamsize)got);
+        if (!out) return false;
+    }
+    out.close();
+    if (!out) return false;
+    char sig[48];
+    snprintf(sig, sizeof(sig), "%zu/%08x", n, (unsigned)(h & 0xffffffffULL));
+    g_sigKnown[dst] = sig;
+    return true;
 }
 
 inline void logFingerprint(long long dt, double deathX) {
@@ -6146,6 +6716,7 @@ inline void logFingerprint(long long dt, double deathX) {
              g_horizonNow, g_curBackoff, fileSig(g_groupsPath).c_str(),
              fileSig(g_groupsDeepPath).c_str());
     writeResult(b);
+    memCensus("round");   // cfg memcensus (print only)
     // KEEP THE PLAN THAT DIED -- **from memory, not from the file**. `g_plan` at
     // this point is the plan GD just replayed; the rewind that can replace it
     // (`g_plan = g_best`) is further down this same function, and the file only
@@ -6199,6 +6770,76 @@ inline void logFingerprint(long long dt, double deathX) {
                  fileSig(bandSrc).c_str(), gs.c_str(), g_cfg.researchCapture ? "on" : "off");
         writeResult(b2);
     }
+}
+
+// What the solving keeps that nothing reads once it is over, let go: the anchor rows of the live,
+// dead and deepest attempts, the checkpoint flights' sets (a GD checkpoint every cfg cpflight ticks,
+// each holding the level's state), the section search's per-node tables and any node checkpoint a
+// search left behind, and both solver copies' cross-call caches (the parsed recordings above all).
+// Each is emptied at the next start() anyway, so nothing a later solve reads changes; without this
+// a solved level held all of it until another Solve began, leaving the level included. Called when
+// a solve session ends (endSession) and when the level is left (onQuit); a search still running
+// keeps everything, and says so -- the next call releases it.
+inline void releaseSolveMemory(const char* where) {
+    if (jobInFlight()) {
+        writeResult(std::string("dpsolve: memory kept at ") + where + " - a search is still running");
+        return;
+    }
+    g_solveMemHeld = false;
+    // What each part holds allocated before and after (capacities, MB), beside the process's private
+    // bytes: a container that is emptied but keeps its buffer shows as a part that did not go down.
+    auto mb = [](size_t n) { return (double)n / (1024.0 * 1024.0); };
+    const int before = postmortem::privateMB();
+    const size_t a0 = anchors::heldBytes(), s0 = secsolve::nodeTableBytes(), c0 = dpbridge::cacheBytes();
+    anchors::release();
+    cpflight::reset();
+    const bool sec = !secsolve::inFlight();
+    if (sec) secsolve::freeNodeTables();
+    const bool core = dpbridge::releaseCaches();
+    char b[320];
+    snprintf(b, sizeof(b), "dpsolve: memory released at %s - private %d -> %d MB; held anchor rows %.1f -> %.1f, "
+             "section tables %.1f -> %.1f%s, solver caches %.1f -> %.1f MB%s", where, before,
+             postmortem::privateMB(), mb(a0), mb(anchors::heldBytes()), mb(s0), mb(secsolve::nodeTableBytes()),
+             sec ? "" : " (kept: in flight)", mb(c0), mb(dpbridge::cacheBytes()),
+             core ? "" : " (kept: a search beside the ladder)");
+    writeResult(b);
+}
+
+// cfg memcensus (print only, config.hpp): one `memcensus:` line -- the wall clock, the process's private
+// bytes and working set, the round, and what each of the mod's main containers and the solver's caches
+// hold allocated (capacities, MB; approximate where a map's nodes are involved). The GD checkpoints the
+// flights keep are counted (cpf=<sets>/<records>/<MB beside them>, gdcp = GD's own list), not sized.
+// The solver's caches are read only between calls: `busy` while a search runs. To result.txt and the
+// Geode log, which keeps the whole game when result.txt starts afresh with a session.
+inline void memCensus(const char* where) {
+    if (!g_cfg.memCensus) return;
+    auto mb = [](size_t n) { return (double)n / (1024.0 * 1024.0); };
+    const cpflight::Held cf = cpflight::held();
+    size_t seekBytes = 0;
+    for (const auto& kv : seekcp::g_cps) if (kv.second) seekBytes += cpflight::recBytes(*kv.second);
+    int gdcp = -1;
+    if (auto* pl = PlayLayer::get())
+        if (pl->m_checkpointArray) gdcp = (int)pl->m_checkpointArray->count();
+    char dp[32] = "busy", dpg[32] = "busy";
+    if (!jobInFlight()) {
+        snprintf(dp, sizeof(dp), "%.1f", mb(dpbridge::cacheBytes()));
+        snprintf(dpg, sizeof(dpg), "%.1f", mb(dpbridge::groupCacheBytes()));
+    }
+    const std::time_t now = std::time(nullptr);
+    char clock[16] = "?";
+    if (const std::tm* tm = std::localtime(&now)) std::strftime(clock, sizeof(clock), "%H:%M:%S", tm);
+    char b[400];
+    snprintf(b, sizeof(b),
+             "memcensus: %s %s priv=%d ws=%d it=%d | anchors=%.1f cpf=%d/%zu/%.1f seekcp=%zu/%.1f sec=%.1f "
+             "map=%.1f log=%.1f csv=%.1f slice=%.1f gt=%.1f dp=%s dpgroups=%s gdcp=%d",
+             where, clock, postmortem::privateMB(), postmortem::workingSetMB(), g_iter,
+             mb(anchors::heldBytes()), cf.sets, cf.recs, mb(cf.bytes), seekcp::g_cps.size(), mb(seekBytes),
+             mb(secsolve::nodeTableBytes()), mb(itermap::heldBytes()),
+             mb(solver::g_log.capacity() * sizeof(solver::TickInfo)), mb(g_csv.capacity()),
+             mb(levelslice::heldBytes()), mb(grouptrace::g_objs.capacity() * sizeof(grouptrace::Tracked)), dp, dpg,
+             gdcp);
+    writeResult(b);
+    log::info("{}", b);
 }
 
 // Stop, and say where it got to rather than why the machinery stopped.
@@ -6278,11 +6919,9 @@ inline void harvestGroups(bool fresh = true) {
             }
         if (partT < 0) return;
     }
-    std::error_code ec;
-    std::filesystem::copy_file(std::string(DATA_DIR) + "/grouptrace_last.txt", g_groupsPath,
-                               std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) return;
+    if (!copyRecording(std::string(DATA_DIR) + "/grouptrace_last.txt", g_groupsPath)) return;
     g_groupsDepth = r.depth;
+    g_groupsSerial = g_attemptSerial;   // grouptrace_last is the attempt that just ended
     if (g_cfg.groupsRetime) {
         g_groupsX.assign(v.size(), std::numeric_limits<float>::quiet_NaN());
         if (fresh)
@@ -6405,6 +7044,116 @@ inline void checkPhantom(long long dt, double deathX, bool wedged = false,
     // the boxes above are in force now, so the solve from the crossing searches a space the first
     // attempt did not have.
     g_triedMissedPortal = false;
+}
+
+// cfg voidband (off): a death at the end of a long run over EMPTY floor closes that run.
+//
+// The ground plane under a level is alive in GD. A body that falls out of the level's lane lands on
+// it and runs on, and a level can leave the floor bare for the rest of its length with a catch at the
+// end for exactly that body. Every tick of that run advances x, so the loop's deepest-first takes it
+// for progress, and the search cannot tell it from the lane either: within its horizon both are
+// alive. A custom level's lane is y 600-1,800; its route missed a dash orb at x 28,485, fell to the
+// floor at x ~28,960 and ran 9,500 px (4,860 ticks) over nothing to two saws at y 135, the only
+// objects below y 300 from x 22,000 on. The loop went back and forth between that run and a death
+// in the lane for the whole budget, at "97%" of a level whose route had stopped at 73%.
+//
+// The rule is kept narrow. All three must hold:
+//   - the run: every tick back from the death with the body under kVoidLow (on the floor, or
+//     jumping from it: a floor jump tops out near y 172), for at least kVoidTicks ticks;
+//   - nothing but decoration and triggers below kVoidTop anywhere along it (objrects types 7 and 20
+//     excluded), up to 40 px before the death;
+//   - GD named its killer, an object below kVoidTop within 100 px of the death: the catch at the end.
+// Then the run is closed to every search (a deadband over it, below kVoidTop, every mode), and when it
+// was the deepest plan the depth to beat moves back to where the run began, as routeEngage moves a
+// wall: the deepest plan never got further than that.
+constexpr double kVoidLow = 200.0;
+constexpr double kVoidTop = 300.0;
+constexpr long long kVoidTicks = 1200;
+// ...sorted by x; g_voidLow and g_voidLowRead are declared with g_phantomBands
+inline bool voidLowIn(double x0, double x1) {
+    if (!g_voidLowRead) {
+        g_voidLowRead = true;
+        g_voidLow.clear();
+        // the level as the session opened it (g_csv), not DATA_DIR/objrects.txt: a section's slice
+        // rewrites that file with its own copy, placeholders and all
+        std::istringstream f(g_csv);
+        std::string line;
+        int cType = -1, cCx = -1, cCy = -1, cW = -1, cH = -1;
+        if (std::getline(f, line)) {
+            std::stringstream hs(line);
+            std::string col;
+            for (int i = 0; std::getline(hs, col, ','); ++i) {
+                if (col == "type") cType = i;
+                else if (col == "cx") cCx = i;
+                else if (col == "cy") cCy = i;
+                else if (col == "w") cW = i;
+                else if (col == "h") cH = i;
+            }
+        }
+        if (cType < 0 || cCx < 0 || cCy < 0 || cW < 0 || cH < 0) return true;   // unreadable: never fire
+        while (std::getline(f, line)) {
+            std::vector<std::string> v;
+            std::stringstream ls(line);
+            std::string cell;
+            while (std::getline(ls, cell, ',')) v.push_back(cell);
+            const int need = std::max({cType, cCx, cCy, cW, cH});
+            if ((int)v.size() <= need || v[cType] == "7" || v[cType] == "20") continue;
+            const double cx = std::atof(v[cCx].c_str()), cy = std::atof(v[cCy].c_str());
+            const double w = std::atof(v[cW].c_str()), h = std::atof(v[cH].c_str());
+            if (cy - h / 2 < kVoidTop) g_voidLow.emplace_back((float)(cx - w / 2), (float)(cx + w / 2));
+        }
+        std::sort(g_voidLow.begin(), g_voidLow.end());
+    }
+    for (const auto& s : g_voidLow) {
+        if (s.first > x1) break;
+        if (s.second >= x0) return true;
+    }
+    return false;
+}
+inline void checkVoidRun(long long dt, double deathX) {
+    if (!g_cfg.voidBand) return;
+    if (solver::g_killUid < 0 || std::llabs(solver::g_killTick - dt) > 1
+        || std::fabs((double)solver::g_killX - deathX) > 100.0 || solver::g_killY >= kVoidTop)
+        return;
+    const std::vector<AnchorRow>* savedSrc = anchors::g_src;
+    anchors::ladderOn(false);
+    long long t = dt;
+    double x0 = deathX;
+    if (!anchors::row(t)) --t;   // the death tick itself may have no row
+    for (; t >= 1; --t) {
+        const AnchorRow* r = anchors::row(t);
+        if (!r || !r->valid || !(r->y > 0.f && r->y < kVoidLow)) break;
+        x0 = r->x;
+    }
+    anchors::g_src = savedSrc;
+    const long long t0 = t + 1, n = dt - t;
+    if (n < kVoidTicks || voidLowIn(x0, deathX - 40.0)) return;
+    char band[96];
+    snprintf(band, sizeof(band), "%.1f,%.1f,-1,-1000.0,%.1f", x0, deathX + 1.0, kVoidTop);
+    for (const std::string& prev : g_phantomBands)
+        if (prev == band) return;
+    g_phantomBands.emplace_back(band);
+    char b[256];
+    snprintf(b, sizeof(b), "dpsolve:   [voidband] the death at t=%lld (x=%.0f) ends %lld ticks over empty "
+             "floor from t=%lld (x=%.0f), killer uid %d - closing it: --deadband %s",
+             dt, deathX, n, t0, x0, solver::g_killUid, band);
+    writeResult(b);
+    // ...and the run is no depth to beat. When it was the deepest plan already (a repeat), the depth
+    // moves back here; when this death is what makes it the deepest, onDeath records it after this
+    // check, so the move is left to it (voidDeeper).
+    g_voidDt = dt;
+    g_voidT0 = t0;
+    g_voidX0 = (float)x0;
+    if (g_bestDeath >= dt - 1 && t0 < g_bestDeath) voidDeeper("was");
+}
+// cfg voidband: the depth to beat goes back to where the closed run began.
+inline void voidDeeper(const char* how) {
+    char b[200];
+    snprintf(b, sizeof(b), "dpsolve:   [voidband] the deepest plan %s that run - the depth to beat goes "
+             "%lld -> %lld", how, g_bestDeath, g_voidT0);
+    writeResult(b);
+    g_bestDeath = g_voidT0;
+    g_bestDeathX = g_voidX0;
 }
 
 // Before declaring the level unsolved, give every veto back once. A veto is a box the game was
@@ -7318,10 +8067,12 @@ inline void onDeath(long long dt, float deathX) {
                         : "dpsolve:   [coin] ended at a missed coin - a death for the ladder and the "
                           "fixups, but not for the phantom veto");
     }
-    else
+    else {
         checkPhantom(postScored ? physDt : dt, postScored ? (double)physX : (double)deathX,
                      wasWedged || sameDeaths >= 8,
                      sameDeaths >= 8 || repeatSame);
+        checkVoidRun(dt, (double)deathX);   // cfg voidband
+    }
     // A wedge IS the signature the missed-portal hint waits for -- a run alive past a mode
     // portal in a mode the section was not built for, frozen instead of killed -- so the hint
     // fires here directly instead of waiting the hours it takes the ladder to exhaust every
@@ -7433,6 +8184,7 @@ inline void onDeath(long long dt, float deathX) {
         g_triedWholeLevel = false;   // a new wall gets its own whole-level try (step mode)
         g_bestDeath = dt;
         g_bestDeathX = deathX;
+        if (g_voidDt == dt) voidDeeper("is");   // cfg voidband: this death closed its run
         // cfg routeprereq: the new wall's box, or none (a wall that is the coin's own, or no coin's).
         if (g_cfg.routePrereq && g_routeNeedUid != deathNeed) {
             snprintf(b, sizeof(b), deathNeed >= 0
@@ -7674,6 +8426,28 @@ inline void onDeath(long long dt, float deathX) {
         else if (g_cfg.dpSecRent && g_autoWallWork >= autoRungEstimate())
             snprintf(why, sizeof(why), "%.1f s-equiv of work spent (a rung is ~%.1f, %d measured)",
                      g_autoWallWork / 1e6, autoRungEstimate() / 1e6, g_autoRungN);
+        // cfg dpunseenfirst: the doors before the rung. SubZero 4002 t=13,884: the rent fired a
+        // section solve after the third round at the wall (EXHAUSTED); one round later the stall
+        // rule turned on the unseen doors (kStallToUnseen) and the next solve walked past the wall.
+        if (why[0] && g_cfg.dpUnseenFirst && g_cfg.dpWorld && !g_needUnseen && !g_secReqPending) {
+            g_needUnseen = true;
+            writeResult(std::string("dpsolve:   [secauto] ") + why + " - the doors the search has "
+                        "not entered first, then the rung (cfg dpunseenfirst)");
+            why[0] = 0;
+        }
+        // cfg dpsecrecaway: this round died away from the wall the rung is for -- record this death
+        // first (the job), then the rung (poll), as dpsecsolved does. Fired from here, the rung
+        // returns before the job is spawned and the death is never recorded.
+        if (why[0] && g_cfg.dpSecRecAway && !g_secReqPending && g_lastDeathPhys >= 0
+            && g_lastDeathPhys + kAutoCreep < rungWall()) {
+            g_autoRecordThenRung = true;
+            g_autoRecordWhy = why;
+            writeResult(std::string("dpsolve:   [secauto] ") + why + " at the wall t="
+                        + std::to_string(rungWall()) + ", but this round died at t="
+                        + std::to_string(g_lastDeathPhys)
+                        + " - recording it first, then the rung (cfg dpsecrecaway)");
+            why[0] = 0;
+        }
         if (why[0] && autoFire(why)) return;
         // cfg dpsecsolved: the plan reached the end in the model and died at the deepest wall.
         // Its recorder runs as usual -- the records say where the divergence starts, which is
@@ -7681,6 +8455,7 @@ inline void onDeath(long long dt, float deathX) {
         if (g_cfg.dpSecSolved && flownClaimedGoal && !coinMiss && !g_secReqPending
             && dt >= g_bestDeath - kAutoCreep && !autoTried()) {
             g_autoRecordThenRung = true;
+            g_autoRecordWhy.clear();
             writeResult("dpsolve:   [secauto] a plan that reached the end died at t="
                         + std::to_string(dt) + " - recording, then a section solve");
         }
@@ -7764,14 +8539,12 @@ inline void finishDeepRecord(const char* why) {
     // A near-empty recording is worse than none: it would become a base layer asserting that
     // everything is where it started.
     if (r.rows >= 100) {
-        std::error_code ec;
-        std::filesystem::copy_file(std::string(DATA_DIR) + "/grouptrace_last.txt", dst,
-                                   std::filesystem::copy_options::overwrite_existing, ec);
+        const bool copied = copyRecording(std::string(DATA_DIR) + "/grouptrace_last.txt", dst);
         snprintf(b, sizeof(b), "dpsolve:   %s (%s): %lld samples to t=%lld - %s",
-                 what, why, r.rows, r.depth, ec ? "COPY FAILED" : "adopted");
+                 what, why, r.rows, r.depth, copied ? "adopted" : "COPY FAILED");
         // cfg groupsretime: this pass's own clock, from the rows the anchor recorder took while it
         // ran (nothing banks them: a no-death pass never reaches onDeath).
-        if (!ec && g_cfg.groupsRetime) {
+        if (copied && g_cfg.groupsRetime) {
             std::vector<float>& x = (kind == RecBootstrap) ? g_groupsBootX : g_groupsDeepX;
             x.assign(anchors::g_live.size(), std::numeric_limits<float>::quiet_NaN());
             for (size_t t = 0; t < anchors::g_live.size(); ++t)
@@ -8000,6 +8773,12 @@ inline void tidyPlayerModes() {
 // own completion path, so nothing is touched here beyond raising the flag -- the restart happens
 // at a frame boundary in poll(), the rule every level change in this file follows.
 inline bool onCleared() {
+    // The run is told the flight cleared (dp_bridge runVerified), whatever the show does next.
+    {
+        std::vector<std::pair<long long, int>> fe;
+        for (const InputCmd& c : g_plan) fe.emplace_back((long long)c.step, c.down ? 1 : 0);
+        writeResult(dpbridge::runVerified(fe, -1, (double)g_hudVerifiedX, true, -1));
+    }
     if (!wantsShow()) return false;
     g_dpShowSolution = true;   // badge -> REPLAY, audio stops being silenced
     g_showRequest = true;
@@ -8192,6 +8971,12 @@ inline void poll() {
         secsolve::g_spineUntil = g_secRung ? g_secReqSpineUntil : -1;
         g_secReqSpineUntil = -1;
         g_secCpRedo = g_secRung && g_secReqForceCp;
+        secsolve::g_wsnapForce = g_secRung && g_secReqForceWsnap;
+        if (g_secReqForceWsnap) {
+            g_secReqForceWsnap = false;
+            writeResult("secrung: this window again with its wsnap set - the plain snapshot search "
+                        "found nothing (cfg secwsnapgate)");
+        }
         if (g_secReqForceCp) {
             g_secReqForceCp = false;
             secsolve::g_snapMode = 0;      // checkpoints; the next ordinary rung puts psnap back
@@ -8305,10 +9090,14 @@ inline void poll() {
                         + std::to_string(g_secPin));
             g_secPin = -1;
         }
-        // cfg dpsecsolved: the job recorded the death and left the wall to a section solve.
+        // cfg dpsecsolved (and dpsecrecaway): the job recorded the death and left the wall to a
+        // section solve.
         if (g_autoRecordThenRung) {
             g_autoRecordThenRung = false;
-            if (autoFire("a plan that reached the end died")) return;
+            const std::string why = g_autoRecordWhy.empty() ? std::string("a plan that reached the end died")
+                                                            : g_autoRecordWhy;
+            g_autoRecordWhy.clear();
+            if (autoFire(why.c_str())) return;
             if (g_secReqPending) return;   // a command's section solve is queued and takes over
         }
         // Before conceding: everything that changes how the search is set up gets a turn.

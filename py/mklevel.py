@@ -6231,6 +6231,837 @@ def build_route2() -> str:
     return header() + ";" + ";".join(objs) + ";"
 
 
+# ---- spider pad (id 3005, GameObjectType 44) --------------------------------
+#
+# What GD does with one (2.2081; the reading is in the commit that added this rig):
+# collisionCheckObjects sends type 44 to the same block as the yellow / pink / red
+# pads, GJBaseGameLayer::bumpPlayer (0x2179d0) at bumpMod 1.0, and only the player
+# side tells them apart. PlayerObject::bumpPlayer (0x39f6a0), type 44: when the
+# pad's facing (isFacingDown, or isFacingLeft with sideways gravity) differs from
+# the player's gravity it first flips the gravity (noEffects), then runs
+# spiderTestJumpInternal(false) -- the spider's own teleport to the surface on the
+# other side -- and the same event and rotation set as spiderTestJump. The gate is
+# canBeActivatedByPlayer: once per player per attempt unless the pad is Multi
+# Activate. This rig produces those situations one at a time; the probe injects
+# x / y / vy before each pad.
+SPIDER_PAD = 3005
+SP_PITCH = 30 * GRID          # one unit; nothing of one reaches the next
+SP_CEIL_BOTTOM = GROUND_TOP + 4 * GRID   # a 120 px corridor: floor 90, ceiling 210
+# Every portal goes in twice, at 105 and at 195: one copy for a player on the
+# floor, one for a player under the ceiling, at either size. A single copy at
+# the corridor's middle (112..187 for a 75 px portal) misses a mini player at
+# rest on either surface (90..108 / 192..210) -- the first run of this rig lost
+# its mini units that way.
+SP_PORTAL_YS = (GROUND_TOP + 15.0, SP_CEIL_BOTTOM - 15.0)
+
+
+def spiderpad_unit(x: float, mode: str, mini: bool, flip: bool, where: str,
+                   rot: float, fy: bool, ceil: bool = True,
+                   floor_blocks: bool = False, blocks_first: bool = False
+                   ) -> tuple[list[str], float, dict]:
+    """One spider pad, met with no input.
+
+    Every unit starts by putting the player in a known state, whatever the last
+    one left: normal gravity (a teleport ends upside down on the ceiling), the
+    unit's mode, its size, and -- when `flip` -- the inverting gravity portal,
+    after which the player rides the ceiling. The pad sits on the floor (`where`
+    = "floor") or under the ceiling ("ceil"), turned by `rot` and flipped by `fy`.
+    `ceil=False` leaves the corridor open above the pad: no surface for the
+    teleport to find.
+
+    Where the teleport lands, and on which tick, may depend on what it lands on
+    and on where that object comes in the collision pass the pad fires from:
+    `floor_blocks` lays blocks flush with the world ground (top 90) under the
+    pad's stretch, and `blocks_first` writes the unit's blocks ahead of the pad
+    in the level string instead of after it.
+    """
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+        if flip:
+            objs.append(obj(GRAV_FLIP, x + 6 * GRID, py))
+    x_pad = x + 14 * GRID
+    y_pad = GROUND_TOP + 5.0 if where == "floor" else SP_CEIL_BOTTOM - 5.0
+    pad = [obj(SPIDER_PAD, x_pad, y_pad, rot=rot, flip_y=fy)]
+    blocks: list[str] = []
+    if ceil:
+        cx = x
+        while cx < x + SP_PITCH:
+            blocks.append(obj(BLOCK, cx, SP_CEIL_BOTTOM + GRID / 2))
+            cx += GRID
+    if floor_blocks:
+        blocks += floor_run(x_pad - 6 * GRID, x_pad + 6 * GRID)
+    objs += (blocks + pad) if blocks_first else (pad + blocks)
+    meta = {"x0": x, "x1": x + SP_PITCH, "mode": mode, "mini": int(mini),
+            "flip": int(flip), "where": where, "rot": rot, "fy": int(fy),
+            "ceil": int(ceil), "floor_blocks": int(floor_blocks),
+            "blocks_first": int(blocks_first), "pad_x": x_pad, "pad_y": y_pad,
+            "floor_top": GROUND_TOP, "ceil_bottom": SP_CEIL_BOTTOM,
+            "t_pad": tick_at(x_pad)}
+    return objs, x + SP_PITCH, meta
+
+
+def build_spiderpad() -> str:
+    """Spider pad rig: the facing cases with a cube, every mode, mini, and a pad
+    with nothing above it (last, as it may leave the player anywhere)."""
+    units = [
+        # mode, mini, flip, where, rot, fy
+        ("cube", False, False, "floor", 0.0, False),     # facing up, normal gravity
+        ("cube", False, True, "ceil", 180.0, False),     # facing down, upside down
+        ("cube", False, False, "floor", 0.0, True),      # flipY: facing down, gravity flipped first
+        ("cube", False, True, "ceil", 180.0, True),      # 180 + flipY: facing up, flipped first
+        ("cube", False, False, "floor", 180.0, False),   # turned 180 on the floor: facing down
+        ("cube", False, False, "floor", 170.0, False),   # off the quarter turn, inside [91,269]
+        ("cube", False, False, "floor", 10.0, False),    # off the quarter turn, outside it
+        ("ship", False, False, "floor", 0.0, False),
+        ("ball", False, False, "floor", 0.0, False),
+        ("ufo", False, False, "floor", 0.0, False),
+        ("wave", False, False, "floor", 0.0, False),
+        ("robot", False, False, "floor", 0.0, False),
+        ("spider", False, False, "floor", 0.0, False),
+        ("swing", False, False, "floor", 0.0, False),
+        ("cube", True, False, "floor", 0.0, False),
+        ("ship", True, False, "floor", 0.0, False),
+        ("cube", True, True, "ceil", 180.0, False),
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for mode, mini, flip, where, rot, fy in units:
+        u, x, meta = spiderpad_unit(x, mode, mini, flip, where, rot, fy)
+        objs += u
+        UNITS.append(meta)
+    # The landing surface and its place in the collision pass: up onto a ceiling
+    # written ahead of the pad; down onto a floor of blocks written after it, and
+    # ahead of it.
+    for mode, mini, flip, where, rot, fy, fb, first in (
+            ("cube", False, False, "floor", 0.0, False, False, True),
+            ("cube", False, True, "ceil", 180.0, False, True, False),
+            ("cube", False, True, "ceil", 180.0, False, True, True)):
+        u, x, meta = spiderpad_unit(x, mode, mini, flip, where, rot, fy,
+                                    floor_blocks=fb, blocks_first=first)
+        objs += u
+        UNITS.append(meta)
+    u, x, meta = spiderpad_unit(x, "cube", False, False, "floor", 0.0, False, ceil=False)
+    objs += u
+    UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Gravity toggle portal (id 2926, GameObjectType 42) --------------------
+# Read from the binary (GJBaseGameLayer::collisionCheckObjects 0x214960, jump
+# table 0x215fe0, type 42 -> 0x214dc1): the same block as the two gravity
+# portals (type 3 -> 0x214c47, type 4 -> 0x214d04) -- the canBeActivatedByPlayer
+# gate, the portal position kept, flipGravity, the activated mark, an event --
+# except that the gravity it asks for is the opposite of the player's
+# upside-down byte (+0x9bf) at the moment it fires. Nothing reads its facing.
+# So two toggles touched on the same tick should cancel, and a toggle fires once
+# per attempt like any portal without Multi Activate. Its hitbox is 23.75 x 75.5
+# (objrects of the custom levels holding one).
+GRAV_TOGGLE = 2926
+GT_H = 75.5
+GT_PITCH = 30 * GRID
+
+
+def gravtoggle_unit(x: float, mode: str, mini: bool, flip: bool, where: str,
+                    rot: float = 0.0, fy: bool = False, second: str = "",
+                    reenter: bool = False) -> tuple[list[str], float, dict]:
+    """One gravity toggle, met with no input.
+
+    The preamble puts the player in a known state (normal gravity, the unit's
+    mode and size, and the inverting portal when `flip`), as in the spider pad
+    rig. The toggle stands on the floor (`where` = "floor") or hangs from the
+    ceiling ("ceil"). `second` adds another toggle: "same" at the same place
+    (both touched on one tick), "near" 6 px further on (a few ticks later), and
+    "far" eight blocks on at the other surface (after the player has crossed
+    the corridor). `reenter` turns the toggle on its side, low on the floor, with
+    a normal-gravity portal (also on its side) above it, so the player leaves the
+    toggle upward, is turned back, and falls into it again while still inside
+    its x span.
+    """
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+        if flip:
+            objs.append(obj(GRAV_FLIP, x + 6 * GRID, py))
+    x_t = x + 14 * GRID
+    if reenter:
+        # On its side the toggle is 75.5 wide and 23.75 tall: floor 90 .. 113.75.
+        y_t = GROUND_TOP + 23.75 / 2
+        objs.append(obj(GRAV_TOGGLE, x_t, y_t, rot=90.0))
+        # The turning portal's bottom edge at 145: a cube (30) touching it has
+        # its bottom at 130, clear of the toggle's top.
+        objs.append(obj(GRAV_NORM, x_t, 145.0 + 12.5, rot=90.0))
+    else:
+        y_t = GROUND_TOP + GT_H / 2 if where == "floor" else SP_CEIL_BOTTOM - GT_H / 2
+        objs.append(obj(GRAV_TOGGLE, x_t, y_t, rot=rot, flip_y=fy))
+    x_2 = None
+    if second == "same":
+        x_2 = x_t
+        objs.append(obj(GRAV_TOGGLE, x_2, y_t))
+    elif second == "near":
+        x_2 = x_t + 6.0
+        objs.append(obj(GRAV_TOGGLE, x_2, y_t))
+    elif second == "far":
+        x_2 = x_t + 8 * GRID
+        y_2 = SP_CEIL_BOTTOM - GT_H / 2 if where == "floor" else GROUND_TOP + GT_H / 2
+        objs.append(obj(GRAV_TOGGLE, x_2, y_2))
+    if mode == "wave":
+        # A wave dies on the ceiling's blocks (the first run of this rig ended
+        # there, t=5479), so its unit has no ceiling: a normal-gravity portal
+        # high up turns it back down to the world floor.
+        objs.append(obj(GRAV_NORM, x_t + 5 * GRID, 300.0))
+    else:
+        cx = x
+        while cx < x + GT_PITCH:
+            objs.append(obj(BLOCK, cx, SP_CEIL_BOTTOM + GRID / 2))
+            cx += GRID
+    meta = {"x0": x, "x1": x + GT_PITCH, "mode": mode, "mini": int(mini),
+            "flip": int(flip), "where": where, "rot": 90.0 if reenter else rot,
+            "fy": int(fy), "second": second, "reenter": int(reenter),
+            "pad_x": x_t, "pad_y": y_t, "x_2": x_2,
+            "floor_top": GROUND_TOP, "ceil_bottom": SP_CEIL_BOTTOM,
+            "t_pad": tick_at(x_t)}
+    return objs, x + GT_PITCH, meta
+
+
+def build_gravtoggle() -> str:
+    """Gravity toggle rig: both directions with a cube, every mode, mini, the
+    facing that should not matter, two toggles at once / in quick succession /
+    in a row, and a toggle entered twice."""
+    units = [
+        # mode, mini, flip, where, rot, fy, second, reenter
+        ("cube", False, False, "floor", 0.0, False, "", False),    # normal -> upside down
+        ("cube", False, True, "ceil", 0.0, False, "", False),      # upside down -> normal
+        ("ship", False, False, "floor", 0.0, False, "", False),
+        ("ship", False, True, "ceil", 0.0, False, "", False),
+        ("ball", False, False, "floor", 0.0, False, "", False),
+        ("ball", False, True, "ceil", 0.0, False, "", False),
+        ("ufo", False, False, "floor", 0.0, False, "", False),
+        ("wave", False, False, "floor", 0.0, False, "", False),
+        ("robot", False, False, "floor", 0.0, False, "", False),
+        ("spider", False, False, "floor", 0.0, False, "", False),
+        ("swing", False, False, "floor", 0.0, False, "", False),
+        ("cube", True, False, "floor", 0.0, False, "", False),
+        ("cube", True, True, "ceil", 0.0, False, "", False),
+        ("cube", False, False, "floor", 180.0, False, "", False),  # facing: read by nothing
+        ("cube", False, False, "floor", 0.0, True, "", False),
+        ("cube", False, False, "floor", 0.0, False, "far", False),   # two in a row
+        ("cube", False, False, "floor", 0.0, False, "same", False),  # two on one tick
+        ("cube", False, False, "floor", 0.0, False, "near", False),  # two, a few ticks apart
+        ("cube", False, False, "floor", 0.0, False, "", True),       # entered twice
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for mode, mini, flip, where, rot, fy, second, reenter in units:
+        u, x, meta = gravtoggle_unit(x, mode, mini, flip, where, rot, fy, second, reenter)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Teleport trigger (id 3022) --------------------------------------------
+# Read from the binary: EffectGameObject::triggerObject (0x4a5f30) sends id 3022
+# to GJBaseGameLayer::teleportPlayer (0x20fdb0) with no player, which then
+# takes m_player1. With no linked exit it moves the player to the target
+# group's object (a random one when there are several), keeps x / y under
+# m_ignoreX (352) / m_ignoreY (353), adds (player - trigger) under
+# m_saveOffset (351), and sets gravity by m_gravityMode (354: 1 normal,
+# 2 flipped, 3 toggle). Unlike the portals it leaves no activated mark.
+# The target here is a Spawn trigger with no target of its own: it holds a
+# position, does not collide, and crossing it does nothing.
+TELEPORT_TRIG = 3022
+TP_MARK = 1268
+TP_PITCH = 30 * GRID
+TP_CEIL_BOTTOM = 330.0
+K_SAVE_OFFSET, K_IGNORE_X, K_IGNORE_Y, K_GRAV_MODE = 351, 352, 353, 354
+K_STATIC_FORCE_ON, K_STATIC_FORCE = 345, 346
+
+
+def teleporttrig_unit(x: float, i: int, mode: str = "cube", mini: bool = False,
+                      flip: bool = False, ty: float = 300.0, dx: float = 0.0,
+                      ignx: bool = False, igny: bool = False, grav: int = 0,
+                      save: bool = False, trig_y: float = 105.0, force: float = 0.0,
+                      chain_ty: float | None = None) -> tuple[list[str], float, dict]:
+    """One teleport trigger, met with no input, on a paved floor with no ceiling.
+
+    The preamble puts the player in a known state (normal gravity, mode, size,
+    and the inverting portal when `flip`). The trigger stands at x0 + 14 blocks
+    at `trig_y` (it fires on the x crossing, so its height only matters to
+    m_saveOffset); its target is `dx` further on at height `ty`. `chain_ty` adds a
+    second trigger 40 px later aiming at that height, to catch the player while
+    it falls from the first.
+    """
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+        if flip:
+            objs.append(obj(GRAV_FLIP, x + 6 * GRID, py))
+    objs += floor_run(x, x + TP_PITCH - GRID)
+    x_t = x + 14 * GRID
+    g = 100 + 2 * i
+    props: dict[int, str] = {K_TARGET: str(g)}
+    if ignx:
+        props[K_IGNORE_X] = "1"
+    if igny:
+        props[K_IGNORE_Y] = "1"
+    if grav:
+        props[K_GRAV_MODE] = str(grav)
+    if save:
+        props[K_SAVE_OFFSET] = "1"
+    if force:
+        props[K_STATIC_FORCE_ON] = "1"
+        props[K_STATIC_FORCE] = f"{force:g}"
+    objs.append(obj(TELEPORT_TRIG, x_t, trig_y, extra=props))
+    objs.append(obj(TP_MARK, x_t + dx, ty, extra={K_GROUPS: str(g)}))
+    x_2 = None
+    if chain_ty is not None:
+        x_2 = x_t + 40.0
+        objs.append(obj(TELEPORT_TRIG, x_2, trig_y, extra={K_TARGET: str(g + 1)}))
+        objs.append(obj(TP_MARK, x_2, chain_ty, extra={K_GROUPS: str(g + 1)}))
+    ceil = flip or grav in (2, 3)
+    if ceil:
+        # An upside-down body needs something to rest under (ceiling bottom 330), and the next
+        # unit's preamble portals (105 / 195) cannot reach it there: normal gravity comes back
+        # at the unit's end, at three heights.
+        cx = x
+        while cx < x + TP_PITCH:
+            objs.append(obj(BLOCK, cx, TP_CEIL_BOTTOM + GRID / 2))
+            cx += GRID
+        for py in (105.0, 195.0, 285.0):
+            objs.append(obj(GRAV_NORM, x + TP_PITCH - 2 * GRID, py))
+    meta = {"x0": x, "x1": x + TP_PITCH, "mode": mode, "mini": int(mini), "flip": int(flip),
+            "ceil_bottom": TP_CEIL_BOTTOM if ceil else None,
+            "pad_x": x_t, "trig_y": trig_y, "target": [x_t + dx, ty], "dx": dx,
+            "ignx": int(ignx), "igny": int(igny), "grav": grav, "save": int(save),
+            "force": force, "x_2": x_2, "chain_ty": chain_ty, "t_pad": tick_at(x_t)}
+    return objs, x + TP_PITCH, meta
+
+
+def build_teleporttrig() -> str:
+    """Teleport trigger rig: up into the air in every mode, sideways with and
+    without ignoreX, straight up (does x snap back to the target's?), ignoreY,
+    the three gravity modes, saveOffset, a static force, and a second trigger
+    caught in the fall."""
+    units = [
+        dict(),                                   # cube, straight up to 300
+        dict(dx=60.0),                            # sideways, x not kept
+        dict(dx=60.0, ignx=True),                 # sideways, x kept
+        dict(igny=True),                          # y kept: only the x part, which is 0
+        dict(flip=True, grav=1, ty=150.0),        # upside down -> forced normal
+        dict(grav=2, ty=150.0),                   # forced upside down
+        dict(grav=3, ty=150.0),                   # toggle
+        dict(save=True, trig_y=45.0),             # + (player - trigger) = +60 in y
+        dict(force=10.0),                         # static force 10
+        dict(chain_ty=200.0),                     # caught again while falling
+        dict(mode="ship"), dict(mode="ball"), dict(mode="ufo"), dict(mode="wave"),
+        dict(mode="robot"), dict(mode="spider"), dict(mode="swing"),
+        dict(mini=True),
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for i, kw in enumerate(units):
+        u, x, meta = teleporttrig_unit(x, i, **kw)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Teleport portal velocity (2902 / 747) ---------------------------------
+# Read from the binary: after the move, GJBaseGameLayer::teleportPlayer
+# (0x20fdb0) sets the player's velocity from the portal's force. A redirected
+# force (347; mod 350, min 348, max 349) goes to PlayerObject::redirectPlayerForce
+# (0x39fc60); otherwise a static force (345, strength 346) sets vy to the force
+# along a direction, or adds it with 443; a static force of 0 that does not add
+# stops the player. The direction comes from the exit: (exit flipped in x ? 180 :
+# 0) + (a portal-like exit ? 180 : 90) - the exit's rotation, in degrees. Each
+# unit runs one 2902 (or 747) at the player's height, no input, and lands it at a
+# marker, as the 3022 rig does; a `chain` unit adds a second portal that keeps x
+# and y (352, 353) a little further on, met while falling, so that only its
+# velocity shows.
+TP_PORTAL, TP_PORTAL_OLD = 2902, 747
+K_REDIRECT_ON, K_REDIRECT_MIN, K_REDIRECT_MAX, K_REDIRECT_MOD = 347, 348, 349, 350
+K_FORCE_ADD, K_TP_YOFFSET, K_NO_TOUCH = 443, 54, 121
+
+
+def tpportal_unit(x: float, i: int, mode: str = "cube", mini: bool = False,
+                  flip: bool = False, ty: float = 200.0, kind: int = TP_PORTAL,
+                  prot: float = 0.0, yoff: float = 120.0, igny: bool = False,
+                  grav: int = 0, force: float | None = None, add: bool = False,
+                  redirect: tuple[float, float, float] | None = None,
+                  exit_kind: str = "mark", exit_rot: float = 0.0, exit_fx: bool = False,
+                  two_exits: bool = False, chain: dict | None = None
+                  ) -> tuple[list[str], float, dict]:
+    """One teleport portal 14 blocks in, at the resting player's height, no input.
+
+    `force` is the static force (None: off); `redirect` is (mod, min, max). The
+    exit is a marker (`exit_kind` "mark", a Spawn trigger) or a No Touch 2902
+    ("portal"), at (portal x, `ty`), turned `exit_rot` and flipped in x by
+    `exit_fx`; `two_exits` puts a second marker 60 px above the first in the
+    target group. A 747 (`kind`) uses its own orange half `yoff` above it instead.
+    `chain` gives a second 2902, 60 px on, that keeps x and y: its own force /
+    redirect / exit_rot, met by the player falling from the first one's exit.
+    """
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+        if flip:
+            objs.append(obj(GRAV_FLIP, x + 6 * GRID, py))
+    objs += floor_run(x, x + TP_PITCH - GRID)
+    x_p = x + 14 * GRID
+    g = 400 + 3 * i
+
+    def props_of(force_, add_, redirect_, igny_, ignx_, grav_, target) -> dict[int, str]:
+        p: dict[int, str] = {}
+        if target:
+            p[K_TARGET] = str(target)
+        if igny_:
+            p[K_IGNORE_Y] = "1"
+        if ignx_:
+            p[K_IGNORE_X] = "1"
+        if grav_:
+            p[K_GRAV_MODE] = str(grav_)
+        if force_ is not None:
+            p[K_STATIC_FORCE_ON] = "1"
+            p[K_STATIC_FORCE] = f"{force_:g}"
+            if add_:
+                p[K_FORCE_ADD] = "1"
+        if redirect_ is not None:
+            p[K_REDIRECT_ON] = "1"
+            p[K_REDIRECT_MOD] = f"{redirect_[0]:g}"
+            p[K_REDIRECT_MIN] = f"{redirect_[1]:g}"
+            p[K_REDIRECT_MAX] = f"{redirect_[2]:g}"
+        return p
+
+    # A body at rest on the floor spans 90..120; under the ceiling (bottom 330), 300..330. The
+    # 2902's box is 25x90.
+    py_ = TP_CEIL_BOTTOM - 45.0 if flip else GROUND_TOP + 45.0
+    if kind == TP_PORTAL_OLD and abs(prot) == 90.0:
+        py_ = GROUND_TOP + 20.0   # turned, the box is 90x25: 97.5..122.5
+    if kind == TP_PORTAL_OLD:
+        p = props_of(force, add, redirect, igny, False, grav, 0)
+        p[K_TP_YOFFSET] = f"{yoff:g}"
+        objs.append(obj(TP_PORTAL_OLD, x_p, py_, rot=prot, extra=p))
+    else:
+        # x kept (352), as on lv22's: without it the body goes to the exit's x, 15 px on from
+        # where the portal took it, which the model does not do (x is the search's clock)
+        objs.append(obj(TP_PORTAL, x_p, py_, rot=prot,
+                        extra=props_of(force, add, redirect, igny, True, grav, g)))
+        if exit_kind == "portal":
+            objs.append(obj(TP_PORTAL, x_p, ty, rot=exit_rot, flip_x=exit_fx,
+                            extra={K_GROUPS: str(g), K_NO_TOUCH: "1"}))
+        else:
+            objs.append(obj(TP_MARK, x_p, ty, rot=exit_rot, flip_x=exit_fx,
+                            extra={K_GROUPS: str(g)}))
+        if two_exits:
+            objs.append(obj(TP_MARK, x_p, ty + 60.0, extra={K_GROUPS: str(g)}))
+    x_c = None
+    if chain is not None:
+        # 60 px on, scaled to 25x270 (90..360): the player falls through it from the exit at 200
+        x_c = x_p + 60.0
+        p = props_of(chain.get("force"), chain.get("add", False), chain.get("redirect"),
+                     True, True, 0, g + 1)
+        p[129] = "3"
+        objs.append(obj(TP_PORTAL, x_c, 225.0, extra=p))
+        objs.append(obj(TP_MARK, x_c, 400.0, rot=chain.get("exit_rot", 0.0),
+                        extra={K_GROUPS: str(g + 1)}))
+    ceil = flip or grav in (2, 3)
+    if ceil:
+        cx = x
+        while cx < x + TP_PITCH:
+            objs.append(obj(BLOCK, cx, TP_CEIL_BOTTOM + GRID / 2))
+            cx += GRID
+        for py in (105.0, 195.0, 285.0):
+            objs.append(obj(GRAV_NORM, x + TP_PITCH - 2 * GRID, py))
+    meta = {"x0": x, "x1": x + TP_PITCH, "mode": mode, "mini": int(mini), "flip": int(flip),
+            "ceil_bottom": TP_CEIL_BOTTOM if ceil else None, "pad_x": x_p, "portal_y": py_,
+            "kind": kind, "prot": prot, "yoff": yoff if kind == TP_PORTAL_OLD else None,
+            "target": [x_p, ty], "igny": int(igny), "grav": grav, "force": force, "add": int(add),
+            "redirect": list(redirect) if redirect else None, "exit_kind": exit_kind,
+            "exit_rot": exit_rot, "exit_fx": int(exit_fx), "two_exits": int(two_exits),
+            "chain": chain, "x_chain": x_c, "t_pad": tick_at(x_p)}
+    return objs, x + TP_PITCH, meta
+
+
+def build_tpportal() -> str:
+    """Teleport portal velocity rig: the static force along the exit's direction (a
+    marker turned or flipped, a portal exit, a 747's own half), added or at 0, with
+    the gravity modes, upside down, in every mode and mini; the redirected force;
+    a portal that keeps y; and a target group of two."""
+    units = [
+        dict(),                                                  # 0 no force
+        dict(force=10.0),                                        # 1 marker 0 deg -> +10
+        dict(force=10.0, exit_rot=45.0),                         # 2 -> 10 sin 45
+        dict(force=10.0, exit_rot=-30.0),                        # 3 -> 10 sin 120
+        dict(force=10.0, exit_fx=True),                          # 4 -> 10 sin 270
+        dict(chain=dict(force=10.0, add=True)),                  # 5 added while falling
+        dict(chain=dict(force=0.0)),                             # 6 force 0 while falling
+        dict(force=10.0, exit_kind="portal"),                    # 7 portal exit 0 deg -> 0
+        dict(force=10.0, exit_kind="portal", exit_rot=90.0),     # 8 portal exit 90 -> +10
+        dict(kind=TP_PORTAL_OLD, force=10.0),                    # 9 747, its own half
+        dict(kind=TP_PORTAL_OLD, prot=90.0, force=18.0, grav=1),  # 10 lv22's
+        dict(force=10.0, grav=2, ty=150.0),                      # 11 forced upside down
+        dict(force=10.0, flip=True, ty=150.0),                   # 12 upside down already
+        dict(mode="ship", force=10.0), dict(mode="ball", force=10.0),
+        dict(mode="ufo", force=10.0), dict(mode="wave", force=10.0),
+        dict(mode="robot", force=10.0), dict(mode="spider", force=10.0),
+        dict(mode="swing", force=10.0),
+        dict(mini=True, force=10.0),                             # 20
+        dict(redirect=(1.0, 0.0, 0.0)),                          # 21 on the floor
+        dict(redirect=(1.0, 10.0, 0.0)),                         # 22 min 10
+        dict(chain=dict(redirect=(2.0, 0.0, 0.0))),              # 23 x2 while falling
+        dict(chain=dict(redirect=(1.0, 0.0, 3.0))),              # 24 max 3 while falling
+        dict(chain=dict(redirect=(1.0, 0.0, 0.0), exit_rot=-45.0)),  # 25 to 135 deg
+        dict(igny=True, force=10.0),                             # 26 y kept, pushed
+        dict(igny=True, grav=2),                                 # 27 y kept, flipped
+        dict(kind=TP_PORTAL_OLD, prot=90.0, igny=True, force=10.0),  # 28 747, y kept
+        dict(two_exits=True),                                    # 29 two exits
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for i, kw in enumerate(units):
+        u, x, meta = tpportal_unit(x, i, **kw)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Gravity trigger (id 2066) ---------------------------------------------
+# Read from the binary: EffectGameObject::triggerObject (0x4a5f30, case 0x4a6e1c)
+# writes the trigger's m_gravityValue (148) into the player's m_gravityMod
+# (+0xb84) -- player 1, player 2 or both by m_targetPlayer1 / 2 (138 / 200), or
+# the player that set it off by m_followCPP (201) -- and updateJump (0x38b900)
+# multiplies every mode's gravity by it, the cube's (+0x7c8) and the flying
+# modes' 0.958199 alike. This rig launches the player off a yellow pad after,
+# or across, a gravity trigger and puts the gravity back at the unit's end.
+GRAV_TRIG = 2066
+K_GRAV_VALUE = 148
+GT2_PITCH = 30 * GRID
+GT2_CEIL_BOTTOM = 330.0
+
+
+def gravtrig_unit(x: float, mode: str, mini: bool, value: float, midair: bool = False
+                  ) -> tuple[list[str], float, dict]:
+    """One gravity trigger and a yellow pad, no input, a paved floor and no ceiling.
+
+    The trigger stands 4 blocks before the pad, or, with `midair`, 4 blocks after
+    it, where the body is in the air; a second trigger at the unit's end sets the
+    gravity back to 1.
+    """
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+    objs += floor_run(x, x + GT2_PITCH - GRID)
+    x_pad = x + 12 * GRID
+    x_trig = x_pad + (4 * GRID if midair else -4 * GRID)
+    objs.append(obj(PAD_YELLOW, x_pad, GROUND_TOP + 5.0))
+    objs.append(obj(GRAV_TRIG, x_trig, 200.0, extra={K_GRAV_VALUE: f"{value:g}"}))
+    x_back = x + GT2_PITCH - GRID
+    objs.append(obj(GRAV_TRIG, x_back, 200.0, extra={K_GRAV_VALUE: "1"}))
+    meta = {"x0": x, "x1": x + GT2_PITCH, "mode": mode, "mini": int(mini), "value": value,
+            "midair": int(midair), "pad_x": x_trig, "jump_pad_x": x_pad, "back_x": x_back,
+            "t_pad": tick_at(x_trig)}
+    return objs, x + GT2_PITCH, meta
+
+
+def build_gravtrig() -> str:
+    """Gravity trigger rig: a cube at 0.5, 2 and 0.1, one switched on in the air,
+    every other mode at 0.5, and a mini cube."""
+    units = [
+        ("cube", False, 0.5, False), ("cube", False, 2.0, False), ("cube", False, 0.5, True),
+        ("ship", False, 0.5, False), ("ball", False, 0.5, False), ("ufo", False, 0.5, False),
+        ("robot", False, 0.5, False), ("spider", False, 0.5, False), ("swing", False, 0.5, False),
+        ("wave", False, 0.5, False), ("cube", True, 0.5, False), ("cube", False, 0.1, False),
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for mode, mini, value, midair in units:
+        u, x, meta = gravtrig_unit(x, mode, mini, value, midair)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+def gravtrig2_unit(x: float, mode: str, value: float, hold: int
+                   ) -> tuple[list[str], float, dict]:
+    """A gravity trigger, then a press held `hold` ticks: what the value does to a
+    press -- the ship's and robot's thrust, the UFO's and cube's impulse, the
+    ball's, spider's and swing's gravity flip. The flipping modes get a ceiling
+    (bottom 330) and normal gravity back at the unit's end, at three heights."""
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_NORM, x + 4 * GRID, py))
+    objs += floor_run(x, x + GT2_PITCH - GRID)
+    x_trig = x + 8 * GRID
+    objs.append(obj(GRAV_TRIG, x_trig, 200.0, extra={K_GRAV_VALUE: f"{value:g}"}))
+    x_press = x + 12 * GRID
+    t_press = tick_at(x_press)
+    PLAN.append((t_press, 1))
+    PLAN.append((t_press + hold, 0))
+    flips = mode in ("ball", "spider", "swing")
+    if flips:
+        cx = x
+        while cx < x + GT2_PITCH:
+            objs.append(obj(BLOCK, cx, GT2_CEIL_BOTTOM + GRID / 2))
+            cx += GRID
+        for py in (105.0, 195.0, 285.0):
+            objs.append(obj(GRAV_NORM, x + GT2_PITCH - 3 * GRID, py))
+    x_back = x + GT2_PITCH - GRID
+    objs.append(obj(GRAV_TRIG, x_back, 200.0, extra={K_GRAV_VALUE: "1"}))
+    meta = {"x0": x, "x1": x + GT2_PITCH, "mode": mode, "value": value, "hold": hold,
+            "pad_x": x_trig, "press_x": x_press, "t_press": t_press, "back_x": x_back,
+            "ceil_bottom": GT2_CEIL_BOTTOM if flips else None, "t_pad": tick_at(x_trig)}
+    return objs, x + GT2_PITCH, meta
+
+
+def build_gravtrig2() -> str:
+    """Gravity trigger rig with presses: the ship held at 1 and at 0.5, the robot
+    held, a UFO and a cube tapped, the ball, spider and swing flipped, the wave
+    held."""
+    units = [
+        ("ship", 1.0, 60), ("ship", 0.5, 60), ("robot", 0.5, 30), ("ufo", 0.5, 3),
+        ("cube", 0.5, 3), ("ball", 0.5, 3), ("spider", 0.5, 3), ("swing", 0.5, 3),
+        ("wave", 0.5, 20),
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for mode, value, hold in units:
+        u, x, meta = gravtrig2_unit(x, mode, value, hold)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Teleport orb (id 3027) ------------------------------------------------
+# Read from the binary: PlayerObject::ringJump (0x398c00) sends a ring of
+# GameObjectType 46 to GJBaseGameLayer::teleportPlayer (0x20fdb0) with the
+# player that pressed it -- the 3022 path, but for that player and on a press --
+# and skips every other ring effect. collisionCheckObjects hands type 46 to
+# playerTouchedRing like any ring (0x215a42) and then reads the player's box
+# again (0x215e78). Each unit puts one orb in the player's path at floor height,
+# presses inside it (or holds through it), and sends the player to a Spawn
+# trigger marker, as the 3022 rig does.
+TELEPORT_ORB = 3027
+
+
+def teleportorb_unit(x: float, i: int, mode: str = "cube", mini: bool = False,
+                     flip: bool = False, ty: float = 200.0, dx: float = 0.0,
+                     ignx: bool = False, igny: bool = False, grav: int = 0,
+                     hold_through: bool = False, press_len: int = 3
+                     ) -> tuple[list[str], float, dict]:
+    """One teleport orb at floor height 14 blocks in, pressed 12 px past its
+    centre's x minus the contact distance (3 ticks), or with `hold_through` held
+    from 20 px before contact for 40 ticks; its target is `dx` further on at `ty`."""
+    objs: list[str] = []
+    for py in SP_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_MINI if mini else SIZE_NORM, x + 4 * GRID, py))
+        if flip:
+            objs.append(obj(GRAV_FLIP, x + 6 * GRID, py))
+    objs += floor_run(x, x + TP_PITCH - GRID)
+    x_o = x + 14 * GRID
+    oy = TP_CEIL_BOTTOM - 15.0 if flip else GROUND_TOP + 15.0
+    g = 300 + i
+    props: dict[int, str] = {K_TARGET: str(g)}
+    if ignx:
+        props[K_IGNORE_X] = "1"
+    if igny:
+        props[K_IGNORE_Y] = "1"
+    if grav:
+        props[K_GRAV_MODE] = str(grav)
+    objs.append(obj(TELEPORT_ORB, x_o, oy, extra=props))
+    objs.append(obj(TP_MARK, x_o + dx, ty, extra={K_GROUPS: str(g)}))
+    contact = 18.0 + (9.0 if mini else 15.0)
+    if hold_through:
+        tp = tick_at(x_o - contact - 20.0)
+        PLAN.append((tp, 1))
+        PLAN.append((tp + 40, 0))
+    else:
+        tp = tick_at(x_o - contact + 12.0)
+        PLAN.append((tp, 1))
+        PLAN.append((tp + press_len, 0))
+    # Every unit has the ceiling and normal gravity back at its end: a press still held after the
+    # teleport flips a ball or a spider (measured), and a body left upside down with nothing above
+    # it misses every later unit's preamble.
+    cx = x
+    while cx < x + TP_PITCH:
+        objs.append(obj(BLOCK, cx, TP_CEIL_BOTTOM + GRID / 2))
+        cx += GRID
+    for py in (105.0, 195.0, 285.0):
+        objs.append(obj(GRAV_NORM, x + TP_PITCH - 2 * GRID, py))
+    meta = {"x0": x, "x1": x + TP_PITCH, "mode": mode, "mini": int(mini), "flip": int(flip),
+            "ceil_bottom": TP_CEIL_BOTTOM, "orb": [x_o, oy],
+            "target": [x_o + dx, ty], "dx": dx, "ignx": int(ignx), "igny": int(igny), "grav": grav,
+            "hold_through": int(hold_through), "press_len": 40 if hold_through else press_len,
+            "t_press": tp, "t_pad": tick_at(x_o - contact)}
+    return objs, x + TP_PITCH, meta
+
+
+def build_teleportorb() -> str:
+    """Teleport orb rig: up into the air from a cube, sideways with and without
+    ignoreX, ignoreY, forced-flipped and toggled gravity, a press held through the
+    orb, every other mode, and a mini cube."""
+    # The units that move x on purpose come last: a teleport snaps x to the target's, so every
+    # later unit meets its orb at another tick (press ticks come from a measured --xmap run).
+    units = [
+        dict(),                                   # cube, straight up to 200
+        dict(igny=True),                          # y kept: only the x part, which is 0
+        dict(grav=2, ty=150.0),                   # forced upside down
+        dict(grav=3, ty=150.0),                   # toggle
+        dict(hold_through=True),                  # held into the orb
+        dict(mode="ship"), dict(mode="ball"), dict(mode="ufo"), dict(mode="wave"),
+        dict(mode="robot"), dict(mode="spider"), dict(mode="swing"),
+        dict(mini=True),
+        dict(press_len=1),                        # released on the teleport tick
+        dict(press_len=2),                        # released on the tick after it
+        dict(dx=60.0, ignx=True),                 # sideways, x kept
+        dict(dx=60.0),                            # sideways, x not kept
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for i, kw in enumerate(units):
+        u, x, meta = teleportorb_unit(x, i, **kw)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Follow Player Y (id 1814) ---------------------------------------------
+# Read from the binary: GJBaseGameLayer::processPlayerFollowActions (0x22ded0),
+# called once a tick from processMoveActionsStep before the player moves, adds
+# clamp(dt*60*speed, 0, 1) * (player 1's y + offset - the object's y) to every
+# object of the target group, cut to +-dt*60*max when a max is set; with a delay
+# the target is the player's y that long ago, from a 200-slot ring the update
+# loop advances every 0.01 s. Each unit fires one 1814 at its start and puts a
+# marker of the target group behind the trigger, where the player never touches
+# it; grouptrace=1 records where the marker goes. The keys are the bindings'
+# property numbers: 90 speed, 91 delay, 92 offset, 105 max speed.
+FOLLOW_Y = 1814
+K_FY_SPEED, K_FY_DELAY, K_FY_OFFSET, K_FY_MAX = 90, 91, 92, 105
+FY_MARK = 201          # a 1x speed portal: grouptrace tracks it, and the player is at 1x
+FY_PITCH = 30 * GRID
+FY_PORTAL_YS = (105.0, 195.0, 285.0, 375.0)
+
+
+def followy_unit(x: float, i: int, mode: str = "cube", speed: float = 1.0,
+                 delay: float = 0.0, offset: int = 0, vmax: float = 0.0,
+                 presses: tuple[tuple[int, int], ...] = ((4, 3), (12, 3)),
+                 marks: tuple[float, ...] = (105.0,), portal: str | None = None,
+                 portal_y: float = 300.0) -> tuple[list[str], float, dict]:
+    """One 1814 fired on crossing, its group's markers behind it, and presses at
+    (cells after the trigger, ticks held). With `portal`, a mode portal of that
+    kind joins the group 16 cells ahead, starting at `portal_y`."""
+    objs: list[str] = []
+    for py in FY_PORTAL_YS:
+        objs.append(obj(GRAV_NORM, x, py))
+        objs.append(obj(MODE_PORTAL[mode], x + 2 * GRID, py))
+        objs.append(obj(SIZE_NORM, x + 4 * GRID, py))
+    objs += floor_run(x, x + FY_PITCH - GRID)
+    x_t = x + 8 * GRID
+    g = 200 + i
+    # 2 s: over within the unit (480 ticks, 623 px at 1x), so each unit's trigger runs alone
+    props: dict[int, str] = {K_TARGET: str(g), K_DURATION: "2", K_FY_SPEED: f"{speed:g}"}
+    if delay:
+        props[K_FY_DELAY] = f"{delay:g}"
+    if offset:
+        props[K_FY_OFFSET] = str(offset)
+    if vmax:
+        props[K_FY_MAX] = f"{vmax:g}"
+    objs.append(obj(FOLLOW_Y, x_t, 200.0, extra=props))
+    for k, my in enumerate(marks):
+        objs.append(obj(FY_MARK, x_t - (2 + k) * GRID, my, extra={K_GROUPS: str(g)}))
+    x_p = None
+    if portal:
+        x_p = x_t + 16 * GRID
+        objs.append(obj(MODE_PORTAL[portal], x_p, portal_y, extra={K_GROUPS: str(g)}))
+    t_trig = tick_at(x_t)
+    for cells, hold in presses:
+        tp = tick_at(x_t + cells * GRID)
+        PLAN.append((tp, 1))
+        PLAN.append((tp + hold, 0))
+    meta = {"x0": x, "x1": x + FY_PITCH, "mode": mode, "group": g, "speed": speed,
+            "delay": delay, "offset": offset, "vmax": vmax, "dur": 2, "trig_x": x_t,
+            "marks": [[x_t - (2 + k) * GRID, my] for k, my in enumerate(marks)],
+            "portal": portal, "portal_x": x_p, "portal_y": portal_y if portal else None,
+            "presses": [list(p) for p in presses], "t_pad": t_trig}
+    return objs, x + FY_PITCH, meta
+
+
+def build_followy() -> str:
+    """Follow Player Y rig: speed 1 (a quarter of the gap a tick at 240 ticks/s)
+    under a jumping cube and a flying ship, speed 0.5 with an offset, a max speed,
+    a delay, speed 10 (clamped to the whole gap), a cube portal that follows a
+    flying ship, and two markers starting apart."""
+    ship = ((2, 40), (10, 30), (16, 30))
+    units = [
+        dict(),
+        dict(mode="ship", presses=ship),
+        dict(speed=0.5, offset=30),
+        dict(vmax=1.0),
+        dict(delay=0.1),
+        dict(speed=10.0),
+        dict(mode="ship", presses=ship, portal="cube"),
+        dict(marks=(300.0, 60.0)),
+    ]
+    objs: list[str] = []
+    x = 300.0
+    for i, kw in enumerate(units):
+        u, x, meta = followy_unit(x, i, **kw)
+        objs += u
+        UNITS.append(meta)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+# --- Gameplay rotation and the velocity-limit exemption (id 2900, property 585) -------------------
+# rotateGameplay swaps the axes when the vertical/horizontal flag changes, sets vy to the travel speed
+# (dx / 0.25 = 9.6 at 4x) and stores the exemption +0x952 as 1 (0x399faa) -- then as 0 again when the
+# trigger has Dont Slide (585, 0x39a00d). Both are stores, so the byte the body arrived with does not
+# survive either way. A ship at 4x, no input: #1 turns frame 0 -> 3 (vp := -9.6, outside the band, so
+# only a latched body is left unclamped), #2 twenty ticks later turns back (vp := +9.6). One level per
+# (585 on #1, 585 on #2); this is what dp's --rotboost reproduces (dptest has the same four cases).
+# Measured in GD (|yvel|, the tick after each swap):
+#   rotslide_00  #1 -> 9.514 (latched)  #2 -> 9.497 (latched)
+#   rotslide_01  #1 -> 9.514 (latched)  #2 -> 8.000 (Dont Slide drops a latched body)
+#   rotslide_10  #1 -> 6.400 (clamped)  #2 -> 9.497 (raised again)
+#   rotslide_11  #1 -> 6.400 (clamped)  #2 -> 8.000
+ROT_TRIG = 2900
+K_MOVE_DIR, K_GROUND_DIR, K_DONT_SLIDE = 166, 167, 585
+ROTSLIDE_X0 = 600.0
+
+
+def build_rotslide(slide1_off: bool, slide2_off: bool) -> str:
+    objs: list[str] = floor_run(0.0, ROTSLIDE_X0 - GRID)
+    e1 = {K_MOVE_DIR: "4", K_GROUND_DIR: "1"}
+    if slide1_off:
+        e1[K_DONT_SLIDE] = "1"
+    objs.append(obj(ROT_TRIG, ROTSLIDE_X0, 105.0, rot=-90.0, extra=e1))
+    e2 = {K_MOVE_DIR: "2", K_GROUND_DIR: "4"}
+    if slide2_off:
+        e2[K_DONT_SLIDE] = "1"
+    objs.append(obj(ROT_TRIG, ROTSLIDE_X0 + GRID, 153.0, extra=e2))
+    # a wall of blocks 400 px on ends the run
+    for i in range(60):
+        objs.append(obj(1, ROTSLIDE_X0 + 400.0, GROUND_Y + GRID * i))
+    UNITS.append({"x0": 0.0, "x1": ROTSLIDE_X0 + 400.0, "mode": "ship", "speed": "4x",
+                  "dontslide_1": int(slide1_off), "dontslide_2": int(slide2_off),
+                  "t_swap1": 251, "t_swap2": 272,
+                  "gd_abs_yvel_after_1": 6.4 if slide1_off else 9.514,
+                  "gd_abs_yvel_after_2": 8.0 if slide2_off else 9.497})
+    return header(start_mode="ship", speed=4) + ";" + ";".join(objs) + ";"
+
+
 BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "route1": build_route1, "route2": build_route2,
             "coincal": build_coincal,
@@ -6387,7 +7218,16 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "shortexit": build_shortexit, "edgeland": build_edgeland,
             "slopelandball": build_slopelandball,
             "ceilpush": build_ceilpush, "ceilpushball": build_ceilpushball,
-            "ceilpush8": build_ceilpush8, "padedge": build_padedge, "padedge13": build_padedge13, "padfall": build_padfall, "padnorm": build_padnorm}
+            "ceilpush8": build_ceilpush8, "padedge": build_padedge, "padedge13": build_padedge13, "padfall": build_padfall, "padnorm": build_padnorm,
+            "spiderpad": build_spiderpad, "gravtoggle": build_gravtoggle,
+            "teleporttrig": build_teleporttrig,
+            "gravtrig": build_gravtrig, "gravtrig2": build_gravtrig2,
+            "followy": build_followy, "teleportorb": build_teleportorb,
+            "tpportal": build_tpportal,
+            "rotslide_00": lambda: build_rotslide(False, False),
+            "rotslide_01": lambda: build_rotslide(False, True),
+            "rotslide_10": lambda: build_rotslide(True, False),
+            "rotslide_11": lambda: build_rotslide(True, True)}
 
 
 def main() -> int:

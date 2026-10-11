@@ -18,6 +18,7 @@
 #include <string>
 
 #include "dp/cli.hpp"
+#include "dp/band_rows.hpp"
 
 namespace {
 
@@ -301,8 +302,8 @@ void autoSwitches() {
         "dirdist,dynmode,silent,togon,remap,item,item2,count,subcount,actgrp,thold,ttog,tdual,"
         "cmode,i1mode,i2mode,tgtmode,mod1,mod2,res1,res2,res3,tol,rnd1,rnd2,sgn1,sgn2\n"
         + trigRow(3027, 1049, 6225, 145, 0, 0, 0.0, 0.0)     // x-crossing Toggle, off
-        + trigRow(900, 901, 9000, 50, 0, -1, 0.0, 30.0)      // x-crossing Move ...
-        + trigRow(910, 1049, 9001, 60, 1, 1, 0.5, 0.0));     // ... spawning a Toggle, on, 0.5 s
+        + trigRow(900, 901, 9000, 50, 0, -1, 0.0, 30.0)      // x-crossing Move, whose group
+        + trigRow(910, 1049, 9001, 60, 1, 1, 0.5, 0.0));     // holds a spawn-only Toggle
     const std::string grp = writeTmp("dptest_auto_grp.txt",
         "uid,groups\n4256 145\n500 50\n910 50\n600 60\n");
     std::vector<dp::AutoTrig> autos = dp::loadAutoTriggers(trig, grp);
@@ -313,10 +314,12 @@ void autoSwitches() {
     check(ring != ev.end() && ring->second.size() == 1 && ring->second[0].on == 0
               && ring->second[0].autoIdx == 0 && ring->second[0].delay == 0.0,
           "an x-crossing Toggle switches its group off, on its own crossing");
-    const auto nested = ev.find(600);
-    check(nested != ev.end() && nested->second.size() == 1 && nested->second[0].on == 1
-              && nested->second[0].delay == 120.0,
-          "a Toggle a crossing spawns switches after the spawn's delay (0.5 s = 120 ticks)");
+    // A Move root spawns nothing: the spawn-triggered Toggle in its target group is carried as an
+    // object and waits for a Spawn or a box (triggers.hpp, the Move-root rule in loadAutoTriggers,
+    // measured on a custom level's group 171). This check used to expect the Toggle's switch 120
+    // ticks after the crossing, the rule that measurement overturned.
+    check(ev.find(600) == ev.end(),
+          "a Move a crossing fires does not spawn the Toggle in its target group");
 
     // The ring: the crossing's switch plus the box's, resolved the way the model will.
     std::vector<dp::OnEvent> r = ring->second;
@@ -570,8 +573,343 @@ static int groupsCorpus(int argc, char** argv) {
     return bad;
 }
 
+// THE RUN (search_dp.hpp SearchRun). A run is one level's solve: begin refuses while one is open --
+// the carry-over a one-session cold run exists to catch -- and end closes it. A verification says
+// whether the plan flown was the one this core emitted last (its edges from that plan's anchor on).
+void runLifecycle() {
+    dp::g_run = dp::SearchRun{};
+    std::string why;
+    check(dp::runBegin(4, 7, why), "a run begins when none is open");
+    check(dp::g_run.open && dp::g_run.level == 4 && dp::g_run.seed == 7,
+          "begin records the level and the seed");
+    std::string why2;
+    check(!dp::runBegin(5, 0, why2), "begin refuses while a run is open");
+    check(why2.find("level 4") != std::string::npos && why2.find("level 5") != std::string::npos,
+          "the refusal names the open run's level and the level that asked");
+    check(dp::g_run.level == 4, "a refused begin leaves the open run as it was");
+    dp::g_run.lastT0 = 100;
+    dp::g_run.lastEdges = {{101, 1}, {110, 0}};
+    const std::vector<std::pair<long long, int>> spliced = {{20, 1}, {30, 0}, {101, 1}, {110, 0}};
+    const std::vector<std::pair<long long, int>> other = {{20, 1}, {30, 0}, {102, 1}, {110, 0}};
+    check(dp::runOwnPlan(spliced), "a flight of the emitted tail on another prefix is the run's own");
+    check(!dp::runOwnPlan(other), "a flight whose tail differs is not");
+    // the seam: an emitted edge a tick before the anchor that changes nothing, which the splice drops
+    dp::g_run.lastEdges = {{99, 1}, {101, 1}, {110, 0}};
+    check(dp::runOwnPlan({{20, 1}, {101, 1}, {110, 0}}),
+          "an emitted edge that changes nothing need not be flown");
+    check(!dp::runOwnPlan({{20, 1}, {30, 0}, {101, 1}, {110, 0}}),
+          "...but a level the emitted plan holds through the seam must be held there");
+    dp::g_run.lastEdges = {{101, 1}, {110, 0}};
+    const std::string line = dp::runVerified(spliced, 500, 1234.5, false, 480);
+    check(line.find("own=1") != std::string::npos && dp::g_run.verified == 1 && dp::g_run.own == 1,
+          "runVerified counts the flight and says it was the run's own");
+    check(line.find("via=") == std::string::npos, "...and a flight of the run's own plan carries no via");
+    // the section search splices another tail from t=200: a flight of it is counted apart
+    const std::vector<std::pair<long long, int>> sec = {{20, 1}, {30, 0}, {205, 1}, {230, 0}};
+    dp::runNoteSplice(sec, 200);
+    const std::string ls = dp::runVerified(sec, 260, 2000.0, false, -1);
+    check(ls.find("own=0") != std::string::npos && ls.find(" via=secsolve") != std::string::npos
+              && dp::g_run.viaSplice == 1,
+          "a flight of the spliced plan is the section search's (via=secsolve)");
+    const std::string lo = dp::runVerified(other, 300, 2100.0, false, -1);
+    check(lo.find("via=") == std::string::npos && dp::g_run.viaSplice == 1,
+          "a flight of neither plan carries no via");
+    const std::string e = dp::runEnd();
+    check(e.find("level=4") != std::string::npos && e.find(" via-secsolve=1") != std::string::npos
+              && !dp::g_run.open,
+          "end closes the run and counts the section search's flights");
+    const std::string pf = writeTmp("dptest_plan.txt", "input=101,1\ninput=105,0\n");
+    check(dp::runNotePlanFile(pf) && dp::g_run.lastEdges.size() == 2
+              && dp::g_run.lastEdges[1] == std::make_pair(105LL, 0),
+          "the plan a call answered with is read back from its file");
+    check(!dp::runNotePlanFile(pf + ".missing") && dp::g_run.lastEdges.size() == 2,
+          "a plan file that cannot be read leaves the record as it was");
+    check(dp::runBegin(5, 0, why), "the next level's run begins once the last has ended");
+    dp::runEnd();
+    check(dp::runEnd().find("no run open") != std::string::npos, "an end with no run open says so");
+}
+
+// --bandowntrack: when the recording counts as having seen a portal's band. A portal-set track (four
+// on-grid rows, too few to call a camera) sees a band on a row within 3 ticks that carries it, or
+// a band equal to the one in force (the track records changes only); a camera-driven one (eight
+// off-grid rows) always sees, its rows being pans and not portal writes.
+void bandOwnSeen() {
+    const auto savedTrack = dp::g_bandTrack;
+    const auto savedIdx = dp::g_bandTrackIntervals;
+    const int savedCam = dp::g_bandTrackCam;
+    auto setTrack = [](std::vector<dp::BandTrackRow> rows) {
+        dp::g_bandTrack = std::move(rows);
+        dp::g_bandTrackIntervals.clear();
+        for (size_t i = 0; i < dp::g_bandTrack.size(); ++i)
+            if (dp::g_bandTrack[i].kind == dp::BandKind::Interval)
+                dp::g_bandTrackIntervals.push_back(i);
+        dp::g_bandTrackCam = -1;
+    };
+    using K = dp::BandKind;
+    setTrack({{2873, K::Degenerate, 90, 90}, {2874, K::Interval, 150, 450},
+              {6132, K::Interval, 270, 570}, {9322, K::Interval, 630, 930}});
+    check(dp::bandTrackSawBand(9322, 630, 930) && dp::bandTrackSawBand(9325, 630, 930)
+              && dp::bandTrackSawBand(9319, 630.5, 929.5),
+          "a portal-set track sees a band on its own row, up to 3 ticks off and within 1 px");
+    check(dp::bandTrackSawBand(9326, 630, 930),
+          "...and further on while that band is still in force (the track records changes only)");
+    check(!dp::bandTrackSawBand(9318, 630, 930),
+          "...but not 4 ticks before its row, where another band is in force");
+    check(!dp::bandTrackSawBand(9322, 840, 1140),
+          "a row within the window that carries another band is another portal's");
+    check(!dp::bandTrackSawBand(17765, 840, 1140),
+          "a portal far from every row with a band not in force is unseen (never fired on the route)");
+    check(dp::bandTrackSawBand(17765, 630, 930),
+          "a portal far from every row that rewrote the band in force is seen");
+    std::vector<dp::BandTrackRow> cam;
+    for (int i = 0; i < 8; ++i) cam.push_back({1000 + i, K::Interval, 90.f + 1.437f * i, 360.f + 1.437f * i});
+    setTrack(cam);
+    check(dp::bandTrackIsCamera() && dp::bandTrackSawBand(1003, 0, 1)
+              && dp::bandTrackSawBand(1020, 0, 1),
+          "a camera-driven track always sees: its rows are the camera's pans, not portal writes");
+    dp::g_bandTrack = savedTrack;
+    dp::g_bandTrackIntervals = savedIdx;
+    dp::g_bandTrackCam = savedCam;
+}
+
+// --rotboost: a 2900 that swaps the axes stores the velocity-limit exemption (+0x952) as 1, then as
+// 0 when the trigger has Dont Slide (rotateGameplay 0x399faa / 0x39a00d). Both are stores, so the
+// byte the body arrived with does not survive the swap either way; with the flag off the model
+// leaves it alone. One trigger at x=100, a ship crossing it in frame 0.
+void rotBoostDontSlide() {
+    const auto savedTrig = dp::g_rotTrig;
+    const bool savedFlag = dp::g_rotBoost;
+    auto run = [](bool flag, int boostIn, int dontSlide) {
+        dp::g_rotTrig.clear();
+        dp::RotTrig rt{100.0, 0.0, 3};
+        rt.setRev = 0;
+        rt.dontSlide = (uint8_t)dontSlide;
+        dp::g_rotTrig.push_back(rt);
+        dp::g_rotBoost = flag;
+        dp::State c{};
+        c.mode = 1;
+        c.xAbs = 101.f;
+        c.boost = (uint8_t)boostIn;
+        const int nf = dp::applyRotation(c, 99.0, 1.95, 1);
+        return nf == 3 && c.frame == 3 ? (int)c.boost : -1;
+    };
+    for (int b = 0; b <= 1; ++b) {
+        check(run(true, b, 0) == 1, b ? "--rotboost: latched in, Dont Slide 0 -> latched"
+                                       : "--rotboost: unlatched in, Dont Slide 0 -> latched");
+        check(run(true, b, 1) == 0, b ? "--rotboost: latched in, Dont Slide 1 -> unlatched"
+                                       : "--rotboost: unlatched in, Dont Slide 1 -> unlatched");
+        check(run(false, b, 0) == b && run(false, b, 1) == b,
+              b ? "flag off: a latched body keeps its byte through the swap"
+                : "flag off: an unlatched body keeps its byte through the swap");
+    }
+    dp::g_rotTrig = savedTrig;
+    dp::g_rotBoost = savedFlag;
+}
+
+// --warpfly: a ship's step inside a 0.36 time warp, as GD stepped it on a custom level's warp
+// (modifiers.hpp, g_warpFly). Every rung scales, thrust included; the switch speed does not, so a
+// body released at +0.82 still takes the weak rung.
+void warpFlyShipStep() {
+    const gdapprox::ShipParams& p = gdapprox::ShipParams::normal();
+    auto step = [&](double vy, bool held, double t) {
+        return dp::qVy(gdapprox::ShipModel::stepVy(vy, held, dp::shipParamsWarp(p, t)));
+    };
+    check(step(-0.361, false, 0.36) == -0.386, "--warpfly: released at -0.361 steps -0.025");
+    check(step(-1.061, true, 0.36) == -1.022, "--warpfly: held at -1.061 steps +0.039");
+    check(step(0.82, false, 0.36) == 0.795,
+          "--warpfly: released at +0.82 keeps the weak rung (the switch speed is not scaled)");
+    check(&dp::shipParamsWarp(p, 1.0) == &p && step(-0.361, false, 1.0) == -0.43,
+          "--warpfly: outside a warp the parameters are the caller's own");
+}
+
+// --moverextend's data form needs the Move's start: a run of constant-velocity rows that goes back to
+// the object's OWN first row has nothing before it that dates the Move. Object A stands still at t=0 (a row), then
+// moves from t=90 (the gap dates the start): extended for the Move's remaining 50 - 12 ticks (12 steps since t=90). Object B is first
+// recorded at t=100 with 3 rows: its first row is not shown to be the Move's start, so it is NOT extended, although
+// another object's rows begin at t=0 (a recording-wide minimum would have called B's start known). Object C is B
+// with one earlier row at another velocity: the change dates it, so it is extended (2 steps, cap 48).
+void moverExtendStart() {
+    const bool savedMe = dp::g_moverExtend, savedMv = dp::g_moverExtendVel;
+    dp::g_moverExtend = true;
+    dp::g_moverExtendVel = false;
+    dp::Dynamics d;
+    d.objs.resize(3);
+    d.samples.assign(3, {});
+    auto row = [](int t, float cx) { dp::DynSample s{}; s.t = t; s.cx = cx; s.cy = 0.f; s.hw = s.hh = 5.f; s.on = 1; return s; };
+    d.samples[0].push_back(row(0, 0.f));
+    for (int t = 90; t <= 102; ++t) d.samples[0].push_back(row(t, 2.f * (float)(t - 90)));
+    for (int t = 100; t <= 102; ++t) d.samples[1].push_back(row(t, 500.f + 2.f * (float)(t - 100)));
+    d.samples[2].push_back(row(99, 800.f));
+    for (int t = 100; t <= 102; ++t) d.samples[2].push_back(row(t, 805.f + 2.f * (float)(t - 100)));
+    dp::Dynamics::AutoPart mv{};
+    mv.dx = 100.f; mv.dy = 0.f; mv.dur = 50.0; mv.ease = 0;
+    d.partsAny.assign(3, std::vector<dp::Dynamics::AutoPart>{mv});
+    d.prepareExtend();
+    check(d.extOk[0] == 1 && d.extCap[0] == 38, "--moverextend: stood still, then moved: start dated by the gap -> extended (cap 38)");
+    check(d.extOk[1] == 0, "--moverextend: first recorded mid-Move at t=100 while another object has rows from t=0 -> not extended");
+    check(d.extOk[2] == 1 && d.extCap[2] == 48, "--moverextend: a velocity change dates the start -> extended (cap 48)");
+    dp::g_moverExtend = savedMe;
+    dp::g_moverExtendVel = savedMv;
+}
+// --slambox: the toward-the-player steps an object takes from the boxes the state touched,
+// each part decided the way dynamics.hpp's slam loop decides it -- skipped iff slamBoxRecorded says the
+// recorded attempt fired that same box on the state's own entry tick. `fire[b]` is the state's entry into box b
+// (-1 = not touched), `rec` the recorded attempt's (--rectouch). Returns the summed dy the state adds.
+struct SlamPart { int box; float dy; };
+float slamSum(const std::vector<SlamPart>& parts, const std::array<int, dp::kTouchBits>& fire,
+              const std::array<int, dp::kTouchBits>& rec) {
+    float sum = 0.f;
+    for (const SlamPart& p : parts) {
+        if (p.dy >= 0.f) continue;
+        const int F = fire[(size_t)p.box];
+        if (F < 0) continue;
+        if (dp::slamBoxRecorded(rec, p.box, F)) continue;
+        sum += p.dy;
+    }
+    return sum;
+}
+void slamBoxIdentity() {
+    auto none = [] { std::array<int, dp::kTouchBits> a{}; a.fill(-1); return a; };
+    const int A = 1, B = 2;
+    {   // two candidate boxes; the recording holds A; the state enters A on its tick and B later
+        auto fire = none(), rec = none();
+        rec[A] = 100; fire[A] = 100; fire[B] = 120;
+        check(slamSum({{A, -9.f}, {B, -9.f}}, fire, rec) == -9.f,
+              "--slambox: A recorded and entered on its tick -> skipped; B, not recorded -> kept");
+    }
+    {   // the old rule's hole: the recording holds A, the state touches only B, on A's tick
+        auto fire = none(), rec = none();
+        rec[A] = 100; fire[B] = 100;
+        check(slamSum({{A, -9.f}, {B, -9.f}}, fire, rec) == -9.f,
+              "--slambox: only B touched (the recording's touch is A) -> B keeps its step");
+    }
+    {   // two boxes hit on the same tick, only A in the recording
+        auto fire = none(), rec = none();
+        rec[A] = 100; fire[A] = 100; fire[B] = 100;
+        check(slamSum({{A, -9.f}, {B, -4.f}}, fire, rec) == -4.f,
+              "--slambox: A and B on the same tick, only A recorded -> A skipped, B kept");
+    }
+    {   // one box, two slam parts
+        auto fire = none(), rec = none();
+        rec[A] = 100; fire[A] = 100;
+        check(slamSum({{A, -9.f}, {A, -3.f}}, fire, rec) == 0.f,
+              "--slambox: one recorded box with two parts -> both skipped");
+    }
+    {   // the same box entered on another tick is another activation
+        auto fire = none(), rec = none();
+        rec[A] = 100; fire[A] = 101;
+        check(slamSum({{A, -9.f}}, fire, rec) == -9.f,
+              "--slambox: the recorded box entered a tick later -> kept (delta 0 only)");
+    }
+    {   // the witness's shape: -9 / 0 / +300 boxes, the recording fired -9 and +300, the state likewise
+        auto fire = none(), rec = none();
+        const int b19 = 19, b20 = 20, b23 = 23;
+        rec[b19] = 5119; rec[b23] = 5132; fire[b19] = 5119; fire[b23] = 5132;
+        check(slamSum({{b19, -9.f}, {b20, 0.f}, {b23, 300.f}}, fire, rec) == 0.f,
+              "--slambox: the plate's three boxes, the -9 recorded on its tick -> no second -9");
+    }
+}
+// The recorded band's source through the writer and the reader (band_rows.hpp, bands.hpp loadBandTrack).
+// A band whose source goes camera -> portal -> camera with the same numbers used to write one row, and the
+// lookup gave the first row's source for all three ticks. The writer now adds an S row for a change of
+// source alone; the reader keeps S rows out of the track, so every reader of the rows sees the rows a
+// file without them gives.
+namespace {
+void clearBandTrack() {
+    dp::g_bandTrack.clear();
+    dp::g_bandTrackIntervals.clear();
+    dp::g_bandSrcRows.clear();
+    dp::g_bandTrackCam = -1;
+    dp::g_bandTrackEnd = -1;
+}
+struct BandSeen { int kind; double fl, ce; long long age; int src; bool ok; };
+std::vector<BandSeen> bandSeen(int t0, int t1) {
+    std::vector<BandSeen> v;
+    for (int t = t0; t <= t1; ++t) {
+        BandSeen s{};
+        dp::BandKind k{};
+        s.ok = dp::bandTrackKindAt(t, k, s.fl, s.ce, s.age, &s.src);
+        s.kind = (int)k;
+        v.push_back(s);
+    }
+    return v;
+}
+}  // namespace
+void bandSourceRows() {
+    std::vector<dp::BandSample> s;
+    auto add = [&](long long t, float lo, float hi, int cam) {
+        dp::BandSample b;
+        b.t = t; b.written = true; b.pmin = lo; b.pmax = hi; b.cam = cam;
+        s.push_back(b);
+    };
+    add(1, 600.f, 900.f, 1);
+    add(2, 600.f, 900.f, 0);
+    add(3, 600.f, 900.f, 1);
+    add(4, 630.f, 930.f, 0);
+    add(5, 630.f, 930.f, 0);
+    long long rows = 0;
+    const std::string body = dp::bandRows(s, &rows);
+    check(body == "1,I,600,900,1\n2,S,0\n3,S,1\n4,I,630,930,0\n" && rows == 4,
+          "band rows: a source change with the same numbers is an S row, a value change an I row");
+    clearBandTrack();
+    dp::loadBandTrack(writeTmp("dptest_band_s.txt", body).c_str());
+    const auto withS = bandSeen(1, 6);
+    const int want[6] = {1, 0, 1, 0, 0, 0};
+    bool srcOk = true;
+    for (int i = 0; i < 6; ++i) srcOk = srcOk && withS[(size_t)i].ok && withS[(size_t)i].src == want[i];
+    check(srcOk, "band rows: the lookup reads the source tick by tick (1, 0, 1, then the next row's 0)");
+    check(dp::g_bandTrack.size() == 2 && dp::g_bandTrackIntervals.size() == 2 && dp::g_bandSrcRows.size() == 2,
+          "band rows: S rows stay out of the track (2 rows, 2 intervals, 2 source changes)");
+    // Every reader but the source's sees the file without its S rows.
+    clearBandTrack();
+    dp::loadBandTrack(writeTmp("dptest_band_nos.txt", "1,I,600,900,1\n4,I,630,930,0\n").c_str());
+    const auto noS = bandSeen(1, 6);
+    bool same = dp::g_bandTrack.size() == 2;
+    for (int i = 0; i < 6; ++i) {
+        const BandSeen& a = withS[(size_t)i];
+        const BandSeen& b = noS[(size_t)i];
+        same = same && a.ok == b.ok && a.kind == b.kind && a.fl == b.fl && a.ce == b.ce && a.age == b.age;
+    }
+    check(same, "band rows: kind, values and age are the same with and without the S rows");
+    // A four-column file (before the source) reads as it did: no source anywhere.
+    clearBandTrack();
+    dp::loadBandTrack(writeTmp("dptest_band_4.txt", "1,I,600,900\n4,I,630,930\n").c_str());
+    bool none = true;
+    for (const BandSeen& b : bandSeen(1, 6)) none = none && b.ok && b.src == -1;
+    check(none, "band rows: a four-column file has no source (-1) on every tick");
+    // ...and an S row is no row to the older shapes: not I/D/N/U, and not three numbers.
+    int t = 0;
+    float fl = 0.f, ce = 0.f;
+    check(std::sscanf("2,S,0", "%d,%f,%f", &t, &fl, &ce) != 3,
+          "band rows: an S row is not a `t,floor,ceil` row, so an older reader skips it");
+    clearBandTrack();
+}
+// --formularec reads the recording only when it is the anchor's own attempt, up to the tick it reached
+// (--recprov). The same tick and the same box from another attempt is not that attempt's world.
+void formulaRecProvenance() {
+    auto with = [](bool given, long long rec, long long anc, long long reach, long long t) {
+        dp::g_recProvGiven = given;
+        dp::g_recProvRec = rec;
+        dp::g_recProvAnchor = anc;
+        dp::g_recProvReach = reach;
+        return dp::formulaRecProvOk(t);
+    };
+    check(with(true, 41, 41, 3000, 2500), "--recprov: one attempt, before its reach -> read");
+    check(!with(true, 47, 41, 3000, 2500), "--recprov: the recording is another attempt's -> not read");
+    check(!with(true, 41, 41, 3000, 3001), "--recprov: past the tick the recording reached -> not read");
+    check(!with(false, -1, -1, -1, 2500), "--recprov: not given (an older mod) -> not read");
+    check(!with(true, -1, -1, 3000, 2500), "--recprov: unknown attempts on both sides -> not read");
+    with(false, -1, -1, -1, 0);
+}
 int main(int argc, char** argv) {
     if (argc > 2 && !std::strcmp(argv[1], "--groups-corpus")) return groupsCorpus(argc, argv);
+    bandSourceRows();
+    formulaRecProvenance();
+    slamBoxIdentity();
+    warpFlyShipStep();
+    rotBoostDontSlide();
+    bandOwnSeen();
+    runLifecycle();
     groupsParser();
     commaFields();
     overlayReach();
@@ -581,6 +919,7 @@ int main(int argc, char** argv) {
     activatorRoots();
     autoSwitches();
     keyHoldsDelayedSwitch();
+    moverExtendStart();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

@@ -115,10 +115,10 @@ def main(argv=None) -> int:
                          + [Path(str(plan) + s) for s in
                             (".groups.txt", ".groups.deep.txt",
                              ".groups.live.txt", ".groups.bank.txt")])
-    # gdref/lv*.bandtrack.txt is deliberately NOT watched: this run rewrites it,
-    # so its state beforehand says nothing. It is claimed inside
-    # quick_regress.band_track_args right after our write -- which is what the
-    # missing install() above was making inert.
+    # The band recording is not watched: band_track_args writes it in a directory
+    # of this process's own (no longer gdref/lv*.bandtrack.txt, 2026-10-09) and
+    # claims it right after the write -- which is what the missing install()
+    # above was making inert.
 
     refs = {lv: qr.read_ref(lv) for lv in a.levels}
 

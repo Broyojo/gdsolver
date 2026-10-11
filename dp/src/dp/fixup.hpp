@@ -77,9 +77,10 @@ inline long long g_fixupHits = 0;
 // They are the same tick of nearly the same trajectory and normally agree, but
 // that is an assumption. Enough to ask "did a rotated state ever take a
 // delta?"; NOT enough to count how many records are corrupt.
-inline long long g_fixupHitFrame[4] = {0, 0, 0, 0};
+// (the counts are in g_fixupCensus below; g_fixupRotSeen is how many of the
+// eight x slots are taken)
 inline float g_fixupRotX[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-inline int g_fixupRotSeen = 0;
+inline std::atomic<int> g_fixupRotSeen{0};
 // ...AND THE DENOMINATOR. The counters above are firings, and a firing count of
 // zero has two readings: the lookup ran often while rotated and never matched,
 // or it hardly ran while rotated at all. The first says something about frames;
@@ -93,11 +94,39 @@ inline int g_fixupRotSeen = 0;
 // of one state whichever branch it takes. The x of the first few rotated CALLS
 // is kept as well: if the denominator turns out to be zero, its x says where
 // the lookup stopped being reached, which the firing counters cannot.
-// (the (frame, rev) pair of counters this used to describe lives in bands.hpp:
-// step.hpp does the counting and is upstream of this header)
-inline long long g_fixupCallFrame[4] = {0, 0, 0, 0};
+//
+// ONE ROW PER THREAD, summed where they are printed (fixupCensus), as
+// g_frameRevReach in bands.hpp and for the same reason: the search's pool
+// threads count them, and shared counters were a cache line every lookup wrote
+// and lost increments to the race. A row holds the lookups and the firings by
+// (frame, rev) -- framerev:'s lookups= and hits=; fixupcall: and fixupframe:
+// print their per-frame sums -- and the rotated (frame != 0) totals. Frame 0's
+// hits are worn by both the plain frame and the anchor rewrite's (frame 0,
+// rev 1), so a frame-only hit count could not say whether any record was ever
+// applied to a state GD recorded as frame 2.
+// Only the x lists are shared: a compare-exchange takes a slot while fewer than
+// eight are taken, so past the eighth a rotated state only reads the count.
+struct alignas(64) FixupCensusRow {
+    long long call[4][2];
+    long long hit[4][2];
+    long long callRot, hitRot;
+};
+inline FixupCensusRow g_fixupCensus[kThreadSlots] = {};
 inline float g_fixupCallRotX[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-inline int g_fixupCallRotSeen = 0;
+inline std::atomic<int> g_fixupCallRotSeen{0};   // x slots taken, as g_fixupRotSeen
+inline FixupCensusRow fixupCensus() {
+    FixupCensusRow t{};
+    for (const FixupCensusRow& r : g_fixupCensus) {
+        for (int f = 0; f < 4; ++f)
+            for (int v = 0; v < 2; ++v) {
+                t.call[f][v] += r.call[f][v];
+                t.hit[f][v] += r.hit[f][v];
+            }
+        t.callRot += r.callRot;
+        t.hitRot += r.hitRot;
+    }
+    return t;
+}
 // The x window is ONE TICK (1.2 px at 1.3-1.6 px/tick, still covering the
 // +-1 px stair-snap offset class). It was 2.5 and a DELTA record then
 // re-matched the NEXT tick's transition too: applied every tick it kept the
@@ -189,23 +218,32 @@ inline thread_local int g_fxBlockedUid = -1;
 // One place, so a kill hit and a delta hit cannot be counted by different
 // rules. Records the x of the first few rotated firings too: applyFixup has no
 // tick to hand and giving it one would change a signature for a census.
+// The slot is the value the compare-exchange took, not a second read of the
+// count: a test and an index read separately let another thread's bump in
+// between write past the end of the list.
+inline void takeRotX(std::atomic<int>& taken, float (&xs)[8], float x) {
+    int n = taken.load(std::memory_order_relaxed);
+    while (n < 8 && !taken.compare_exchange_weak(n, n + 1, std::memory_order_relaxed)) {}
+    if (n < 8) xs[n] = x;
+}
+
 inline void noteFixupFrame(const State& s) {
     const unsigned f = (unsigned)s.frame;
-    if (f < 4) ++g_frameRevHit[f][s.rev ? 1 : 0];
-    if (f < 4) ++g_fixupHitFrame[f];
+    FixupCensusRow& row = g_fixupCensus[g_threadSlot & (kThreadSlots - 1)];
+    if (f < 4) ++row.hit[f][s.rev ? 1 : 0];
     if (f != 0) {
-        if (g_fixupRotSeen < 8) g_fixupRotX[g_fixupRotSeen] = s.xAbs;
-        ++g_fixupRotSeen;
+        ++row.hitRot;
+        takeRotX(g_fixupRotSeen, g_fixupRotX, s.xAbs);
     }
 }
 
 inline void noteFixupCall(const State& s) {
     const unsigned f = (unsigned)s.frame;
-    if (f < 4) ++g_frameRevCall[f][s.rev ? 1 : 0];
-    if (f < 4) ++g_fixupCallFrame[f];
+    FixupCensusRow& row = g_fixupCensus[g_threadSlot & (kThreadSlots - 1)];
+    if (f < 4) ++row.call[f][s.rev ? 1 : 0];
     if (f != 0) {
-        if (g_fixupCallRotSeen < 8) g_fixupCallRotX[g_fixupCallRotSeen] = s.xAbs;
-        ++g_fixupCallRotSeen;
+        ++row.callRot;
+        takeRotX(g_fixupCallRotSeen, g_fixupCallRotX, s.xAbs);
     }
 }
 
@@ -313,7 +351,10 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     bool p1FlippedGravity = false;
     if (g_touchCensus) g_tcBranch = 0;
     g_preBtnSet = false;
+    t_ringLinkLate = 0;   // --ringtaplink
     State c = stepOne(s, input, K, d1, &p1FlippedGravity);
+    const bool p1RingLate = t_ringLinkLate != 0;
+    t_ringLinkLate = 0;
     if (g_touchCensus) g_tcBranchP1 = g_tcBranch;
     // p1's pre-button y, saved before p2's stepOne can overwrite it
     const bool preBtnSet = g_preBtnSet;
@@ -322,7 +363,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     const uint8_t p1HitG = g_hitGRepel;   // --repela0c, likewise
     if (!s.dual) {
         dead = d1;
-        markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
+        markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0,
+                    input != 0 && s.action == 0, &s, input != 0);
         // No fixup of either kind applies near moving geometry (nearDynObject
         // above). This exact constellation is the one that breaks the lv22
         // corridor oscillation: both breakout runs (2026-08-26 01:15 and
@@ -379,27 +421,52 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // inverse of the new polarity and halves only if that changed it; a plain
     // toggle would equal that only for a mirrored pair. See the p2 -> p1 half after
     // p2's step.
-    if (p1FlippedGravity && s.dual
+    // --dualunlink (frames.hpp): none of the partner calls below happens while an Options trigger
+    // has unlinked the pair's gravity (the layer's +0x860, which flipGravity and
+    // playerWillSwitchMode test first) -- each body's flip stays its own.
+    const bool unlinked = dualUnlinkedAt((int)s.frame, (double)s.xAbs, (double)s.y);
+    if (p1FlippedGravity && s.dual && !unlinked
         && sameModeFlags(s.mode, s.mode2)) {
         const uint8_t want = (uint8_t)!c.flip;
         if (sb.flip != want) {
             sb.flip = want;
             sb.vy = (float)((double)sb.vy * 0.5);
+            // --ballscaleair: the partner call is a flipGravity, which lowers a ball's +0x728
+            if (g_ballScaleAir && sb.mode == 2) sb.ball728 = (uint8_t)((sb.ball728 & ~3u) | 1u);
         }
     }
+    // --ballscaleair: each body's polarity as its own step left it; the partner calls and the repel
+    // below that turn a ball's gravity again are flipGravity too (checked after the last of them)
+    const uint8_t ballF1Own = c.flip;
     bool d2 = false;
     bool p2FlippedGravity = false;
     g_halfNow = 1;
     // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
     g_bandPortalWrote = false;
     if (g_dualBand) g_dualOtherMode = (int)c.mode;
+    t_followHalf2 = 1;   // --followy: player 1's y is sb's y2
+    t_p2RingFresh = -1;  // --rtlp2ring
+    // --p2xoff: the second body steps where IT is, dx2 from player 1 (the windows cover it: model.hpp
+    // p2Widen). Its x comes back to the pair's below, and the offset moves by however much farther
+    // one half went than the other this tick -- a teleport trigger takes player 1 alone. Below 0.5 px
+    // the two advances are the same step rounded at two magnitudes, and are not a move.
+    const bool p2x = g_p2xOff && s.frame == 0;
+    if (p2x && s.dx2 != 0.f) sb.xAbs = (float)((double)sb.xAbs + (double)s.dx2);
     State cb = stepOne(sb, input, K, d2, &p2FlippedGravity);
+    if (p2x) {
+        const double moved = ((double)cb.xAbs - (double)sb.xAbs) - ((double)c.xAbs - (double)s.xAbs);
+        c.dx2 = (std::fabs(moved) > 0.5) ? (float)((double)s.dx2 + moved) : s.dx2;
+    }
+    t_followHalf2 = 0;
+    const int p2RingFresh = t_p2RingFresh;
+    t_p2RingFresh = -1;
     g_dualOtherMode = -1;
     const bool p2WroteBand = g_bandPortalWrote;
     g_halfNow = 0;
     const bool p2Tapped = g_ballTapped;   // --repelland
     const uint8_t p2HitG = g_hitGRepel;   // --repela0c
     swapHalves(cb);
+    const uint8_t ballF2Own = cb.flip2;   // --ballscaleair (see ballF1Own)
     // shared fields (x, speed, dual) come from the first half; the second half
     // only contributes its own body -- and `mode` / `mini` / the ceiling press
     // counters are ITS fields now, not shared ones (State::mode2 / mini2 say
@@ -423,6 +490,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // --dualslide: ...and the second body's dart slide arm (State::slideT2), which its own
     // stepOne wrote into the swapped slot.
     if (g_dualSlide) c.slideT2 = cb.slideT2;
+    // --dualhover: ...and its robot hover budget (State::rHover2)
+    if (g_dualHover) c.rHover2 = cb.rHover2;
     // --dualdash: ...and its dash (State::dashing2 / dashSlope2), for the same reason
     { c.dashing2 = cb.dashing2; c.dashSlope2 = cb.dashSlope2; }
     c.slopeUid02 = cb.slopeUid02;  c.slopeUidNow2 = cb.slopeUidNow2;
@@ -430,9 +499,12 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     c.usedOrbOld2 = cb.usedOrbOld2;
     for (int i = 0; i < 3; ++i) c.usedOrbHist2[i] = cb.usedOrbHist2[i];
     for (int i = 0; i < 2; ++i) c.spdFired2[i] = cb.spdFired2[i];
+    for (int i = 0; i < 2; ++i) c.spdMore2[i] = cb.spdMore2[i];   // --spdsameonce
     c.hitG2 = cb.hitG2;   // --repela0c
     // --a1clatch: the second body's +0xa1c is bit 1 (0 in both halves when the flag is off)
     c.a1cLatch = (uint8_t)((c.a1cLatch & 1u) | (cb.a1cLatch & 2u));
+    // --ballscaleair: the second body's +0x728 is bits 2-3 (0 in both halves when the flag is off)
+    c.ball728 = (uint8_t)((c.ball728 & 3u) | (cb.ball728 & 12u));
     {         // --rot2
         c.rot2 = cb.rot2;
         c.rotStep2 = cb.rotStep2;
@@ -484,12 +556,32 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // bodies start flipped (p1 fires 1->0, the partner call leaves p2 alone,
     // p2 fires and sets p1 back to 1: vy * 1/4), which is why the portal pass
     // no longer has r101's same-box skip.
-    if (p2FlippedGravity && s.dual
-        && sameModeFlags(s.mode, s.mode2)) {
+    // --dualbornportal (constants.hpp): GJBaseGameLayer::flipGravity compares the two bodies' mode
+    // flags as they stand when p2's portal fires -- p1 has finished its pass by then (c.mode), p2
+    // has not reached a mode portal after the gravity one (s.mode2).
+    if (p2FlippedGravity && s.dual && !unlinked
+        && sameModeFlags(g_dualBornPortal ? c.mode : s.mode, s.mode2)) {
         const uint8_t want = (uint8_t)!c.flip2;
         if (c.flip != want) {
             c.flip = want;
             c.vy = (float)((double)c.vy * 0.5);
+        }
+    }
+    // --ringtaplink (constants.hpp): p1's ring on a press that began this tick fired in the buttons
+    // phase, after both bodies moved, so the partner call halves p2's finished vy, and compares the
+    // modes as both bodies finished them. A custom level, mini balls: p2 0.012 - 0.129 = -0.117, then
+    // x 0.5 = -0.0585, GD's row.
+    // --rtlp2ring (constants.hpp): ...but a ring p2 fired on the same press is p2's own button, which
+    // runs after p1's: a yellow, pink, red or drop ring sets vy for the gravity the partner call left,
+    // so it is not halved.
+    if (p1RingLate && s.dual && !unlinked && sameModeFlags(c.mode, c.mode2)) {
+        const uint8_t want = (uint8_t)!c.flip;
+        if (c.flip2 != want) {
+            c.flip2 = want;
+            if (g_rtlP2Ring && (p2RingFresh == 11 || p2RingFresh == 12 || p2RingFresh == 35
+                                || p2RingFresh == 32))
+                c.vy2 = -c.vy2;
+            else c.vy2 = (float)((double)c.vy2 * 0.5);
         }
     }
     // Dual mode portal: GD re-MIRRORS the pair. playerWillSwitchMode
@@ -514,7 +606,9 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // alone. The rule below flipped p2 instead.
     const bool p1IsToucher = c.mode != s.mode
                              && c.mode2 == s.mode2 && s.mode2 == c.mode;
-    if (p1IsToucher) {
+    if (unlinked) {
+        // --dualunlink: playerWillSwitchMode skips the re-mirror when the layer's +0x860 is up
+    } else if (p1IsToucher) {
         const uint8_t want = c.flip2 ? 0 : 1;
         if (c.flip != want) {
             c.flip = want;
@@ -582,6 +676,13 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
             }
         }
     }
+    if (g_p2xOff && !c.dual) c.dx2 = 0.f;   // --p2xoff: the dual ended, the offset with it
+    // --ballscaleair: a ball whose gravity a partner call or the repel turned after its own step
+    if (g_ballScaleAir) {
+        if (c.mode == 2 && c.flip != ballF1Own) c.ball728 = (uint8_t)((c.ball728 & ~3u) | 1u);
+        if (c.dual && c.mode2 == 2 && c.flip2 != ballF2Own)
+            c.ball728 = (uint8_t)((c.ball728 & ~12u) | 4u);
+    }
     // Is the second body in OPEN AIR? Both halves take the same input, so in a
     // stretch where only one of them can touch anything, the other carries no
     // decision -- it just drifts. It still has to be simulated (it comes back),
@@ -603,7 +704,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         }
     }
     dead = d1 || d2;
-    markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
+    markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0,
+                    input != 0 && s.action == 0, &s, input != 0);
     // The dual half used to skip this entirely, so a divergence measured in a dual section was
     // unusable even if something had managed to write it down. Applied here, after both bodies
     // are merged, for the same reason the single case applies it after stepOne: the record is

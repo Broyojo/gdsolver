@@ -121,6 +121,29 @@ inline bool g_uiCoins = false;
 // (the glitch-avoid mode, Config::glitchPortal / glitchWave). A choice about how to solve, not a
 // kind of solution: the plan it finds is filed where Solve always files it.
 inline bool g_uiGlitch = false;
+// ...and the search a Solve's calls are answered by (cfg dpsearch): the layer DP, or one of the two
+// experimental searches. Chosen in the menu's Options with the glitch-avoid switch; like it, a
+// choice about how to solve, filed where Solve always files it. Numbered for the saved value
+// ("play-search"), append-only.
+inline constexpr int UI_SEARCH_DP = 0;
+inline constexpr int UI_SEARCH_BEAM = 1;
+inline constexpr int UI_SEARCH_MONTECARLO = 2;
+inline constexpr int UI_SEARCH_COUNT = 3;
+inline const char* uiSearchName(int s) {   // as the menu shows it
+    switch (s) {
+        case UI_SEARCH_BEAM: return "Beam";
+        case UI_SEARCH_MONTECARLO: return "Monte Carlo";
+        default: return "DP";
+    }
+}
+inline const char* uiSearchCfg(int s) {    // as cfg dpsearch and dp's --search spell it
+    switch (s) {
+        case UI_SEARCH_BEAM: return "beam";
+        case UI_SEARCH_MONTECARLO: return "montecarlo";
+        default: return "dp";
+    }
+}
+inline int g_uiSearch = UI_SEARCH_DP;
 // The level the menu's Start was pressed for. PlayLayer::init starts a session only for this
 // level, and disarms it whatever it decides: the choice is made per play, not left standing.
 // A standing mode is what the old corner panel had, and there it was visible; a menu that has

@@ -56,7 +56,7 @@ flowchart TB
     end
     PY["py/ — starts the loop and measures it<br/>cold_regress.py (the regression) · verification<br/>fidelity diagnostics · calibration levels · MCP server"]
     PY -.-> loop
-    loop --> OUT["plan file: one input=tick,0/1 line per edge<br/>plus the model trace and the per-layer bands"]
+    loop --> OUT["plan file: one input=tick,buttons line per edge (a bitmask, bit 0 = jump)<br/>plus the model trace and the per-layer bands"]
 ```
 
 One round trip per iteration: the mod hands the solver the level and, after a
@@ -94,7 +94,10 @@ plan and the model trace the next divergence is measured against.
   incumbent, so a level where nothing is tight emits exactly what the old rule
   did.
 * Output contracts: `SOLVED at ...`, `PARTIAL: frontier died at t=.. x=..`,
-  `FAILED: ...` on stdout; files `<out>` (the plan, `input=<tick>,<0|1>` lines),
+  `FAILED: ...` on stdout; files `<out>` (the plan, `input=<tick>,<buttons>` lines,
+  where `<buttons>` is a bitmask of the buttons held from that tick: bit 0 is
+  player 1's jump, the other bits are reserved and a reader that does not drive
+  one refuses the plan),
   `<out>.trace.csv` (per-tick model state) and `<out>.bands.txt` (per-layer
   frontier width).
 
@@ -124,11 +127,14 @@ plan and the model trace the next divergence is measured against.
   `plan_in.txt` / `cmd.txt` (the next plan, live commands), `result.txt`
   (session results, one line per event), `dump.csv` (per-tick player state),
   `grouptrace*.txt` (moving geometry), `itermap_lv<N>.txt` (the iteration map).
-* `src/mod/dp_bridge.{hpp,cpp}` — the one translation unit that compiles the
-  solver core inside the mod. It mentions neither Geode nor cocos; everything
-  crosses the boundary as plain C++. `dpselftest=1` reports what the core made
-  of the level, in the CLI's own words, so the two can be compared line for
-  line.
+* `src/mod/dp_bridge.{hpp,cpp}` — the mod's side of the solver core. The mod
+  does not compile the core: its first copy is the CLI's own compiled
+  `gdsolver_dpcore` (`dp/src/dpcore.cpp`), and its second copy
+  (`src/mod/dp_bridge2.cpp`, for the plain search beside the cap ladder) is a
+  library of its own built with the same options. The bridge mentions neither
+  Geode nor cocos; everything crosses the boundary as plain C++
+  (`dp/src/dpcore.hpp`). `dpselftest=1` reports what the core made of the
+  level, in the CLI's own words, so the two can be compared line for line.
 * `src/mod/repair.hpp` — the solve loop itself (§3), in the game. cfg
   `dpsolve=1` builds the level from `PlayLayer`, solves it on a worker thread,
   replays the plan, and when the replay dies re-anchors on the player state it
@@ -277,20 +283,28 @@ solver's command line:
 
 | area | on by default | turned off by |
 |---|---|---|
-| the model's rules (`leveldp`) | every measured ramp, dual, portal and kill rule. The 0.4.0 clean-up removed 276 switches, so most have no off arm; a few older rules keep one | `--no-portalpress`, `--no-portalunpin`, `--no-hazendpoint`, `--no-upsidecoyote`, `--no-padtable`, `--no-airpress`, `--no-anchorride`, `--no-rotsplit`, `--no-obb-all` |
-| the repair loop | `cpflight=600`, `dplearnresets=1`, `dpfineretry`, `dpxtrack`, `dpanchorrotstep`, `dpanchorrot2`, `portalpayloadlt`, `offboardtp` | `cpflight=0`, `dplearnresets=-1`, the others `=0` |
+| the model's rules (`leveldp`) | every measured ramp, dual, portal and kill rule. The 0.4.0 clean-up removed 276 switches, so the rules older than it mostly have no off arm (a few keep one); every rule added since keeps a `--no-` spelling | the older ones: `--no-portalpress`, `--no-portalunpin`, `--no-hazendpoint`, `--no-upsidecoyote`, `--no-padtable`, `--no-airpress`, `--no-anchorride`, `--no-rotsplit`, `--no-obb-all`; the newer: `--no-<flag>`, e.g. `--no-gravtrig`, `--no-teleporttrig`, `--no-portreread`, `--no-flipbonk` |
+| the search (`leveldp`) | `--ladderovercap`, `--ladderprefix`, `--rejoinprobe 5`, `--resimladder` (a plan whose own walk dies is searched again from a few ticks before that death) | `--no-ladderovercap`, `--no-ladderprefix`, `--no-rejoinprobe`, `--no-resimladder` |
+| the repair loop | `cpflight=600`, `dplearnresets=1`, `dpfineretry`, `dpxtrack`, `dpanchorrotstep`, `dpanchorrot2`, `portalpayloadlt`, `offboardtp`, `offboardfree`, `offboardband`, `voidband`, `singlereset`, `headbandfresh`, `anchorboardarm`, `cpfollowsection`, `dpseedpickups`, `snapnodesync`, `obbnolatch` | `cpflight=0`, `dplearnresets=-1`, the others `=0` |
 | coins ([COINS.md](COINS.md)) | `dpcoinwin=60,2,700`, `coinapproachreach`, `coinmissearly`, `routeprereq` | `=0` |
-| the section solver ([SECTION_SOLVE.md](SECTION_SOLVE.md)) | `dpsectierfirst`, `dpsecstate`, `secsnapem`, `secjbkeep`, `secheaddash`, `secgracedash`, `secrungcoinoff`, `secbookfirst`, `secredoreach` | `=0` |
-| the level slice ([LEVEL_SLICE.md](LEVEL_SLICE.md)) | `slicetriggers`, `sliceuids`, `slicenotouch`, `slicefirstref`, `slicegiveupcopy` | `=0` |
+| the section solver ([SECTION_SOLVE.md](SECTION_SOLVE.md)) | `dpsectierfirst`, `dpsecstate`, `dpsecrecaway`, `secsnapem`, `secjbkeep`, `secheaddash`, `secheadaccel`, `secgracedash`, `secrungcoinoff`, `secbookfirst`, `secredoreach`, `secwsnapauto`, `secwsnapgate`, `sectionhooklazy` | `=0` |
+| the level slice ([LEVEL_SLICE.md](LEVEL_SLICE.md)) | `slicetriggers`, `sliceuids`, `slicekeepgroups`, `slicenotouch`, `slicefirstref`, `slicegiveupcopy` | `=0` |
+| the seek bar ([RUNNING.md](RUNNING.md)) | `seekcp=600` (a checkpoint every 600 ticks of a replay), `seekblind` (a seek runs screen-off up to the nearest one) | `=0` |
 
 A switch the clean-up removed is refused by name: `leveldp` stops with "<spelling> was
 removed in <commit>; the behaviour is fixed (since <commit>)", and an `autorun.cfg` that
 names a removed key (`dpladderback`, `dprotextend`, ...) makes the game refuse to solve,
-with the same two commits in `result.txt`. One key is off by default:
-`seccpfallback=1` lets the loop's section searches run on checkpoints again (a
-diagnostic; see [SECTION_SOLVE.md](SECTION_SOLVE.md#4-the-search)). What each key
-does, and what it was measured on, is in its comment in `src/mod/config.hpp`,
-`src/solver/secsolve.hpp` or `src/solver/psnap.hpp`.
+with the same two commits in `result.txt`. Some keys are off by default, because they
+are diagnostics or change what is being solved: `seccpfallback=1` lets the loop's
+section searches run on checkpoints again (see
+[SECTION_SOLVE.md](SECTION_SOLVE.md#4-the-search)); `attemptone`, `attemptcount=k` and
+`persistworld=k` pin what an attempt-dependent level reads
+([CUSTOM_LEVELS.md](CUSTOM_LEVELS.md)); `takeover=<tick>` hands the plan to a person
+([TAKEOVER.md](TAKEOVER.md)); `dpsearch=beam|montecarlo` swaps the search; and `areaenv=1`
+treats where the game's random numbers can put an Area Move's objects as deadly (on
+until v0.5.0; the seeds are fixed while the mod drives, so the recording holds this
+game's positions). What each key does, and what it was measured on, is in its comment
+in `src/mod/config.hpp`, `src/solver/secsolve.hpp` or `src/solver/psnap.hpp`.
 
 ## 5. What the model covers
 

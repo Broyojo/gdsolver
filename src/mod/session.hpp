@@ -70,8 +70,11 @@ inline bool uiConfigureSession(int levelId) {
             g_cfg.glitchEmbed = kGlitchEmbedDefault;
             g_cfg.glitchDeco = true;
         }
-        log::info("panel: solve lv{} in-process{}{}", levelId, g_uiCoins ? " with coins" : "",
-                  g_uiGlitch ? " avoiding glitches" : "");
+        // The search (Config::dpSearch): the layer DP unless Options chose an experimental one.
+        g_cfg.dpSearch = uiSearchCfg(g_uiSearch);
+        log::info("panel: solve lv{} in-process{}{}, search {}", levelId,
+                  g_uiCoins ? " with coins" : "", g_uiGlitch ? " avoiding glitches" : "",
+                  g_cfg.dpSearch);
     } else {
         const std::string name = uiSolutionPath(levelId, g_uiCoins);
         std::vector<InputCmd> plan;
@@ -89,6 +92,7 @@ inline bool uiConfigureSession(int levelId) {
             return false;
         }
         uiSessionBase(levelId);
+        loadInputsFile(name, plan);   // again: the session base cleared the attempt sequence the first read set
         g_cfg.inputs = std::move(plan);
         g_cfg.maxAttempts = 1;
         // Coins on: GD's own pickups are reported (`coingd:`, and the count at the clear), so the
@@ -103,6 +107,7 @@ inline bool uiConfigureSession(int levelId) {
     stallwatch::start();   // so that on a stall we can say "where"
     updateWindowTitle();   // show the role in the title (reflected the moment the session starts)
     writeResult("session_start (panel)", true);
+    dpsolve::memCensus("session start");   // cfg memcensus (print only)
     // Say once, plainly, whether the research trail (dp_band_itN/dp_groups_itN and the
     // recorder's dp_fixin_*/dp_attempt_itN files) is being kept this session -- see
     // Config::researchCapture for why it defaults off. A panel session never turns it on.
@@ -144,6 +149,9 @@ inline long long g_secReqSpineUntil = -1;
 // ...and a rung asked again on checkpoints after its snapshot search was caught that way.
 inline bool g_secReqForceCp = false;
 inline bool g_secCpRedo = false;   // the rung in flight is such a redo
+// ...and a rung asked again with its wsnap set after the plain snapshot search found nothing
+// (cfg secwsnapgate; secsolve::g_wsnapForce is the rung in flight being one).
+inline bool g_secReqForceWsnap = false;
 // The last rung's window as handed over, for asking it again (a rung is consumed by the handoff).
 struct SecLastReq {
     long long start = -1, depth = -1, horizon = -1, cap = -1;
@@ -256,6 +264,9 @@ inline void resetSecsolveSession() {
     g_secReqSpineUntil = -1;
     g_secReqForceCp = false;
     g_secCpRedo = false;
+    g_secReqForceWsnap = false;
+    secsolve::g_wsnapForce = false;
+    secsolve::g_wsnapHeld = 0;
     g_secLastReq = SecLastReq{};
     secsolve::g_spineUntil = -1;
     if (g_secState) {
@@ -355,7 +366,7 @@ inline void pollCommandFileImpl(const std::string& cmd) {
                           "dual,p2y,p2vy,p2up,p2ground,p2dead,pmin,pmax,"
                           "snapuid,snapdist,camscale,gframe,ctrlOff,camx,camy,"
                           "p2ground2,p2mode,p2vsize,p2x,rotch,rotidx,rotrev,firedw,"
-                          "bandst,bandmode,camoffy,freemode,bandforce,p2rot\n";
+                          "bandst,bandmode,camoffy,freemode,bandforce,p2rot,p2ctrlOff\n";
             }
             if (g_trace.is_open()) {
                 g_trace.close();
@@ -369,6 +380,26 @@ inline void pollCommandFileImpl(const std::string& cmd) {
             writeResult("serve: FAILED to load plan_in.txt");
         }
     }
+    // `seekfrom <cp tick> <target>` (cfg seekcp's instrument): a seek to <target> that starts from the
+    // checkpoint at or before <cp tick>, whatever is nearer.
+    else if (cmd.rfind("seekfrom ", 0) == 0) {
+        long long cp = -1, t = -1;
+        std::istringstream ss(cmd.substr(9));
+        if (ss >> cp >> t && cp >= 0 && t >= 0) {
+            itermap::seekToTick(t);
+            itermap::g_seekFromCp = cp;
+            itermap::g_seekRestart = true;
+        } else {
+            writeResult("seekfrom: usage: seekfrom <cp tick> <target>");
+        }
+        return;
+    }
+    // `seek <tick>`: what clicking the seek bar asks for, for a driver with no mouse on the worker.
+    else if (cmd.rfind("seek ", 0) == 0) {
+        long long t = -1;
+        if (cfgNum("seek", cmd.substr(5), t)) itermap::seekToTick(t);
+        return;
+    }
     else if (cmd.rfind("step ", 0) == 0) {
         if (cfgNum("step", cmd.substr(5), g_stepTicks))
             log::info("phase2: stepping {} ticks", g_stepTicks);
@@ -376,6 +407,13 @@ inline void pollCommandFileImpl(const std::string& cmd) {
     else if (cmd == "quit") {
         writeResult("user quit via cmd");
         endSession("user_quit");
+        return;
+    }
+    // The human takeover's end key, for a driver or an agent that has no keyboard on the worker
+    // (mod/takeover.hpp): the attempt in progress and the summary are closed as the key closes them.
+    else if (cmd == "takeoverend") {
+        if (takeover::armed()) takeover::endByKey();
+        else writeResult("takeoverend: this session has no takeover");
         return;
     }
     else if (cmd == "diag") {
@@ -469,10 +507,17 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     }
     else if (key == "dphorizon") cfgNum(key, val, g_cfg.dpHorizon);
     else if (key == "dpstephorizon") cfgNum(key, val, g_cfg.dpStepHorizon);
+    else if (key == "dpseed") cfgNum(key, val, g_cfg.dpSeed);
+    else if (key == "dpsearch") {
+        if (val == "dp" || val == "beam" || val == "montecarlo") g_cfg.dpSearch = val;
+        else writeResult("cfg: dpsearch=" + val + " is not dp, beam or montecarlo - ignored (dp)");
+    }
     else if (key == "dpfastvetoall") g_cfg.dpFastVetoAll = (val == "1");
     else if (key == "dprejoinfull") g_cfg.dpRejoinFull = (val == "1");
     else if (key == "dpoffboardkill") g_cfg.dpOffBoardKill = (val == "1");
     else if (key == "offboardtp") g_cfg.offBoardTp = (val == "1");
+    else if (key == "offboardfree") g_cfg.offBoardFree = (val == "1");
+    else if (key == "offboardband") g_cfg.offBoardBand = (val == "1");
     else if (key == "dpmaxiters") cfgNum(key, val, g_cfg.dpMaxIters);
     else if (key == "dptopstop") cfgNum(key, val, g_cfg.dpTopStop);
     else if (key == "coinmissrev") g_cfg.coinMissRev = (val == "1");
@@ -508,10 +553,14 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpseccaptiers") cfgNum(key, val, g_cfg.dpSecCapTiers);
     else if (key == "dpsecstate") g_cfg.dpSecState = (val == "1");
     else if (key == "dpsecsolved") g_cfg.dpSecSolved = (val == "1");
+    else if (key == "dpsecrecaway") g_cfg.dpSecRecAway = (val == "1");
     else if (key == "dpsecreuse") g_cfg.dpSecReuse = (val == "1");
     else if (key == "dpsecrent") g_cfg.dpSecRent = (val == "1");
     else if (key == "dpsecrungprior") cfgNum(key, val, g_cfg.dpSecRungPrior);
     else if (key == "dpsecwallbudget") cfgNum(key, val, g_cfg.dpSecWallBudget);
+    else if (key == "dpunseenfirst") g_cfg.dpUnseenFirst = (val == "1");
+    else if (key == "dpseedpickups") g_cfg.dpSeedPickups = (val == "1");
+    else if (key == "obbnolatch") g_cfg.obbNoLatch = (val == "1");
     else if (key == "dpseccoinrung") g_cfg.dpSecCoinRung = (val == "1");
     else if (key == "dpendtrigclear") g_cfg.dpEndTrigClear = (val == "1");
     else if (key == "slice") g_cfg.slice = (val == "1");
@@ -552,9 +601,12 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpcheckfirst") g_cfg.dpCheckFirst = (val == "1");
     else if (key == "dpcontenthorizon") cfgNum(key, val, g_cfg.dpContentHorizon);
     else if (key == "dpcapladder") cfgNum(key, val, g_cfg.dpCapLadder);
+    else if (key == "dpsigcheck") cfgNum(key, val, g_cfg.dpSigCheck);
+    else if (key == "gtrollcheck") cfgNum(key, val, g_cfg.gtRollCheck);
     else if (key == "dpplainbeside") cfgNum(key, val, g_cfg.dpPlainBeside);
     else if (key == "dpinputgrid") cfgNum(key, val, g_cfg.dpInputGrid);
     else if (key == "dpphaseprof") g_cfg.dpPhaseProf = (val == "1");
+    else if (key == "memcensus") g_cfg.memCensus = (val == "1");
     else if (key == "dpspentpad") g_cfg.dpSpentPad = (val == "1");
     else if (key == "dpxtrack") g_cfg.dpXTrack = (val == "1");
     else if (key == "dpfineretry") g_cfg.dpFineRetry = (val == "1");
@@ -597,6 +649,15 @@ inline bool loadTraceCfg(const std::string& key, const std::string& val) {
     }
     if (key == "rngfix") {
         g_rngFix = (val != "0");
+        return true;
+    }
+    if (key == "attemptone") {
+        g_attemptOne = (val == "1");
+        return true;
+    }
+    if (key == "attemptcount") {
+        long long k = -1;
+        g_attemptCount = (cfgNum(key, val, k) && k >= 0) ? k : -1;
         return true;
     }
     if (key == "rngseed") {
@@ -754,15 +815,42 @@ inline void loadConfig() {
         if (key == "framebudgetms") { cfgNum(key, val, g_cfg.frameBudgetMs); continue; }
         if (key == "anticheatpass") { g_cfg.antiCheatPass = (val == "1"); continue; }
         if (key == "snapplayer") { g_cfg.snapPlayer = (val == "1"); continue; }
+        if (key == "snapnodesync") { g_cfg.snapNodeSync = (val == "1"); continue; }
+        if (key == "snapnodelog") { g_cfg.snapNodeLog = (val == "1"); continue; }
+        if (key == "singlereset") { g_cfg.singleReset = (val == "1"); continue; }
+        if (key == "resetlog") { g_cfg.resetLog = (val == "1"); continue; }
+        if (key == "resetdump") { g_cfg.resetDump = (val == "1"); continue; }
+        if (key == "resetdumpuids") {
+            g_cfg.resetDumpUids.clear();
+            size_t p = 0;
+            while (p < val.size()) {
+                size_t q = val.find(',', p);
+                if (q == std::string::npos) q = val.size();
+                const int u = std::atoi(val.substr(p, q - p).c_str());
+                if (u > 0) g_cfg.resetDumpUids.push_back(u);
+                p = q + 1;
+            }
+            continue;
+        }
+        if (key == "headbandfresh") { g_cfg.headBandFresh = (val == "1"); continue; }
+        if (key == "persistworld") { cfgNum(key, val, g_cfg.persistWorld); continue; }
+        if (key == "persistitems") { g_cfg.persistItems = val; continue; }
+        if (key == "voidband") { g_cfg.voidBand = (val == "1"); continue; }
+        if (key == "recprovchain") { g_cfg.recProvChain = (val == "1"); continue; }
+        if (key == "cpfollowsection") { g_cfg.cpFollowSection = (val == "1"); continue; }
         if (key == "cpflight") { cfgNum(key, val, g_cfg.cpFlight); continue; }
         if (key == "cpflightprobe") { g_cfg.cpFlightProbe = (val == "1"); continue; }
         if (key == "cpflightobj") { cfgNum(key, val, g_cfg.cpFlightObj); continue; }
+        if (key == "takeover") { cfgNum(key, val, g_cfg.takeoverAt); continue; }
+        if (key == "takeoverx") { cfgNum(key, val, g_cfg.takeoverX); continue; }
+        if (key == "takeoverwait") { cfgNum(key, val, g_cfg.takeoverWait); continue; }
         if (key == "cpflightprobeat") { cfgNum(key, val, g_cfg.cpFlightProbeAt); continue; }
         if (key == "cpflightlayerdiff") { g_cfg.cpFlightLayerDiff = (val == "1"); continue; }
         if (key == "cpflightcarrylog") { g_cfg.cpFlightCarryLog = (val == "1"); continue; }
         if (key == "cpflightnodewatch") { g_cfg.cpFlightNodeWatch = val; continue; }
         if (key == "slicenotouch") { g_cfg.sliceNoTouch = (val == "1"); continue; }
         if (key == "slicetriggers") { g_cfg.sliceTriggers = (val == "1"); continue; }
+        if (key == "slicekeepgroups") { g_cfg.sliceKeepGroups = (val == "1"); continue; }
         if (key == "sliceuids") { g_cfg.sliceUids = (val == "1"); continue; }
         if (key == "slicefirstref") { g_cfg.sliceFirstRef = (val == "1"); continue; }
         if (key == "dplearnresets") { cfgNum(key, val, g_cfg.dpLearnResets); continue; }
@@ -787,6 +875,40 @@ inline void loadConfig() {
         if (key == "secleafmid") { secsolve::g_leafMid = (val == "1"); continue; }
         if (key == "secleaflife") { cfgNum(key, val, secsolve::g_leafLife); continue; }
         if (key == "secdrift") { secsolve::g_driftLog = (val == "1"); continue; }
+        if (key == "seekvisevery") { cfgNum(key, val, itermap::g_seekVisEvery); continue; }
+        if (key == "seekblind") { itermap::g_seekBlind = (val == "1"); continue; }
+        if (key == "profsample") { itermap::g_profSample = (val == "1"); continue; }
+        if (key == "sectionhooklazy") { itermap::g_sectionHookLazy = (val == "1"); continue; }
+        if (key == "seekcp") { cfgNum(key, val, itermap::g_seekCpEvery); continue; }
+        if (key == "seekcpfrom") { cfgNum(key, val, itermap::g_seekCpFrom); continue; }
+        if (key == "seekcpto") { cfgNum(key, val, itermap::g_seekCpTo); continue; }
+        if (key == "seekcpkeep") { itermap::g_seekCpKeep = (val == "1"); continue; }
+        if (key == "latchat") { cfgNum(key, val, itermap::g_latchAt); continue; }
+        if (key == "headcheck") { itermap::g_headCheck = (val == "1"); continue; }
+        if (key == "regionat") { cfgNum(key, val, itermap::g_regionAt); continue; }
+        if (key == "pauseattick") { cfgNum(key, val, itermap::g_pauseAtTick); continue; }
+        if (key == "groupcheck") { itermap::g_groupCheck = (val == "1"); continue; }
+        if (key == "actcensus") { itermap::g_actCensus = (val == "1"); continue; }
+        if (key == "cpactivation") { cfgNum(key, val, g_cfg.cpActivation); continue; }
+        if (key == "cpvisafter") { g_cfg.cpVisAfter = (val == "1"); continue; }
+        if (key == "objwatch") {
+            itermap::g_objWatch.clear();
+            std::stringstream ss(val);
+            for (std::string u; std::getline(ss, u, ',');)
+                if (!u.empty()) itermap::g_objWatch.push_back(std::atoi(u.c_str()));
+            continue;
+        }
+        if (key == "batchlog") {
+            if (std::sscanf(val.c_str(), "%lld:%lld", &itermap::g_batchFrom, &itermap::g_batchTo) != 2)
+                writeResult("cfg: batchlog=" + val + " is not from:to - ignored");
+            continue;
+        }
+        if (key == "regionbox") {
+            float* b = itermap::g_regionBox;
+            if (std::sscanf(val.c_str(), "%f:%f:%f:%f", &b[0], &b[1], &b[2], &b[3]) != 4)
+                writeResult("cfg: regionbox=" + val + " is not x0:y0:x1:y1 - ignored");
+            continue;
+        }
         if (key == "secbound") { secsolve::g_boundOn = (val == "1"); continue; }
         if (key == "secshaderskip") { secsolve::g_shaderSkip = (val == "1"); continue; }
         if (key == "secshadersig") { secsolve::g_shaderSig = (val == "1"); continue; }
@@ -795,7 +917,24 @@ inline void loadConfig() {
         if (key == "secbookfirst") { secsolve::g_bookFirst = (val == "1"); continue; }
         if (key == "secjbkeep") { secsolve::g_jbKeep = (val == "1"); continue; }
         if (key == "secheaddash") { secsolve::g_headDash = (val == "1"); continue; }
+        if (key == "secheadaccel") { secsolve::g_headAccel = (val == "1"); continue; }
+        // (not on the else-if chain below: one more link there exceeds MSVC's nesting limit, C1061)
+        if (key == "secsnapring") { psnap::g_snapRing = (val == "1"); continue; }
+        if (key == "anchorboardarm") { g_cfg.anchorBoardArm = (val == "1"); continue; }
         if (key == "secgracedash") { secsolve::g_graceDash = (val == "1"); continue; }
+        if (key == "secwsnapauto") { secsolve::g_wsnapAuto = (val == "1"); continue; }
+        if (key == "secwsnapgate") { secsolve::g_wsnapGate = (val == "1"); continue; }
+        if (key == "seclieskippsnap") { secsolve::g_lieSkipPsnap = (val == "1"); continue; }
+        if (key == "secwsnapset") { cfgNum(key, val, secsolve::g_wsnapSet); continue; }
+        if (key == "secwsnapany") { secsolve::g_wsnapAny = (val == "1"); continue; }
+        if (key == "secwsnaplayer") { cfgNum(key, val, psnap::g_layerInput); continue; }
+        if (key == "secwsnapgroups") {
+            secsolve::g_wsnapGroups.clear();
+            std::stringstream gs(val);
+            for (std::string tok; std::getline(gs, tok, ',');)
+                if (!tok.empty()) secsolve::g_wsnapGroups.push_back(std::atoi(tok.c_str()));
+            continue;
+        }
         if (key == "levelfiletype") { g_cfg.levelFileMain = (val == "main"); continue; }
         if (key == "leveldir") { suite::g_levelDir = val; continue; }
         if (key == "enabled") g_cfg.enabled = (val == "1");
@@ -1103,9 +1242,10 @@ inline void loadConfig() {
         else if (key == "uimode") cfgNum(key, val, g_uiMode);
         // One branch for both keys: this else-if chain is at MSVC's block-nesting limit (C1061),
         // so a new key joins an existing branch. coinroute implies coins whatever the order.
-        else if (key == "coins" || key == "coinroute" || key == "coinwatch") {
+        else if (key == "coins" || key == "coinroute" || key == "coinwatch" || key == "worldgates") {
             if (key == "coinroute") g_cfg.coinRoute = (val == "1");
             else if (key == "coinwatch") g_cfg.coinWatch = (val == "1");
+            else if (key == "worldgates") g_cfg.worldGates = (val == "1");
             else g_cfg.coinMode = (val == "1");
             if (g_cfg.coinRoute) g_cfg.coinMode = true;
         }
@@ -1115,6 +1255,13 @@ inline void loadConfig() {
             if (comma != std::string::npos && cfgNum(key, val.substr(0, comma), at)) {
                 g_cfg.toggles.push_back({ at, val.substr(comma + 1) });
             }
+        }
+        else if (key == "planfile") {
+            // A plan file (plan_io.hpp loadInputsFile), an attempt sequence included: its last block is
+            // g_cfg.inputs, the blocks before it the prelude.
+            std::vector<InputCmd> p;
+            if (loadInputsFile(val, p)) g_cfg.inputs = std::move(p);
+            else writeResult("planfile: could not read " + val);
         }
         else if (key == "input") {
             auto comma = val.find(',');
@@ -1135,6 +1282,9 @@ inline void endSession(const std::string& why) {
     // the next one.
     g_secSaveFastloops = 1;
     resetSecsolveSession();
+    // The search's run ends with the session, HOWEVER it ended, and says so (dp_bridge runEnd): a
+    // run left open is the carry-over the next level's start refuses.
+    writeResult(dpbridge::runEnd());
     // The iteration map, HOWEVER the session ended.
     //
     // It used to be written from two places only -- the clear, and giveUp -- which between them
@@ -1168,6 +1318,9 @@ inline void endSession(const std::string& why) {
     writeResult("anticheat: destroyPlayer calls with GD's anti-cheat spike="
         + std::to_string(solver::g_anticheatCalls) + " (counted, not logged per call)");
     solver::g_anticheatCalls = 0;
+    solver::g_killTick = -1;   // cfg voidband: the last killer belongs to this session
+    solver::g_killUid = -1;
+    solver::g_killX = solver::g_killY = 0.f;
     writeResult("avswallowed: visit=" + std::to_string(g_visitAVs)
         + " updateVisibility=" + std::to_string(g_visAVs)
         + " rendertoggles=" + std::to_string(g_watchFlips)
@@ -1236,6 +1389,20 @@ inline void endSession(const std::string& why) {
         }
         writeResult(m);
     }
+    // ...and the touch triggers GD actually fired (touchfire, playerTouchedTrigger), uid order, with the
+    // hook's own counts: the map above holds orbs and portals, never these.
+    {
+        std::vector<std::pair<int, int>> v(touchfire::g_first.begin(), touchfire::g_first.end());
+        std::sort(v.begin(), v.end());
+        std::string m = "touchfire map (p1 " + std::to_string(v.size()) + ", p2 calls "
+                        + std::to_string(touchfire::g_p2) + ", calls " + std::to_string(touchfire::g_calls) + "):";
+        bool first = true;
+        for (const auto& kv : v) {
+            m += (first ? " " : ",") + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+            first = false;
+        }
+        writeResult(m);
+    }
     // ...and the same for the gravity portals (see portalseed). Same shape and
     // the same reason: a plain replay writes the whole map, and any anchor's
     // portal mask is the prefix of it at or before t0.
@@ -1298,8 +1465,23 @@ inline void endSession(const std::string& why) {
     if (g_rngFix) writeResult("rngfix: trigger seed drawn inside a reset " +
                               std::to_string(g_rngDrawnInReset) + " times");
     g_rngDrawnInReset = 0;
+    // attemptone: how often the pin answered (see g_attemptOne). Both 0 on a level that reads
+    // neither the attempt count nor a kept item.
+    if (g_cfg.singleReset)
+        writeResult("singlereset: " + std::to_string(g_resetsSkipped) + " resets skipped (no physics since the last reset)");
+    if (g_attemptOne)
+        writeResult("attemptone: attempt count read as on attempt 1 " + std::to_string(g_attemptReadsPinned)
+                    + " times, kept items not carried over " + std::to_string(g_persistTransfersSkipped)
+                    + " times");
+    else if (g_attemptCount >= 0)
+        writeResult("attemptcount: attempt count read as " + std::to_string(g_attemptCount) + " "
+                    + std::to_string(g_attemptReadsPinned) + " times");
+    g_attemptReadsPinned = 0;
+    g_persistTransfersSkipped = 0;
+    g_attemptReadsSeen = 0;
     // cfg cpflight: its tally (mod/cp_flight.hpp comes after this file; the solve's start sets this).
     if (g_cpFlightSummary) writeResult(g_cpFlightSummary());
+    if (itermap::g_actCensus) writeResult(itermap::actCensusLine());   // cfg actcensus (print only)
     g_cpFlightSummary = nullptr;
     // Corridor clearance table (cfg clearance=1). Written out from the samples gathered during
     // the run
@@ -1335,6 +1517,11 @@ inline void endSession(const std::string& why) {
     // is over, and while it runs it holds the job slot that the next level's Solve queues behind
     // (dpsolve::start).
     dpbridge::cancelSearch(true);
+    // ...and the memory the solving held, which nothing reads from here on (repair.hpp
+    // releaseSolveMemory; a search that has not stopped yet keeps it, and leaving the level asks
+    // again).
+    if (g_solveMemHeld) dpsolve::releaseSolveMemory("session end");
+    dpsolve::memCensus("session end");   // cfg memcensus (print only)
     g_sessionOver = true;
     writeResult("session_end: " + why);
     flushAll();

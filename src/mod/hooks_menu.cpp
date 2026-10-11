@@ -43,6 +43,7 @@ class $modify(P1MenuLayer, MenuLayer) {
                 stallwatch::start();
                 updateWindowTitle();
                 writeResult("session_start", true);
+                dpsolve::memCensus("session start");   // cfg memcensus (print only)
                 writeResult(dpConfigLine());   // the solver configuration, one line
                 // Say once, plainly, whether the research trail (dp_band_itN/dp_groups_itN and
                 // the recorder's dp_fixin_*/dp_attempt_itN files) is being kept this session --

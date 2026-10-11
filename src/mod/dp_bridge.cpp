@@ -1,90 +1,37 @@
-// The one translation unit that compiles the solver core (dp/) inside the mod.
+// The mod's side of the solver core: dpbridge (dp_bridge.hpp), composed of the core's two copies.
 //
-// NOTHING from Geode or cocos may be included here, and nothing here may include a mod header
-// that does: the dp headers are written for a plain C++ toolchain, and the Windows/cocos
-// macro soup breaks them. The whole of the mod's contact with the solver goes through
-// dp_bridge.hpp, which mentions neither library.
-//
-// Geode force-includes its prelude into every source of the mod target, and that drags in
-// <windows.h>, so "include no Windows headers" is not something this file can decide for
-// itself -- windef.h has already defined NEAR and FAR as empty macros by the time the first
-// line here is compiled, and dp's `enum Bucket { NEAR, PORT, ... }` becomes a syntax error.
-// Undefining them is the whole fix: nothing in dp wants the segment-model keywords, and this
-// TU calls no Windows API.
-#undef NEAR
-#undef FAR
-#undef near
-#undef far
-#undef small
-#undef min
-#undef max
-
-// cli.hpp is the whole of leveldp -- the dp chain plus the front end as dp::cliMain. The CLI
-// executable is a three-line main() around the same header, so the mod runs the solver's code
-// path rather than an imitation of it.
-#include "dp/cli.hpp"
-
+// The core itself is compiled elsewhere, without Geode or cocos in scope: the first copy once for
+// both the CLI and the mod (dp/src/dpcore.cpp, library gdsolver_dpcore), the second in
+// dp_bridge2.cpp (gdsolver_dpcore2), both with the CLI's options (dp/CMakeLists.txt). This file
+// includes no dp/ header -- only their plain-C++ faces -- so the whole of the mod's contact with
+// the solver goes through dp_bridge.hpp, which mentions neither library.
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 
 #include "mod/dp_bridge.hpp"
 
 namespace dpbridge {
 
-LevelStats statsFromCsv(const std::string& csv) {
-    std::istringstream in(csv);
-    dp::Level L = dp::loadLevelFrom(in);
-    LevelStats s;
-    s.ok = true;
-    s.objs = L.objs.size();
-    s.portals = L.portals.size();
-    s.pads = L.pads.size();
-    s.orbs = L.orbs.size();
-    s.moving = L.dyn.size();
-    s.maxX = L.maxX;
-    s.unsupported = L.unsupported;
-    return s;
+LevelStats statsFromCsv(const std::string& csv) { return dpcore::statsFromCsv(csv); }
+
+void setFileSigHints(const std::unordered_map<std::string, std::string>& hints) {
+    dpcore::setFileSigHints(hints);
+    second::setFileSigHints(hints);
 }
 
 int solveInProcess(const std::string& csv, const std::vector<std::string>& args) {
-    // The level comes from memory; the path argument is still required positionally, so it is
-    // given a name that says where the bytes really came from if it ever shows up in a message
-    std::vector<std::string> argv{"leveldp", "(in-process level)"};
-    argv.insert(argv.end(), args.begin(), args.end());
-    std::vector<char*> ptr;
-    ptr.reserve(argv.size());
-    for (std::string& a : argv) ptr.push_back(a.data());
-
-    dp::g_levelCsv = csv;
-    int rc = -1;
-    try {
-        rc = dp::cliMain((int)ptr.size(), ptr.data());
-    } catch (...) {
-        rc = -2;   // never let an exception cross back into the game's frame
-    }
-    dp::g_levelCsv.clear();
-    return rc;
+    return dpcore::solveInProcess(csv, args);
 }
 
-std::vector<double> prepMarks() {
-    return std::vector<double>(std::begin(dp::g_prepMark), std::end(dp::g_prepMark));
-}
+std::vector<double> prepMarks() { return dpcore::prepMarks(); }
 
-SolveProgress progress() {
-    SolveProgress p;
-    p.running = dp::g_progress.running.load(std::memory_order_acquire);
-    p.from = dp::g_progress.from.load(std::memory_order_relaxed);
-    p.tick = dp::g_progress.tick.load(std::memory_order_relaxed);
-    p.horizon = dp::g_progress.horizon.load(std::memory_order_relaxed);
-    p.x = dp::g_progress.x.load(std::memory_order_relaxed);
-    p.alive = dp::g_progress.alive.load(std::memory_order_relaxed);
-    return p;
-}
+SolveProgress progress() { return dpcore::progress(); }
 
-SolveOutcome outcome() {
-#include "mod/dp_bridge_outcome.inl"
-}
+SolveOutcome outcome() { return dpcore::outcome(); }
 
 // ---- the plain search beside the ladder (cli.hpp PlainElsewhere) ---------------------------
 //
@@ -122,57 +69,12 @@ void removeSideFiles(const std::string& out) {
     std::filesystem::remove(sidePath(out) + ".trace.csv", ec);
 }
 
-void adoptOutcome(const SolveOutcome& s) {
-    dp::SearchOutcome& o = dp::g_outcome;
-    o.verdict = s.verdict;
-    o.horizonCut = s.horizonCut;
-    o.deepT = s.deepT;
-    o.deepX = s.deepX;
-    o.capHits = s.capHits;
-    o.workStates = s.workStates;
-    o.cancelT = s.cancelT;
-    o.resimDead = s.resimDead;
-    o.resimFirst = s.resimFirst;
-    o.resimWhy = s.resimWhy;
-    o.resimUid = s.resimUid;
-    o.resimObjX = s.resimObjX;
-    o.resimObjY = s.resimObjY;
-    o.resimTrig = dp::TouchMask{};
-    o.resimTrig.w[0] = s.resimTrig;
-    o.resimFrame = s.resimFrame;
-    o.replayDiedT = s.replayDiedT;
-    o.rejoinT = s.rejoinT;
-    o.rejoinBadT = s.rejoinBadT;
-    o.rejoinBadWhy = s.rejoinBadWhy;
-    o.needTrigMask = dp::TouchMask{};
-    o.needTrigMask.w[0] = s.needTrigMask;
-    o.needTrigPassed = dp::TouchMask{};
-    o.needTrigPassed.w[0] = s.needTrigPassed;
-    o.seedRotQ = s.seedRotQ;
-    o.rotQOrder = s.rotQOrder;
-    o.coinGates = s.coinGates;
-    o.coinNoPrune = s.coinNoPrune;
-    o.startRotHit = s.startRotHit;
-    o.startRotGiven = s.startRotGiven;
-    o.startRotMiss = s.startRotMiss;
-    o.trigWinTouch = s.trigWinTouch;
-    o.trigTotal = s.trigTotal;
-    o.trigRelevantN = s.trigRelevantN;
-    o.trigKept = s.trigKept;
-    o.trigDroppedRelevant = s.trigDroppedRelevant;
-    o.trigDroppedBehind = s.trigDroppedBehind;
-    o.trigDroppedAhead = s.trigDroppedAhead;
-    o.trigMaxKeptX = s.trigMaxKeptX;
-    o.trigMapSig = s.trigMapSig;
-    o.unsupported = s.unsupported;
-}
-
 bool besideStart(const std::vector<std::string>& argv) {
     if (!g_beside.enabled) return false;
     // The checkpoint channel flies the plain search's checkpoints while it runs and waits for
     // their judgement; the second copy has no such channel, so with it on the ladder searches the
     // plain search itself.
-    if (dp::g_check.enabled.load(std::memory_order_acquire)) return false;
+    if (dpcore::checkEnabled()) return false;
     std::vector<std::string> a = argv;
     std::string out;
     for (size_t i = 0; i + 1 < a.size(); ++i) {
@@ -193,15 +95,15 @@ bool besideStart(const std::vector<std::string>& argv) {
     second::takeOutput();   // nothing is left from a search before this one
     second::cancel(false);
     g_beside.killsAt = second::envKillsTotal();
-    g_beside.th = std::thread([a, csv = dp::g_levelCsv] {
+    g_beside.th = std::thread([a, csv = dpcore::levelCsv()] {
         g_beside.rc = second::solve(csv, a);
         const SolveOutcome o = second::outcome();
         g_beside.solved.store(o.verdict == OutcomeSolved);
         g_beside.deepT.store(o.deepT);
         g_beside.done.store(true, std::memory_order_release);
         // the gamble: stop the ladder's attempt in progress if this is already what it will take
-        if (g_beside.gamble && gambleHolds(dp::g_ladderBestT.load()))
-            dp::g_ladderStop.store(true);
+        if (g_beside.gamble && gambleHolds(dpcore::ladderBestT()))
+            dpcore::ladderStop();
     });
     return true;
 }
@@ -227,7 +129,7 @@ int besideTake() {
     if (std::filesystem::exists(side, ec)) std::filesystem::rename(side, g_beside.out, ec);
     if (std::filesystem::exists(side + ".trace.csv", ec))
         std::filesystem::rename(side + ".trace.csv", g_beside.out + ".trace.csv", ec);
-    adoptOutcome(second::outcome());
+    dpcore::adoptOutcome(second::outcome());
     g_besideKills.fetch_add(second::envKillsTotal() - g_beside.killsAt,
                             std::memory_order_relaxed);
     return g_beside.rc;
@@ -249,7 +151,7 @@ bool sameFile(const std::string& a, const std::string& b) {
     if (ea != eb) return false;
     if (!ea) return true;
     std::string x, y;
-    return dp::readFileBytes(a, x) && dp::readFileBytes(b, y) && x == y;
+    return dpcore::readFileBytes(a, x) && dpcore::readFileBytes(b, y) && x == y;
 }
 
 bool sameText(const char* a, const char* b) {
@@ -337,11 +239,30 @@ void plainBeside(int mode) {
     g_beside.enabled = mode > 0;
     g_beside.gamble = mode == 3;
     if (mode > 0)
-        dp::g_plainElsewhere = dp::PlainElsewhere{besideStart, besideTake, besideDrop,
-                                                  mode == 2 ? besideCheck : nullptr,
-                                                  mode == 3 ? besideReady : nullptr};
+        dpcore::setPlainElsewhere(dpcore::PlainElsewhereHooks{besideStart, besideTake, besideDrop,
+                                                              mode == 2 ? besideCheck : nullptr,
+                                                              mode == 3 ? besideReady : nullptr});
     else
-        dp::g_plainElsewhere = dp::PlainElsewhere{};
+        dpcore::setPlainElsewhere(dpcore::PlainElsewhereHooks{});
+}
+
+bool releaseCaches() {
+    // The plain search beside the ladder runs on a thread of its own and is joined only when the
+    // ladder takes or drops it; while it may still be running, its copy's tables are in use. The
+    // first copy's caller (the loop's worker) is the mod's to rule out (repair.hpp).
+    if (g_beside.th.joinable()) return false;
+    dpcore::releaseCaches();
+    second::releaseCaches();
+    return true;
+}
+
+std::size_t cacheBytes() {
+    if (g_beside.th.joinable()) return 0;
+    return dpcore::cacheBytes() + second::cacheBytes();
+}
+std::size_t groupCacheBytes() {
+    if (g_beside.th.joinable()) return 0;
+    return dpcore::groupCacheBytes() + second::groupCacheBytes();
 }
 
 std::string besideCheckTaken() {
@@ -351,61 +272,51 @@ std::string besideCheckTaken() {
     return s;
 }
 
-void checkSubscribe(bool on) {
-    dp::g_check.enabled.store(on, std::memory_order_release);
-    if (!on) dp::g_check.reset();
-}
+void checkSubscribe(bool on) { dpcore::checkSubscribe(on); }
 
-bool nextCheckpoint(SolveCheckpoint& out) {
-    // One lock for the call id, the judged count and the point: reset() changes all three under
-    // it, so reading them apart could pair an index from one call with a point from the next.
-    std::lock_guard<std::mutex> g(dp::g_check.m);
-    const size_t idx = dp::g_check.judged.load(std::memory_order_acquire);
-    if (idx >= dp::g_check.points.size()) return false;
-    const dp::SearchCheckpoints::Point& p = dp::g_check.points[idx];
-    out.call = (unsigned long long)dp::g_check.call.load(std::memory_order_acquire);
-    out.index = idx;
-    out.t0 = p.t0;
-    out.tick = p.tick;
-    out.edges = p.edges;
-    return true;
-}
+bool nextCheckpoint(SolveCheckpoint& out) { return dpcore::nextCheckpoint(out); }
 
-unsigned long long checkCall() {
-    return (unsigned long long)dp::g_check.call.load(std::memory_order_acquire);
-}
+unsigned long long checkCall() { return dpcore::checkCall(); }
 
 bool passCheckpoint(unsigned long long call, std::size_t index) {
-    return dp::g_check.pass((uint64_t)call, index);
+    return dpcore::passCheckpoint(call, index);
 }
 
 void cancelSearch(bool on) {
-    dp::g_check.cancel.store(on, std::memory_order_release);
+    dpcore::cancel(on);
     second::cancel(on);   // and the plain search beside the ladder, if one is running
 }
 long long envKillsTotal() {
-    return dp::g_envKills.load(std::memory_order_relaxed)
-           + g_besideKills.load(std::memory_order_relaxed);
-}
-std::string coreVersion() {
-    // No version string exists in dp/ yet; the compile stamp of this TU is what identifies
-    // the core that is linked in, and it moves whenever dp/ is rebuilt
-    return std::string("dp core built ") + __DATE__ + " " + __TIME__;
+    return dpcore::envKillsTotal() + g_besideKills.load(std::memory_order_relaxed);
 }
 
-std::string defaultsProfile() {
-    dp::resetInvocationState();
-    const std::string list = dp::defaultsProfile();
-    uint64_t h = 1469598103934665603ULL;   // FNV-1a of the list, so two runs compare by one field
-    for (char c : list) {
-        h ^= (uint8_t)c;
-        h *= 1099511628211ULL;
+bool runBegin(int level, unsigned long long seed, std::string& why) {
+    // Both copies are asked before either opens: a refusal leaves neither half-begun.
+    if (dpcore::runOpen()) return dpcore::runBegin(level, seed, why);
+    std::string why2;
+    if (!second::runBegin(level, seed, why2)) {
+        why = "the second core: " + why2;
+        return false;
     }
-    std::string core = coreVersion();
-    for (char& c : core) if (c == ' ') c = '_';
-    char fnv[24];
-    std::snprintf(fnv, sizeof(fnv), "%016llx", (unsigned long long)h);
-    return "core=" + core + " fnv=" + fnv + " " + list;
+    return dpcore::runBegin(level, seed, why);
 }
+std::string runVerified(const std::vector<std::pair<long long, int>>& flown, long long deathT,
+                        double x, bool cleared, long long divT) {
+    second::runVerified(flown, deathT, x, cleared, divT);
+    return dpcore::runVerified(flown, deathT, x, cleared, divT);
+}
+void runNoteSplice(const std::vector<std::pair<long long, int>>& edges, long long t0) {
+    second::runNoteSplice(edges, t0);
+    dpcore::runNoteSplice(edges, t0);
+}
+std::string runEnd() {
+    const std::string s2 = second::runEnd();
+    std::string s = dpcore::runEnd();
+    if (s2.find("no run open") == std::string::npos) s += " | second core: " + s2;
+    return s;
+}
+std::string coreVersion() { return dpcore::coreVersion(); }
+
+std::string defaultsProfile() { return dpcore::defaultsProfile(); }
 
 }  // namespace dpbridge

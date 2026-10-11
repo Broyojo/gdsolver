@@ -8,8 +8,16 @@ struct XSlice {
     const std::vector<Obj>& v;
     size_t lo = 0;
     double maxHw = 0.0;
+    // --widescan (constants.hpp): the objects forRange's break can step over, by index
+    std::vector<size_t> wide;
+    double wideMaxHw = 0.0;
     explicit XSlice(const std::vector<Obj>& objs) : v(objs) {
         for (const Obj& o : objs) maxHw = std::max(maxHw, o.hw);
+        for (size_t i = 0; i < objs.size(); ++i)
+            if (objs[i].hw >= kWideScanHw) {
+                wide.push_back(i);
+                wideMaxHw = std::max(wideMaxHw, objs[i].hw);
+            }
     }
     // Rewind for a window that starts BEHIND the cursor. The old code only ever
     // advanced (callers were monotone in x); gameplay rotation broke that, and
@@ -37,13 +45,52 @@ struct XSlice {
     // rebuild; firing it only when the window actually moved back keeps the
     // forward case at its old cost (rebuilding every tick cost lv21 11.6 ->
     // 29.5 min once, which is why this is a rewind and not a rebuild).
+    // --widescan (constants.hpp): the cursor and the break below read each object's own edges, and
+    // edges follow cx only for objects of about one width. Under the flag an object narrower than
+    // kWideScanHw is caught by the rewind and by a scan of kWideScanHw past the break, which is exact
+    // for it (its cx is within its half width of its edges); a wider one comes from `wide`, behind the
+    // cursor and past the break, with its own range test. What the break reached is visited first and
+    // in the same order.
     template <class F>
     void forRange(double x0, double x1, F&& f) {
-        if (lo > 0 && v[lo - 1].cx + v[lo - 1].hw + 40 >= x0) seekTo(x0);
+        const bool ws = g_wideScan;
+        if (lo > 0 && v[lo - 1].cx + (ws ? kWideScanHw : v[lo - 1].hw) + 40 >= x0) {
+            if (ws) {
+                const double lim = x0 - kWideScanHw - 40.0;
+                size_t a = 0, b = v.size();
+                while (a < b) {
+                    const size_t m = (a + b) / 2;
+                    if (v[m].cx < lim) a = m + 1; else b = m;
+                }
+                lo = a;
+            } else {
+                seekTo(x0);
+            }
+        }
         while (lo < v.size() && v[lo].cx + v[lo].hw + 40 < x0) ++lo;
-        for (size_t i = lo; i < v.size(); ++i) {
+        size_t i = lo;
+        for (; i < v.size(); ++i) {
             if (v[i].cx - v[i].hw > x1 + 40) break;
             f(v[i]);
+        }
+        if (!ws) return;
+        // the narrow ones just past the break (a wide one comes from `wide` below)
+        for (size_t j = i + 1; j < v.size() && v[j].cx - kWideScanHw <= x1 + 40; ++j)
+            if (v[j].hw < kWideScanHw && v[j].cx - v[j].hw <= x1 + 40) f(v[j]);
+        if (wide.empty()) return;
+        // the wide ones the cursor has passed...
+        const auto mid = std::lower_bound(wide.begin(), wide.end(), lo);
+        for (auto it = mid; it != wide.begin();) {
+            --it;
+            const Obj& o = v[*it];
+            if (o.cx + wideMaxHw + 40 < x0) break;
+            if (o.cx + o.hw + 40 >= x0 && o.cx - o.hw <= x1 + 40) f(o);
+        }
+        // ...and the ones past the break
+        for (auto it = std::upper_bound(wide.begin(), wide.end(), i); it != wide.end(); ++it) {
+            const Obj& o = v[*it];
+            if (o.cx - wideMaxHw > x1 + 40) break;
+            if (o.cx - o.hw <= x1 + 40 && o.cx + o.hw + 40 >= x0) f(o);
         }
     }
 };
@@ -57,6 +104,12 @@ struct State {
     float xAbs;       // absolute x, float-accumulated like GD (see advanceX)
     const Obj* snapObj;  // GD m_objectSnappedTo: last solid stood on (null = none)
     float snapDist;      // GD m_snapDistance: x - snapObj->cx at the last contact
+    // --p2xoff: the second dual body's x minus the first's (constants.hpp g_p2xOff). A teleport
+    // trigger moves player 1 alone, and the pair then runs apart for the rest of the dual. Written
+    // by stepBoth (fixup.hpp) only under the flag, 0 from a dual portal on, read only while dual,
+    // seeded at an anchor from --startp2dx. It accumulates. HERE and not at the end: it fills the
+    // padding before the next pointer, so sizeof is unchanged.
+    float dx2 = 0.f;
     const Obj* usedOrb;  // GD m_touchedRings: orb already used in this contact
     // One ring per HOLD. GD will not activate a second ring until the button
     // has been released and pressed again, and lv14 x=16875 y=585 is where that
@@ -155,6 +208,28 @@ struct State {
     // (cleared at the top of stepOne), not seeded; single-player only (a dual's halves would share
     // it, as they share seatT).
     float lawSv = 0.f;
+    // --followy only (0 otherwise): where each Follow Player Y's reference object is, per slot
+    // (modifiers.hpp, FollowY) -- the filtered y of player 1 its group closes on, which depends on
+    // the whole path behind the state and so has to ride with it. Bit `slot` of followOk says the
+    // value is known: set on the tick whose move crosses the trigger (to the object's load-time
+    // y) or by the --start anchor (from the recording); unknown, the group stays where the
+    // recording put it. It accumulates; a dual's two bodies share it (player 1's y drives it).
+    float followF[kFollowYSlots] = {0.f, 0.f};
+    uint8_t followOk = 0;
+    // --teleportorb only (0 otherwise): the body arrived at a teleport orb's target on the last
+    // tick, with GD's m_isOnGround still set from where it left. One tick of life (cleared at the
+    // top of stepOne): the jump and the ball's tap read that stale ground on the next tick, the
+    // physics does not (calib_teleportorb). Not seeded, like lawSv.
+    uint8_t tpArrive = 0;
+    // --ctrltouch only (0 otherwise): a touch-triggered Options trigger this branch touched has
+    // switched player 1's controls off (modifiers.hpp, CtrlTouchBox); the button is ignored while it
+    // is set. It accumulates and is not seeded: an anchor inside a recorded window keeps --ctrlwin.
+    uint8_t ctrlT = 0;
+    // --seatspeed only (0 otherwise): the speed (speedCodeForDx) the ride's last ramp seat ran at,
+    // which is what GD's stored rate (+0x938) and launch velocity (+0x9b4) were computed with; 0
+    // when not riding. Rewritten on every riding tick, not seeded (an anchor on the tick after a
+    // speed change mid-ride is a hole, as for pFlap); a dual's two bodies share it.
+    uint8_t seatSpd = 0;
     // Ticks since gravity last flipped, saturated at 24 -- the same 0.1 s at
     // 240 ticks/s as slopeT above, and read the same way: GD stamps the time in
     // flipGravity (player+0x800) and collidedWithObjectInternal (:1180-1226)
@@ -993,6 +1068,11 @@ struct State {
     // Nothing above changes -- the arm that keeps the expression keeps the
     // hard-coded step, for the same reason.
     //
+    // [2026-10-09] The cube gets a stake of its own under --rotlatch: 1 or 2 when the spin keeps
+    // the full or the mini size it was staked at against the size now in force, 0 otherwise. Written
+    // and read only in the cube's spin block, under the flag; not seeded at an --start anchor (an
+    // anchor turns at its own size, as before the flag).
+    //
     // **At the END of the struct on purpose** -- same reason as jumpBuf above.
     float rotStep = 0.f;
     // --stickseam: the uid of the solid GD's stick re-land is tied to (+0x608,
@@ -1102,8 +1182,32 @@ struct State {
     // portal starts both at 0 (it is spawned upside down, in its own mode). Like flipT, not
     // carried by --start (255 = no grace). In the padding after dashing2, so sizeof is unchanged.
     uint8_t flipT2 = 255, modeT2 = 255;
+    // --dualhover: the SECOND body's robot hover budget (see rHover), swapped by swapHalves and
+    // merged by stepBoth under the flag. It accumulates and is NOT seeded at an --start anchor, as
+    // rHover is not; 0 whenever the flag is off. In the padding after modeT2, so sizeof is unchanged.
+    uint8_t rHover2 = 0;
+    // --ballscaleair: GD's +0x728 per body -- runBallRotation (the ground stake: a landing, a roll, a
+    // pad, a speed portal) raises it, toggleRollMode (0x39b570) clears it whenever the ball flag
+    // changes and flipGravity before a ball's air stake (ringJump's own stake leaves it alone), and
+    // togglePlayerScale (0x3a0cba) re-stakes the ball only while it is up. Bits 0-1 for
+    // the body being stepped, 2-3 for the second body (swapHalves swaps them, stepBoth merges 2-3 from
+    // the second half): 0 = not known, 1 = down, 2 = up. It accumulates and is NOT seeded at an
+    // --start anchor (the dump has no column for it), so an anchor starts it unknown and the scale
+    // falls back to reading the stake's value. 0 whenever the flag is off.
+    uint8_t ball728 = 0;
     float rot2 = 0.f, rotStep2 = 0.f;
     float dashSlope2 = 0.f;
+    // --slopestick: the ramp GD's +0x5e8 holds -- the one the body last landed on -- by uid, -1 when
+    // none. Written and read only under the flag; one tick of memory (this tick's seat, else -1), so
+    // the --start anchor does not seed it: an anchor on a moving ramp loses its first re-land.
+    int32_t stickSlope = -1;
+    // --spdsameonce: two more places in the speed portals' memory (see spdFired), per body, so the
+    // memory is four deep: spdFired[0..1] then spdMore[0..1], newest first. GD keeps every speed
+    // portal it activated (GJEffectManager's triggered-ID set, keyed by object and player); two
+    // stacked pairs under the body at once are four marks. Swapped by swapHalves, merged by stepBoth,
+    // not seeded at an anchor (as spdFired). -1 throughout whenever the flag is off. At the END on
+    // purpose (positional State{...}).
+    int32_t spdMore[2] = {-1, -1}, spdMore2[2] = {-1, -1};
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1192,8 +1296,25 @@ struct State {
 // and it seeds p1's, as boost2's note says of its own field. Not printed in --seeddump yet.
 // [2026-10-02] seatT2 (--dualseatt) landed in the padding after freeHalf: still 520. It accumulates
 // and is not seeded, as seatT is not.
+// [2026-10-05] 520 -> 528: followF / followOk (--followy). They accumulate; seeded at an anchor from
+// the recorded y of each trigger's reference object, and printed in --seeddump.
+// [2026-10-06] tpArrive (--teleportorb) landed in the padding after followOk: still 528. One tick
+// of life, so nothing to seed.
+// [2026-10-09] dx2 (--p2xoff, the second dual body's x offset) landed in the padding after
+// snapDist: still 528. It accumulates; seeded at an anchor from --startp2dx, printed in --seeddump
+// under the flag.
+// [2026-10-09] 528 -> 536: stickSlope (--slopestick, the ramp the body last landed on). One tick of
+// memory, so nothing to seed; -1 whenever the flag is off.
+// [2026-10-09] ctrlT (--ctrltouch) landed in the padding after tpArrive: still 536. It accumulates
+// and is not seeded (an anchor inside a recorded window keeps --ctrlwin); not printed in --seeddump.
+// [2026-10-10] ball728 (--ballscaleair, both bodies' +0x728 in one byte) landed in the padding after
+// rHover2: still 536. It accumulates and is not seeded (see the field); printed in --seeddump under
+// the flag.
+// [2026-10-10] 536 -> 552: spdMore / spdMore2 (--spdsameonce, the speed portals' memory four deep per
+// body, after stickSlope's padding). They accumulate and are not seeded, for spdFired's reason;
+// printed in --seeddump under the flag.
 constexpr size_t kStateBytes =
-    (520u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (552u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,

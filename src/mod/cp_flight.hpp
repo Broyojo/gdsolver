@@ -271,6 +271,18 @@ struct AreaState {
     // m_activatedByPlayer1 / m_activatedByPlayer2), bit 0/1/2, m_objects order, 0xff for other objects
     std::vector<uint8_t> activated;
     std::vector<GameObject*> area, processed;  // the lists' first `count` entries
+    // cfg cpactivation (off by default): every object's m_isActivated (m_objects order) and the layer's
+    // list of active objects with its count and index, as the flight had them. GD's checkpoint carries
+    // neither: the restore's reset activates what is in view then, and an object activated there and
+    // switched off by a toggle afterwards stays activated -- toggleGroup (0x223bc0) changes only the
+    // group count and +0x28e -- and staticObjectsInRect (0x211260) takes an activated object whatever
+    // its groups. Measured on SubZero 4002: four walls switched off at t=20,716 stayed in the query
+    // after a restore at t=20,400 and stopped a spider's teleport at t=21,319; the head run never had
+    // them activated.
+    bool haveActivation = false;
+    std::vector<uint8_t> activatedFlag;
+    std::vector<GameObject*> activeObjects;
+    int activeCount = 0, activeIndex = 0;
     int areaCount = 0, areaIndex = 0, processedCount = 0, processedIndex = 0;
 };
 
@@ -307,6 +319,14 @@ inline void captureArea(GJBaseGameLayer* l, AreaState& a) {
         e.stamp = o->m_unk4C8;
         e.skip = o->m_unk508;
         a.objs.push_back(e);
+    }
+    if (g_cfg.cpActivation) {
+        a.haveActivation = true;
+        a.activatedFlag.reserve(l->m_objects->count());
+        for (auto* o : CCArrayExt<GameObject*>(l->m_objects)) a.activatedFlag.push_back(o && o->m_isActivated ? 1 : 0);
+        a.activeObjects = l->m_activeObjects;
+        a.activeCount = l->m_activeObjectsCount;
+        a.activeIndex = l->m_activeObjectsIndex;
     }
     a.areaCount = l->m_areaObjectsCount;
     a.areaIndex = l->m_areaObjectsIndex;
@@ -370,6 +390,30 @@ inline void restoreArea(GJBaseGameLayer* l, const AreaState& a) {
     l->m_areaObjectsIndex = a.areaIndex;
     l->m_processedAreaObjectsCount = (int)std::min(a.processed.size(), l->m_processedAreaObjects.size());
     l->m_processedAreaObjectsIndex = a.processedIndex;
+    if (a.haveActivation && g_cfg.cpActivation) {
+        size_t k = 0;
+        for (auto* o : CCArrayExt<GameObject*>(l->m_objects)) {
+            if (k >= a.activatedFlag.size()) break;
+            // The flag only (cpactivation=1). Going through GD's activateObject / deactivateObject and
+            // copying the active list back (cpactivation=2) crashed the draw (CCTextureAtlas::updateQuad
+            // from a batch node's visit) a few restores later: what activation attaches to the batch
+            // nodes is not this list's to restore.
+            if (o) {
+                const bool want = a.activatedFlag[k] != 0;
+                if (g_cfg.cpActivation >= 2) {
+                    if (o->m_isActivated && !want) o->deactivateObject(false);
+                    else if (!o->m_isActivated && want) o->activateObject();
+                }
+                o->m_isActivated = want;
+            }
+            ++k;
+        }
+        if (g_cfg.cpActivation >= 2) {
+            l->m_activeObjects = a.activeObjects;
+            l->m_activeObjectsCount = a.activeCount;
+            l->m_activeObjectsIndex = a.activeIndex;
+        }
+    }
 }
 
 // The per-object state grouptrace keeps to write only changes (grouptrace::Tracked without the
@@ -402,6 +446,10 @@ struct Rec {
     long long seedTrig = 0, seedKept = 0, seedVarIndex = 0, seedVarTable = 0;
     Camera camera;
     AreaState area;
+    // cfg cpfollowsection: each Follow Player Y object's collision section cell (x, y) as the flight
+    // had it when the checkpoint was taken (hooks_gamelayer cpCaptureState / cpRestoreState)
+    struct FollowCell { GameObject* obj; int sx, sy; };
+    std::vector<FollowCell> followCells;
     std::vector<uint8_t> layerBytes;   // cfg cpflightlayerdiff only
     // ...and after each of the next kDiffSteps update calls of the flight that took it, the layer's and
     // player 1's bytes, with the tick they were taken at (compared at the same calls of a restored flight)
@@ -447,7 +495,7 @@ struct GtFile {
 // What an attempt inherits from the one before it, which resetLevel leaves as that attempt left it. A
 // flight from a checkpoint is the flight a head flight would be now only if the attempt that took the
 // checkpoint started with the same inheritance as a head flight would start with now; otherwise the
-// plan flies from the head (audits AUD-113 / AUD-114: the rows are not rewritten -- the checkpoint and
+// plan flies from the head (the rows are not rewritten -- the checkpoint and
 // the records before T must be one lineage). Taken before the reset on both sides (the attempt's reset,
 // and a plan's install); the node part says what the reset will leave (see staleNodeSet). The parts:
 //   - the flight band: getMinPortalY / getMaxPortalY (0x213690 / 0x213770) outside the ground-layer
@@ -604,6 +652,7 @@ inline CarrySig carrySig(GJBaseGameLayer* l) {
 // books in full, which a flight restored from one of its checkpoints takes up to that tick.
 struct Set {
     int attempt = -1;
+    long long serial = -1;                       // g_attemptSerial (anchors::g_provChain)
     std::vector<InputCmd> plan;
     std::vector<std::shared_ptr<Rec>> recs;      // tick order
     long long from = -1;                         // restored from a checkpoint at this tick (-1: head)
@@ -676,7 +725,9 @@ inline bool g_ended = true;   // this attempt's end is counted
 inline int g_gtSerial = 0;
 
 // cfg `cpflightobj=<uid>` (print only): that object's area offsets, stamp and rect when a checkpoint
-// is taken, right after a restore, and after the next update calls (`cpflight: obj` lines).
+// is taken, right after a restore, and after the next update calls (`cpflight: obj` lines). The
+// `circle=` part is what GJBaseGameLayer::playerCircleCollision (0x211df0) builds a saw's reach from:
+// m_objectRadius, times the larger of the two multipliers it reads when they are not both 1.
 inline int g_objAfter = 0;   // update calls left to print after a restore
 
 inline void objLine(GJBaseGameLayer* l, const char* when, long long t) {
@@ -687,14 +738,19 @@ inline void objLine(GJBaseGameLayer* l, const char* when, long long t) {
     if (!o) { writeResult(std::string("cpflight: obj ") + when + " uid not found"); return; }
     const auto r = o->getObjectRect();
     const float* f = &o->m_positionXOffset;
-    char b[520];
+    char b[760];
     snprintf(b, sizeof(b), "cpflight: obj %s t=%lld uid=%d pos=(%.3f,%.3f) real=(%.4f,%.4f) "
              "off=(%g,%g,%g,%g,%g,%g,%g,%g,%g,%g) stamp=%d 4c0=%d 4c4=%d 4cc=%d skip=%d dirty=%d "
-             "rect=(%.3f,%.3f %.3fx%.3f) disabled=%d/%d", when, t, g_cfg.cpFlightObj,
+             "rect=(%.3f,%.3f %.3fx%.3f) disabled=%d/%d circle=(r %.4f wh %.4f,%.4f scale %.4f,%.4f "
+             "start %.4f,%.4f soff %.4f,%.4f node %.4f,%.4f)", when, t, g_cfg.cpFlightObj,
              o->getPositionX(), o->getPositionY(), o->m_positionX, o->m_positionY, f[0], f[1], f[2], f[3],
              f[4], f[5], f[6], f[7], f[8], f[9], o->m_unk4C8, o->m_unk4C0, o->m_unk4C4, o->m_unk4CC,
              (int)o->m_unk508, (int)o->m_isObjectRectDirty, r.origin.x, r.origin.y, r.size.width,
-             r.size.height, (int)o->m_isGroupDisabled, (int)o->m_isGroupDisabledTemp);
+             r.size.height, (int)o->m_isGroupDisabled, (int)o->m_isGroupDisabledTemp,
+             (double)o->m_objectRadius, (double)o->m_width, (double)o->m_height, (double)o->m_scaleX,
+             (double)o->m_scaleY, (double)o->m_startScaleX, (double)o->m_startScaleY,
+             (double)o->m_scaleXOffset, (double)o->m_scaleYOffset, (double)o->getScaleX(),
+             (double)o->getScaleY());
     writeResult(b);
 }
 
@@ -807,6 +863,45 @@ inline void reset() {
     g_headPending = false;
     g_next = -1;
     g_from = -1;
+    // cfg cpflightnodewatch: the watched objects are the layer's, and the list is refilled only
+    // when the layer's address changes -- which a new layer standing at the old one's does not.
+    g_watchLayer = nullptr;
+    g_watch.clear();
+}
+
+// What the checkpoint flights hold, for the memory census (cfg memcensus): the distinct sets alive (live,
+// dead and deepest can be one set), their records, and the bytes the records and the sets' rows keep
+// allocated beside the GD checkpoints themselves -- those are counted (recs), not sized. Approximate: a
+// map's nodes are taken at their pair's size.
+struct Held { int sets = 0; size_t recs = 0; size_t bytes = 0; };
+inline size_t recBytes(const Rec& r) {
+    const AreaState& a = r.area;
+    size_t n = r.player.capacity() + a.staleNodes.capacity() * sizeof(StaleNode)
+               + a.objs.capacity() * sizeof(ObjOffsets) + a.variance.capacity() * sizeof(short)
+               + a.latch.capacity() + a.activated.capacity() + a.activatedFlag.capacity()
+               + (a.area.capacity() + a.processed.capacity() + a.activeObjects.capacity()) * sizeof(GameObject*)
+               + r.followCells.capacity() * sizeof(Rec::FollowCell) + r.layerBytes.capacity()
+               + r.gt.capacity() * sizeof(GtState)
+               + r.envEntries.size() * sizeof(std::pair<GameObject* const, areaenv::Entry>)
+               + r.envShapes.size() * sizeof(std::pair<GameObject* const, areaenv::Shape>);
+    for (const auto& v : r.afterLayer) n += v.capacity();
+    for (const auto& v : r.afterPlayer) n += v.capacity();
+    return n;
+}
+inline Held held() {
+    Held h;
+    const Set* seen[3] = {nullptr, nullptr, nullptr};
+    int k = 0;
+    for (const std::shared_ptr<Set>* p : {&g_live, &g_dead, &g_deepest}) {
+        const Set* s = p->get();
+        if (!s || s == seen[0] || s == seen[1]) continue;
+        seen[k++] = s;
+        ++h.sets;
+        h.recs += s->recs.size();
+        h.bytes += s->rows.capacity() * sizeof(AnchorRow) + s->plan.capacity() * sizeof(InputCmd);
+        for (const auto& r : s->recs) if (r) h.bytes += recBytes(*r);
+    }
+    return h;
 }
 
 inline void resetCounts() {
@@ -861,6 +956,7 @@ inline void onAttemptStart(int attempt, bool takes) {
     if (!on()) return;
     auto s = std::make_shared<Set>();
     s->attempt = attempt;
+    s->serial = g_attemptSerial;
     s->plan = g_cfg.inputs;
     // what this attempt inherits, as it stands before its reset (this runs before PlayLayer::resetLevel;
     // a flight from a checkpoint inherits the same, or it would not have been started)
@@ -880,6 +976,9 @@ inline void onAttemptStart(int attempt, bool takes) {
         const long long T = g_starting->rec->tick;
         g_from = T;
         s->from = T;
+        // ...and so is the world up to T (cfg recprovchain reads it in recProvArg)
+        if (g_starting->set->serial >= 0)
+            anchors::g_provChain[g_attemptSerial] = anchors::ProvLink{T, g_starting->set->serial};
         // ...and the checkpoints behind T are this attempt's too: its prefix IS that attempt's.
         for (const auto& r : g_starting->set->recs)
             if (r->tick <= T) s->recs.push_back(r);
@@ -1063,12 +1162,16 @@ inline void splice(const Choice& c) {
     for (const auto& kv : s.seeds.pads) if (kv.second <= T) padseed::g_first.insert(kv);
     ringseed::g_fired.clear();
     for (const auto& e : s.seeds.rings) if (e.second <= T) ringseed::g_fired.push_back(e);
+    ringseed::g_fired2.clear();
+    for (const auto& e : s.seeds.rings2) if (e.second <= T) ringseed::g_fired2.push_back(e);
     touchseed::g_first.clear();
     for (const auto& kv : s.seeds.touch) if (kv.second <= T) touchseed::g_first.insert(kv);
     portalseed::g_first.clear();
     for (const auto& kv : s.seeds.portal) if (kv.second <= T) portalseed::g_first.insert(kv);
     portalseed::g_first2.clear();
     for (const auto& kv : s.seeds.portal2) if (kv.second <= T) portalseed::g_first2.insert(kv);
+    touchfire::g_first.clear();
+    for (const auto& kv : s.seeds.touchFire) if (kv.second <= T) touchfire::g_first.insert(kv);
     solver::g_coinGdTick = r.coinGd;
     solver::g_coinPickupTick = r.coinPickup;
     solver::g_coinGdUnmatched = r.coinGdUnmatched;
@@ -1127,8 +1230,8 @@ inline void splice(const Choice& c) {
 // ---- the probe ------------------------------------------------------------
 //
 // At a banked death, the plan that died is flown again from one of its own checkpoints -- the probe --
-// and then once more from the head -- the control, the flight a head flight of that plan is now (audit
-// AUD-113). The probe is compared with the control on every row from t=1 (its rows up to T are the ones
+// and then once more from the head -- the control, the flight a head flight of that plan is now.
+// The probe is compared with the control on every row from t=1 (its rows up to T are the ones
 // it took from the checkpoint's attempt), the death, the seeds, the coin books and the recording byte
 // for byte. A probe is flown only when what it inherits now is what the checkpoint's attempt inherited
 // (CarrySig), as a flight from a checkpoint is; otherwise it is skipped and counted. Neither flight is
@@ -1173,8 +1276,9 @@ inline const char* rowDiff(const AnchorRow& a, const AnchorRow& b, std::map<std:
 #define CPF_V(name, va, vb) if ((va) != (vb)) { ++count[name]; if (!first) first = name; }
     CPF_F(valid) CPF_F(x) CPF_F(y) CPF_F(vy) CPF_F(mode) CPF_F(onGround) CPF_F(onGround2) CPF_F(flip)
     CPF_F(mini) CPF_F(dual) CPF_F(y2) CPF_F(v2) CPF_F(f2) CPF_F(g2) CPF_F(g2b) CPF_F(m2) CPF_F(mini2)
-    CPF_F(dashing) CPF_F(dashSlope) CPF_F(rot) CPF_F(speed) CPF_F(gframe) CPF_F(snapUid)
-    CPF_F(snapDist) CPF_F(pmin) CPF_F(pmax) CPF_F(freeMode) CPF_F(boost) CPF_F(ctrlOff) CPF_F(b985)
+    CPF_F(dashing) CPF_F(dashSlope) CPF_F(dashing2) CPF_F(dashRing2) CPF_F(rot) CPF_F(speed)
+    CPF_F(gframe) CPF_F(snapUid)
+    CPF_F(snapDist) CPF_F(pmin) CPF_F(pmax) CPF_F(freeMode) CPF_F(boost) CPF_F(ctrlOff) CPF_F(ctrlOff2) CPF_F(b985)
     CPF_F(b986) CPF_F(b985_2) CPF_F(b986_2) CPF_F(coins) CPF_F(item1) CPF_F(cnt1) CPF_F(item2)
     CPF_F(cnt2) CPF_F(onSlope) CPF_F(slopeUnder) CPF_F(slopeUid)
     if (clock0a && clock0b) {
@@ -1204,7 +1308,7 @@ inline bool sameCoinPos(const std::vector<std::vector<solver::CoinPos>>& a,
     return true;
 }
 
-// The carry state in full at one moment (AUD-114's comparison of the restore with the control): the
+// The carry state in full at one moment (for comparing the restore with the control): the
 // band, the latched objects, the area list, the stale nodes (node against real position) and each
 // player's snap (uid, snap distance, second ground flag).
 struct CarryFull {
@@ -1318,7 +1422,7 @@ inline std::string probeCapture(long long end, float endX, const char* how) {
     p.how = how;
     p.rows = anchors::g_live;
     p.seeds = anchors::Seeds{padseed::g_first, ringseed::g_fired, touchseed::g_first, portalseed::g_first,
-                             portalseed::g_first2};
+                             portalseed::g_first2, touchfire::g_first, ringseed::g_fired2};
     p.coinGd = solver::g_coinGdTick;
     p.coinPickup = solver::g_coinPickupTick;
     p.routeOn = route::g_onTick;
@@ -1378,7 +1482,8 @@ inline std::string controlEnd(long long end, float endX, const char* how) {
     const bool deathSame = end == p.end && endX == p.endX;
     const bool seedsSame = padseed::g_first == p.seeds.pads && ringseed::g_fired == p.seeds.rings
                            && touchseed::g_first == p.seeds.touch && portalseed::g_first == p.seeds.portal
-                           && portalseed::g_first2 == p.seeds.portal2;
+                           && portalseed::g_first2 == p.seeds.portal2
+                           && touchfire::g_first == p.seeds.touchFire;
     const bool coinsSame = solver::g_coinGdTick == p.coinGd && solver::g_coinPickupTick == p.coinPickup
                            && sameCoinPos(solver::g_coinPosLog, p.coinPos)
                            && solver::g_itemCounts == p.itemCounts && route::g_onTick == p.routeOn

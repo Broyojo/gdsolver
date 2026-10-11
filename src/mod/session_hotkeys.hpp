@@ -55,7 +55,7 @@ inline bool manualStepPending();
 // the held state is mirrored here and the polling structure is left exactly as it was.
 enum class Key {
     Overlay, Pause, Step1, Step10, Render, Hitboxes, Replay, Quit, Itermap,
-    Faster, Slower, SeekBack, SeekForward, Count
+    Faster, Slower, SeekBack, SeekForward, TakeoverEnd, Count
 };
 
 inline bool g_keyDown[(size_t)Key::Count] = {};
@@ -64,7 +64,7 @@ inline bool g_keyDown[(size_t)Key::Count] = {};
 inline const char* const kKeySettings[(size_t)Key::Count] = {
     "key-overlay", "key-pause", "key-step1", "key-step10", "key-render", "key-hitboxes",
     "key-replay", "key-quit", "key-itermap", "key-faster", "key-slower",
-    "key-seek-back", "key-seek-forward"
+    "key-seek-back", "key-seek-forward", "key-takeover-end"
 };
 
 inline bool keyHeld(Key k) { return g_keyDown[(size_t)k]; }
@@ -266,6 +266,16 @@ inline void pollHotkeys() {
     // more: staying behind with a finished session is the one state in which the mod is no
     // longer driving while the player is still mid-level, and the level's record would start
     // counting again from wherever the plan had got to.
+    // The human takeover's end (mod/takeover.hpp). Only in a session that armed it; elsewhere
+    // the key is nobody's.
+    static bool s_tkDown = false;
+    const bool tk = keyHeld(Key::TakeoverEnd);
+    if (tk && !s_tkDown && takeover::armed()) takeover::endByKey();
+    s_tkDown = tk;
+    // A takeover session leaves the level alone except through the person's own play: F7 and the
+    // seek keys would restart or run the level under them, and the speed keys are on the arrows,
+    // where up is also GD's jump. The edge tracking below still runs.
+    const bool takeoverOwnsLevel = takeover::armed();
     bool f9 = keyHeld(Key::Quit);
     if (f9 && !s_f9Down) {
         log::info("hotkey: F9 -> quit to the level screen");
@@ -289,7 +299,7 @@ inline void pollHotkeys() {
     // behind the driver's back would hand it a run it never asked for.
     static bool s_f7Down = false;
     bool f7 = keyHeld(Key::Replay);
-    if (f7 && !s_f7Down) {
+    if (f7 && !s_f7Down && !takeoverOwnsLevel) {
         if (auto* pl = PlayLayer::get()) {
             if (g_sessionOver && !g_serveMode) {
                 g_sessionOver = false;
@@ -326,7 +336,7 @@ inline void pollHotkeys() {
     if (kUp && !s_upDown) step = +1;
     if (kDown && !s_downDown) step = -1;
     s_upDown = kUp; s_downDown = kDown;
-    if (step != 0) {
+    if (step != 0 && !takeoverOwnsLevel) {
         watchSpeedStep(step);
         log::info("hotkey: {} -> {:g}x", step > 0 ? "faster" : "slower", g_watchSpeed);
     }
@@ -364,7 +374,7 @@ inline void pollHotkeys() {
         // map is watchable live they are keys a person has a reason to be pressing.
         // The edge tracking above still runs, so a key held across the end of a solve is not
         // mistaken for a fresh press afterwards.
-        if (showingSolve()) return;
+        if (showingSolve() || takeover::armed()) return;
         if (press) { repeats = 0; since = t; }
         last = t;
         if (stopped) {

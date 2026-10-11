@@ -52,6 +52,9 @@ struct LevelFacts {
     bool newer = false;
     bool official = false;   // a main level (GJLevelType::Main), where the yellow note is not shown
     std::string newerIds = "none";   // which objects from 2.0 on, for the log (newerSummary)
+    // Reads the attempt count or keeps items across attempts, and the attempt pin is on
+    // (g_attemptOne): solved as its first attempt, a yellow note rather than a red one.
+    bool attempts = false;
 };
 
 // The key's value in a "k,v,k,v" run, or empty.
@@ -133,6 +136,15 @@ inline LevelFacts readLevel(GJGameLevel* level, bool mainLevel) {
     f.unmodelled = w.unmodelled;
     f.newer = w.newer;
     f.newerIds = levelwarn::newerSummary(w);
+#ifdef GEODE_IS_WINDOWS
+    // With the attempt pin (cfg attemptone, hooks_attempt.cpp) the model is no longer blind to such
+    // a level: every attempt is its first. What it still cannot do -- a level that opens only after
+    // dying -- is what the yellow note says.
+    if (g_attemptOne && (f.unmodelled & levelwarn::kAttemptDependent)) {
+        f.unmodelled &= ~levelwarn::kAttemptDependent;
+        f.attempts = true;
+    }
+#endif
     return f;
 }
 
@@ -160,6 +172,130 @@ inline const cocos2d::ccColor3B kWarnRed{255, 100, 100};
 inline const cocos2d::ccColor3B kWarnYellow{255, 215, 70};
 inline const cocos2d::ccColor3B kInfoBlue{160, 205, 255};
 
+// What each search choice is, under its name in Options.
+inline const char* describeSearch(int s) {
+    switch (s) {
+        case UI_SEARCH_BEAM:
+            return "Experimental: keeps the best states each tick.\nMore likely not to be solved.";
+        case UI_SEARCH_MONTECARLO:
+            return "Experimental: random playouts.\nMore likely not to be solved.";
+        default:
+            return "The reachability DP (the default).";
+    }
+}
+
+// ---- Options: the Solve settings other than Coins ---------------------------------------------
+// A second popup over the menu, opened by its Options button (Solve only), for the choices about
+// how Solve searches -- Avoid glitches, and which search answers the calls. More may come; the
+// menu itself keeps the mode, Coins and Start. Each change goes back to the menu at once (onChange),
+// which shows its warnings; nothing here is kept until the menu's Start.
+class Options : public geode::Popup {
+public:
+    static Options* create(bool glitch, int search, std::function<void(bool, int)> onChange) {
+        auto* r = new Options();
+        if (r->init(glitch, search, std::move(onChange))) { r->autorelease(); return r; }
+        delete r;
+        return nullptr;
+    }
+
+protected:
+    bool m_glitch = false;
+    int m_search = UI_SEARCH_DP;
+    std::function<void(bool, int)> m_onChange;
+    CCMenuItemToggler* m_glitchToggle = nullptr;
+    cocos2d::CCLabelBMFont* m_searchValue = nullptr;
+    cocos2d::CCLabelBMFont* m_searchDesc = nullptr;
+
+    static constexpr float kW = 300.f, kH = 230.f;
+
+    bool init(bool glitch, int search, std::function<void(bool, int)> onChange) {
+        using namespace cocos2d;
+        if (!geode::Popup::init(kW, kH)) return false;
+        this->setID("play-menu-options"_spr);
+        m_glitch = glitch;
+        m_search = std::clamp(search, 0, UI_SEARCH_COUNT - 1);
+        m_onChange = std::move(onChange);
+        this->setTitle("Solve options");
+
+        // Avoid glitches, the checkbox and its label centred as a pair (as the menu's rows are).
+        m_glitchToggle = CCMenuItemToggler::createWithStandardSprites(
+            this, menu_selector(Options::onGlitch), .6f);
+        m_glitchToggle->toggle(m_glitch);
+        m_glitchToggle->setID("glitch-toggle"_spr);
+        auto* glitchLabel = CCLabelBMFont::create("Avoid glitches", "bigFont.fnt");
+        glitchLabel->setScale(.45f);
+        glitchLabel->setAnchorPoint({0.f, .5f});
+        glitchLabel->setID("glitch-label"_spr);
+        const float boxW = 18.f, gap = 6.f;
+        const float left = -(boxW + gap + glitchLabel->getScaledContentWidth()) / 2.f;
+        m_buttonMenu->addChildAtPosition(m_glitchToggle, Anchor::Top, ccp(left + boxW / 2.f, -58.f));
+        m_mainLayer->addChildAtPosition(glitchLabel, Anchor::Top, ccp(left + boxW + gap, -58.f));
+
+        // The search: its name between two arrows, as the game's own resolution choice is.
+        auto* searchTitle = CCLabelBMFont::create("Search", "goldFont.fnt");
+        searchTitle->setScale(.7f);
+        searchTitle->setID("search-title"_spr);
+        m_mainLayer->addChildAtPosition(searchTitle, Anchor::Top, ccp(0, -94.f));
+        m_searchValue = CCLabelBMFont::create(uiSearchName(m_search), "bigFont.fnt");
+        m_searchValue->setID("search-value"_spr);
+        m_mainLayer->addChildAtPosition(m_searchValue, Anchor::Top, ccp(0, -122.f));
+        for (int dir : {-1, 1}) {
+            auto* spr = CCSprite::createWithSpriteFrameName(dir < 0 ? "edit_leftBtn_001.png"
+                                                                    : "edit_rightBtn_001.png");
+            spr->setScale(.9f);
+            auto* btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(Options::onSearch));
+            btn->setTag(dir);
+            btn->setID(dir < 0 ? "search-left"_spr : "search-right"_spr);
+            m_buttonMenu->addChildAtPosition(btn, Anchor::Top, ccp(95.f * dir, -122.f));
+        }
+        m_searchDesc = CCLabelBMFont::create("", "chatFont.fnt", 260.f, kCCTextAlignmentCenter);
+        m_searchDesc->setScale(.7f);
+        m_searchDesc->setID("search-description"_spr);
+        m_mainLayer->addChildAtPosition(m_searchDesc, Anchor::Top, ccp(0, -156.f));
+
+        auto* okSpr = ButtonSprite::create("OK", "goldFont.fnt", "GJ_button_01.png", .8f);
+        auto* ok = CCMenuItemSpriteExtra::create(okSpr, this, menu_selector(Options::onOk));
+        ok->setID("ok-button"_spr);
+        m_buttonMenu->addChildAtPosition(ok, Anchor::Bottom, ccp(0, 26.f));
+
+        refresh();
+        return true;
+    }
+
+    void refresh() {
+        m_searchValue->setString(uiSearchName(m_search));
+        geode::cocos::limitNodeWidth(m_searchValue, 150.f, .6f, .3f);
+        m_searchDesc->setString(describeSearch(m_search));
+        m_searchDesc->setColor(m_search == UI_SEARCH_DP ? kWhite : kWarnRed);
+        if (m_onChange) m_onChange(m_glitch, m_search);
+    }
+
+    // CCMenuItemToggler calls its target before it flips its own state (see the menu's onCoins).
+    void onGlitch(CCObject*) {
+        m_glitch = !m_glitchToggle->isToggled();
+        refresh();
+    }
+
+    void onSearch(CCObject* sender) {
+        const int dir = static_cast<cocos2d::CCNode*>(sender)->getTag();
+        m_search = (m_search + dir + UI_SEARCH_COUNT) % UI_SEARCH_COUNT;
+        refresh();
+    }
+
+    void onOk(CCObject*) { this->onClose(nullptr); }
+
+    void keyDown(cocos2d::enumKeyCodes key, double p1) override {
+        if (key == cocos2d::enumKeyCodes::KEY_Left || key == cocos2d::enumKeyCodes::KEY_Right) {
+            m_search = (m_search + (key == cocos2d::enumKeyCodes::KEY_Left ? -1 : 1)
+                        + UI_SEARCH_COUNT) % UI_SEARCH_COUNT;
+            refresh();
+            return;
+        }
+        if (key == cocos2d::enumKeyCodes::KEY_Enter) { onOk(nullptr); return; }
+        geode::Popup::keyDown(key, p1);
+    }
+};
+
 class Popup : public geode::Popup {
 public:
     static Popup* create(GJGameLevel* level, LevelFacts facts, std::function<void()> play) {
@@ -180,15 +316,18 @@ protected:
     cocos2d::CCLabelBMFont* m_desc = nullptr;
     CCMenuItemToggler* m_coinToggle = nullptr;
     cocos2d::CCLabelBMFont* m_coinLabel = nullptr;
+    // The Options popup's two choices (Solve only), and its button.
     bool m_glitch = false;
-    CCMenuItemToggler* m_glitchToggle = nullptr;
-    cocos2d::CCLabelBMFont* m_glitchLabel = nullptr;
+    int m_search = UI_SEARCH_DP;
+    CCMenuItemSpriteExtra* m_optBtn = nullptr;
     cocos2d::CCLabelBMFont* m_note = nullptr;
     cocos2d::CCLabelBMFont* m_rngNote = nullptr;
     cocos2d::CCLabelBMFont* m_redNote = nullptr;
     cocos2d::CCLabelBMFont* m_yellowNote = nullptr;
+    cocos2d::CCLabelBMFont* m_attemptNote = nullptr;
     cocos2d::CCLabelBMFont* m_versionNote = nullptr;
     cocos2d::CCLabelBMFont* m_glitchNote = nullptr;
+    cocos2d::CCLabelBMFont* m_searchNote = nullptr;
     int m_levelId = 0;
     ButtonSprite* m_startSpr = nullptr;
     CCMenuItemSpriteExtra* m_startBtn = nullptr;
@@ -199,14 +338,16 @@ protected:
     // description is two lines, the checkbox is taller than its label -- which the first cut (230
     // high) did not: the checkbox sat on the bot note. With one note the popup is 260 high; each
     // further note adds a row to it, so the notes never climb into the checkbox rows. The "Avoid
-    // glitches" row under Coins (Solve only) adds one more row of height, 26 below (284).
-    // The "Solve faster (not reproducible)" row that sat between them is gone from the menu (the
-    // user's call, 2026-10-01); the mod setting solve-gamble still sets it, on the settings page.
-    // Even so the popup can be taller than the screen -- GD's design height is 320, and with
-    // three notes this is 284 + 2 x 14 -- so shrinkToFit scales it down to fit.
-    static constexpr float kW = 340.f, kH = 284.f;
+    // glitches" row that sat under Coins moved to Options (2026-10-11, the user's call: the menu
+    // keeps Coins, the other Solve settings go to a page of their own), which a button in the
+    // top-right corner opens, as the game's Advanced does on its video options; the popup is 260
+    // high again, with a row kept for each of the two warnings Options can raise.
+    // The "Solve faster (not reproducible)" row is gone from the menu (the user's call,
+    // 2026-10-01); the mod setting solve-gamble still sets it, on the settings page.
+    // Even so the popup can be taller than the screen -- GD's design height is 320 -- so
+    // shrinkToFit scales it down to fit.
+    static constexpr float kW = 340.f, kH = 260.f;
     static constexpr float kModeY = -88.f, kDescY = -128.f, kCoinY = -164.f;   // from the top edge
-    static constexpr float kGlitchY = -190.f;                                  // ...likewise
     static constexpr float kNoteY = 64.f, kStartY = 32.f;   // from the bottom edge
     static constexpr float kNoteRow = 14.f;   // the level's notes stack up from the bot note
 
@@ -218,7 +359,7 @@ protected:
     std::string olderSolve(bool coins) const {
         const std::string path = uiSolutionPath(m_levelId, coins);
         std::vector<InputCmd> plan;
-        if (!loadInputsFile(path, plan)) return {};
+        if (!loadInputsFile(path, plan, true)) return {};
         const std::string v = readSolvedWith(path);
         if (v == modVersion()) return {};
         return v.empty() ? std::string("an earlier version") : v;
@@ -229,11 +370,13 @@ protected:
     // version).
     int noteCount() const {
         const int unsolved = (m_facts.unmodelled ? 1 : 0)
-                             + (m_facts.newer && !m_facts.official ? 1 : 0);
+                             + (m_facts.newer && !m_facts.official ? 1 : 0)
+                             + (m_facts.attempts ? 1 : 0);
         const int solved = (!olderSolve(false).empty()
                             || (m_facts.coins > 0 && !olderSolve(true).empty())) ? 1 : 0;
-        // ...and a row kept for the Avoid glitches warning, which comes and goes with its box.
-        return std::max(unsolved, solved) + (m_facts.random ? 1 : 0) + 1;
+        // ...and a row kept for each warning Options can raise (Avoid glitches, an experimental
+        // search), which come and go with the choices.
+        return std::max(unsolved, solved) + (m_facts.random ? 1 : 0) + 2;
     }
 
     cocos2d::CCLabelBMFont* makeNote(const std::string& text, const cocos2d::ccColor3B& color,
@@ -258,7 +401,7 @@ protected:
         auto solution = [this](bool coins) -> std::string {
             const std::string path = uiSolutionPath(m_levelId, coins);
             std::vector<InputCmd> plan;
-            if (!loadInputsFile(path, plan)) return "none";
+            if (!loadInputsFile(path, plan, true)) return "none";
             const std::string v = readSolvedWith(path);
             return v.empty() ? std::string("stored, version not recorded") : "stored by " + v;
         };
@@ -276,7 +419,7 @@ protected:
         const int id = level->m_levelID.value();
         auto stored = [id](bool coins) {
             std::vector<InputCmd> plan;
-            return loadInputsFile(uiSolutionPath(id, coins), plan);
+            return loadInputsFile(uiSolutionPath(id, coins), plan, true);
         };
         if (m_facts.coins > 0 && stored(true)) {
             m_mode = UI_MODE_REPLAY;
@@ -341,23 +484,16 @@ protected:
                     spr->setColor(kDim);
             m_coinLabel->setColor(kDim);
         }
-        // Avoid glitches: a choice about how Solve searches, so it is only shown there. It keeps
-        // the last Start's choice, like Coins. Under the Coins row.
-        m_glitch = g_uiGlitch;
-        m_glitchToggle = CCMenuItemToggler::createWithStandardSprites(
-            this, menu_selector(Popup::onGlitch), .6f);
-        m_glitchToggle->toggle(m_glitch);
-        m_glitchToggle->setID("glitch-toggle"_spr);
-        m_glitchLabel = CCLabelBMFont::create("Avoid glitches", "bigFont.fnt");
-        m_glitchLabel->setScale(.45f);
-        m_glitchLabel->setAnchorPoint({0.f, .5f});
-        m_glitchLabel->setID("glitch-label"_spr);
+        // Options: Avoid glitches and the search, choices about how Solve searches, so the button
+        // is only shown there. They keep the last Start's choices (saved values), like Coins.
+        m_glitch = Mod::get()->getSavedValue<bool>("play-glitch", false);
+        m_search = std::clamp(Mod::get()->getSavedValue<int>("play-search", UI_SEARCH_DP), 0,
+                              UI_SEARCH_COUNT - 1);
         {
-            const float gLeft = -(boxW + gap + m_glitchLabel->getScaledContentWidth()) / 2.f;
-            m_buttonMenu->addChildAtPosition(m_glitchToggle, Anchor::Top,
-                                             ccp(gLeft + boxW / 2.f, kGlitchY));
-            m_mainLayer->addChildAtPosition(m_glitchLabel, Anchor::Top,
-                                            ccp(gLeft + boxW + gap, kGlitchY));
+            auto* spr = ButtonSprite::create("Options", "goldFont.fnt", "GJ_button_04.png", .55f);
+            m_optBtn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(Popup::onOptions));
+            m_optBtn->setID("options-button"_spr);
+            m_buttonMenu->addChildAtPosition(m_optBtn, Anchor::TopRight, ccp(-46.f, -22.f));
         }
 
         // The promise the safety gate makes, where the choice is made (see botDriving).
@@ -376,6 +512,10 @@ protected:
         m_yellowNote = makeNote("It uses objects from 2.0 on, where the solver is still being "
                                 "matched to the game: slower, and it may not be solved.",
                                 kWarnYellow, "newer-objects-note"_spr);
+        m_attemptNote = makeNote("It changes from attempt to attempt: the bot takes it as its "
+                                 "first attempt, so a level that opens only after dying will not "
+                                 "be solved.",
+                                 kWarnYellow, "attempt-note"_spr);
         // A level already solved needs neither; solving it again with another version than the one
         // that did may still fail, and that is said instead (refresh fills it in).
         m_versionNote = makeNote("", kWarnYellow, "solved-version-note"_spr);
@@ -383,6 +523,8 @@ protected:
         m_glitchNote = makeNote("Avoid glitches is experimental: the level is more likely "
                                 "not to be solved.",
                                 kWarnYellow, "glitch-note"_spr);
+        // A search other than the DP is an experiment, and said so in red (refresh names it).
+        m_searchNote = makeNote("", kWarnRed, "search-note"_spr);
 
         m_startSpr = ButtonSprite::create("Start", "goldFont.fnt", "GJ_button_01.png", .9f);
         m_startBtn = CCMenuItemSpriteExtra::create(m_startSpr, this,
@@ -429,7 +571,7 @@ protected:
     // the test the session itself applies (loadInputsFile).
     bool hasSolution() const {
         std::vector<InputCmd> plan;
-        return loadInputsFile(uiSolutionPath(m_level->m_levelID.value(), m_coins), plan);
+        return loadInputsFile(uiSolutionPath(m_level->m_levelID.value(), m_coins), plan, true);
     }
 
     void refresh() {
@@ -438,9 +580,15 @@ protected:
         const bool bot = m_mode != UI_MODE_NORMAL;
         m_coinToggle->setVisible(bot);
         m_coinLabel->setVisible(bot);
-        m_glitchToggle->setVisible(m_mode == UI_MODE_SOLVE);
-        m_glitchLabel->setVisible(m_mode == UI_MODE_SOLVE);
+        m_optBtn->setVisible(m_mode == UI_MODE_SOLVE);
+        m_optBtn->setEnabled(m_mode == UI_MODE_SOLVE);
         m_note->setVisible(bot);
+        if (m_search != UI_SEARCH_DP) {
+            m_searchNote->setString((std::string("Search: ") + uiSearchName(m_search)
+                                     + " is experimental: the level is more likely not to be "
+                                       "solved.").c_str());
+            geode::cocos::limitNodeWidth(m_searchNote, kW - 30.f, .55f, .3f);
+        }
         // Saying so here, rather than letting the session find out after the level has loaded,
         // is the point of asking before the level starts.
         const bool ok = m_mode != UI_MODE_REPLAY || hasSolution();
@@ -462,8 +610,10 @@ protected:
         for (auto [label, show] :
              {std::pair{m_rngNote, m_facts.random},
               std::pair{m_glitchNote, m_mode == UI_MODE_SOLVE && m_glitch},
+              std::pair{m_searchNote, m_mode == UI_MODE_SOLVE && m_search != UI_SEARCH_DP},
               std::pair{m_versionNote, !older.empty()},
               std::pair{m_yellowNote, !solved && m_facts.newer && !m_facts.official},
+              std::pair{m_attemptNote, !solved && m_facts.attempts},
               std::pair{m_redNote, !solved && m_facts.unmodelled != 0}}) {
             label->setVisible(bot && show);
             if (bot && show) {
@@ -493,26 +643,39 @@ protected:
         refresh();
     }
 
-    // Same order as onCoins: the toggler has not flipped yet.
-    void onGlitch(CCObject*) {
-        m_glitch = !m_glitchToggle->isToggled();
-        refresh();
+    // Options over the menu; its choices come back here as they are made.
+    void onOptions(CCObject*) {
+        if (m_mode != UI_MODE_SOLVE) return;
+        Ref<Popup> self = this;
+        auto* o = Options::create(m_glitch, m_search, [self](bool glitch, int search) {
+            self->m_glitch = glitch;
+            self->m_search = search;
+            self->refresh();
+        });
+        if (o) o->show();
     }
 
     void onStart(CCObject*) {
         if (!m_startBtn->isEnabled()) return;
         g_uiMode = m_mode;
         g_uiCoins = m_coins;
-        // Only a Solve asks; the choice itself is kept for the next one either way.
+        // Only a Solve asks; the choices themselves are kept for the next one either way.
         g_uiGlitch = m_mode == UI_MODE_SOLVE && m_glitch;
+        g_uiSearch = m_mode == UI_MODE_SOLVE ? m_search : UI_SEARCH_DP;
         g_uiArmedLevel = m_level.data();
         Mod::get()->setSavedValue<int>("play-mode", m_mode);
         if (m_facts.coins > 0) Mod::get()->setSavedValue<bool>("play-coins", m_coins);
-        if (m_mode == UI_MODE_SOLVE) Mod::get()->setSavedValue<bool>("play-glitch", m_glitch);
-        log::info("play menu: {} lv{}{}{} ({} coins in the level)", uiModeName(m_mode),
+        if (m_mode == UI_MODE_SOLVE) {
+            Mod::get()->setSavedValue<bool>("play-glitch", m_glitch);
+            Mod::get()->setSavedValue<int>("play-search", m_search);
+        }
+        log::info("play menu: {} lv{}{}{}{} ({} coins in the level)", uiModeName(m_mode),
                   m_level->m_levelID.value(),
                   (m_mode != UI_MODE_NORMAL && m_coins) ? " with coins" : "",
-                  g_uiGlitch ? " avoiding glitches" : "", m_facts.coins);
+                  g_uiGlitch ? " avoiding glitches" : "",
+                  g_uiSearch != UI_SEARCH_DP ? std::string(", search ") + uiSearchName(g_uiSearch)
+                                             : std::string(),
+                  m_facts.coins);
         // Close first: the game's onPlay may open an alert of its own (no song, high object
         // count), and that alert must not end up underneath this popup.
         auto play = std::move(m_play);
@@ -548,9 +711,10 @@ bool open(Layer* layer, GJGameLevel* level, CCObject* sender, bool mainLevel) {
     if (facts.platformer) return false;
     // What the notes were decided from, so a note can be traced back to the objects behind it.
     log::info("play menu: lv{} checked: not modelled: {}; objects from 2.0 on: {}{}; random "
-              "numbers: {}", level->m_levelID.value(), levelwarn::describeAll(facts.unmodelled),
+              "numbers: {}; changes by attempt (taken as the first): {}",
+              level->m_levelID.value(), levelwarn::describeAll(facts.unmodelled),
               facts.newerIds, facts.official ? " (a main level: yellow not shown)" : "",
-              facts.random ? "yes" : "no");
+              facts.random ? "yes" : "no", facts.attempts ? "yes" : "no");
     Ref<Layer> self = layer;
     Ref<CCObject> from = sender;
     auto* p = Popup::create(level, facts, [self, from] { self->onPlay(from.data()); });
@@ -570,6 +734,9 @@ $on_mod(Loaded) {
                           0, UI_MODE_COUNT - 1);
     g_uiCoins = Mod::get()->getSavedValue<bool>("play-coins", false);
     g_uiGlitch = Mod::get()->getSavedValue<bool>("play-glitch", false);
+    // The session reads g_uiSearch only after a Start, which sets it; the menu reads the saved
+    // value itself. Left at the DP here, so nothing but a Start picks an experimental search.
+    g_uiSearch = UI_SEARCH_DP;
 }
 
 // The early-outs below are the first tests each onPlay makes, by the offsets the 2.2081 binary

@@ -237,6 +237,84 @@ inline bool g_worldOn = false;
 inline size_t g_maxMoving = 4000;    // cfg `secmaxmov`: beyond this fall back
                                      // to the checkpoint
 inline std::vector<GameObject*> g_movSet;   // decided once at the section start
+// cfg `secwsnapauto` (on; `=0` is the old snapshot): without it, under `secsnap=2` with
+// `secverifyevery` set (a rung), psnap runs in a
+// section with moving objects and leaves them where the last stepped node put them, trusting the
+// cross-checks to reject what that breaks: the snapshot puts back the player, the effect manager
+// and the game state, not the objects, so a node is expanded in a world the node stepped before
+// left behind. Official level 19 from t=19,700 (a mini
+// UFO; a touch trigger at t~19,695 opens a two-group jaw over ~101 ticks): the plan's own branch,
+// which the game flies to t=20,100, died at t=19,878 on the snapshot (the loop's lie at 19,879),
+// and the loop's window came back EXHAUSTED eight times before a checkpoint search solved it in
+// 1,568 s. With the section's moving set (movingObjectsInSection: what moved under three input
+// patterns, and the grouped objects in reach) restored as `secsnap=3` does, the same branch lives
+// to t=20,100. The set is capped by `secmaxmov`, as secsnap=3's is not.
+// Fourteen snapshot windows on custom levels where the plan's own branch died on the snapshot before
+// it did in the game (2026-10-08): with the set (secwsnapset=5) the branch lived exactly as long as
+// in the game on 6, against 0 without it. Where secsolve never runs (official levels 1-22) nothing
+// changes.
+inline bool g_wsnapAuto = true;
+// cfg `secwsnapset` (with secwsnapauto, default 5): which objects go into that set. 0 = what moved under the
+// three input patterns and every grouped object in reach (secsnap=3's set); 1 = only what moved.
+// The grouped-in-reach part covers objects a branch sets moving that the three patterns do not
+// (a touch trigger only some branches reach), and it is most of the set's size -- decorations
+// carry groups too. Measured at the lv19 window above (cap 100): the full set of 537 costs 0.948 ms
+// a restore against psnap's 0.155. And 1 found NOTHING there -- the three patterns are compared end
+// to start, and none of them left an object displaced -- so the jaw was only ever covered by the
+// grouped-in-reach part. 2 = what moved, plus the objects of the groups the window's own position
+// triggers aim at (hooks_gamelayer wsnapTriggerSet). Both lv19 windows (heads 19,700 / 19,300, depth
+// goals 454 / 854, cap 100) come back SOLVED on psnap+wsnap with 0 and with 2, the spine living to
+// the plan's own death: 0 holds 537 / 504 objects at 0.84 / 0.80 ms a restore, 2 holds 407 / 381 at
+// 0.71 / 0.66. The jaw's two groups alone (172 objects, secwsnapgroups=82,83) keep the spine but
+// leave the 19,700 window EXHAUSTED.
+// 3 = as 2, with every trigger kind in reach (not only the six movers) and their center groups -- the
+// Area effects and the rest that move or reshape objects (hooks_gamelayer wsnapTriggerSet).
+// 4 = what moved or changed pose, plus the grouped objects in reach that are not decoration (object type
+// 7): 0's set without the decoration, which is most of it on a heavy level (a custom window held 10,116
+// grouped objects in reach, over secmaxmov) and cannot touch the player.
+// 5 = 4 with the reach window's far end carried to the window's horizon: the probe runs min(400,
+// horizon) ticks, and the far end goes on by the ticks it did not run at the fastest x step it saw.
+// Whatever the set, the search says what it did with it on a `secsolve: wsnap set` line: put back,
+// empty, or over secmaxmov and dropped (then the search runs on psnap alone).
+inline int g_wsnapSet = 5;
+// cfg `secwsnapany` (with secwsnapauto, on by default there): an object counts as moving when ANY of
+// what wsnap puts back changes at a sample during the three input patterns -- position, rotation,
+// scale, visibility and the area effects' offsets -- not only when its position differs between the
+// start and the end of a pattern. An area-animated hazard that rotates and scales in place, or that
+// comes back to where it started, never moved by the old test. Measured on a custom level's window
+// (2026-10-08): two 170-212 px rotated hazards that an Area effect scales and turns killed the spine
+// on the snapshot from the second layer, and a psnap restore left their position, rotation and scale
+// offsets where the last stepped node had put them (secworld). secwsnapany=0 is the old test.
+inline bool g_wsnapAny = true;
+// cfg `secwsnapgate` (on; `=0` puts the set back on every ask): a rung puts the wsnap set back only
+// when it has to. Its first ask holds the set back and searches on the player snapshot alone, as
+// secwsnapauto=0 does; when that search finds nothing, the same window is asked again at once with the
+// set put back, and the ladder counts that answer. A window the plain snapshot solves pays nothing for
+// the set. Measured on two custom levels whose windows the plain snapshot solves (2026-10-08): the
+// searches' restores and steps are the same with the set and without it, and putting back 622-1,742
+// objects made each restore 2-4x dearer -- 770 s of section search against 155 s with the gate, the
+// same as with no set at all (and 228 s against 75 s). A rung's SOLVED is always a leaf the plain replay
+// reproduced, so a lie on the snapshot can only cost a window its leaf, which is when the re-ask comes.
+// A one-way search (secsolve by hand) is not gated.
+inline bool g_wsnapGate = true;
+inline bool g_wsnapForce = false;    // the rung in flight is that re-ask: the set goes back in
+inline size_t g_wsnapHeld = 0;       // the size of the set this search held back (0: none)
+// cfg `seclieskippsnap` (off): a window whose plain snapshot search was caught parting from the game
+// (g_psnapLied: "the snapshot parts from the game in this window") and found nothing is not searched on
+// the player snapshot alone again: a later ask of it puts the wsnap set back from the start, where
+// secwsnapgate would hold it back first. It skips only searches of a kind that already found nothing
+// there, so it cannot cost a leaf. Measured over two days of runs' logs (2026-10-09): 218 of 468 plain
+// snapshot searches were caught that way, and the 53 later asked of a window already caught found
+// nothing, at 2,699 s.
+inline bool g_lieSkipPsnap = false;
+inline std::vector<long long> g_liedWindows;   // the starts (g_startTick) of the windows caught so
+inline bool liedWindow(long long start) {
+    for (long long s : g_liedWindows)
+        if (s == start) return true;
+    return false;
+}
+// cfg `secwsnapgroups=a,b,...` (diagnosis): the set is exactly these groups' objects.
+inline std::vector<int> g_wsnapGroups;
 // cfg `secworld=N`: compare the world object-by-object after checkpoint restore
 // vs after psnap restore
 inline int g_worldDiff = 0;
@@ -521,7 +599,15 @@ inline bool g_died = false;     // did a death verdict come in the previous step
 // long before this header -- can ask the same question rather than a copy of it (two flags that
 // mean the same thing drift, and the one that drifts is always the one nobody is looking at).
 inline bool& g_active = g_secSearching;
-inline int g_feed = 0;               // button state given at this tick (0/1)
+// Every write of g_active goes through setSearching, so the section hook that acts only during a
+// search (updateObjectSection, hooks_gamelayer.cpp) is enabled before the search's first update
+// and disabled after its last. The hook installs g_onActive.
+inline void (*g_onActive)() = nullptr;
+inline void setSearching(bool v) {
+    g_active = v;
+    if (g_onActive) g_onActive();
+}
+inline int g_feed = 0;              // button state given at this tick (0/1)
 inline int g_held = 0;               // currently pressing? (for handleButton deltas)
 // Can be turned off with cfg `secjumpbuf=0` (default ON): when restoring a held
 // press, also set m_jumpBuffered. WITHOUT THIS A HELD BRANCH BECOMES A
@@ -648,6 +734,20 @@ inline std::vector<double> g_vy;
 // explained: the first tick of a boost is the same either way.
 inline std::vector<double> g_accel;
 inline std::vector<uint8_t> g_pad;
+// cfg `secheadaccel` (on; `=0` reads them from the live player): the head node's accumulator and
+// pad flag, both bodies, are the plain
+// flight's (g_headPlain, taken before the head's checkpoint is made), not the live player's when
+// the search sets up. By then the qualify probes have loaded the head's checkpoint, and a load
+// leaves a robot at 1.5 with the pad flag of the run before -- and every expansion of the head
+// writes the node's pair back, so the head's own snapshot (which has the plain flight's values)
+// never reaches a child. MEASURED on a custom level's window (2026-10-08, `robodbg`): a mini robot
+// holding a jump through the head, the game at vy 4.492 with the accumulator at 0.09 and climbing
+// 0.0225 a tick; the spine had 1.5 and pad 1 from the first layer, lost 0.195 of vy a tick, and
+// died at depth 12 where the game flew on for 197 ticks. Every search from that head started from
+// the same wrong pair, so no cap or cross-check could recover it. Over fifteen uncleared custom
+// levels with a 600 s budget, it on against off: one more cleared, ten unchanged, four moved by a
+// search that returned a different solution or trimmed differently, the plan's own branch the same.
+inline bool g_headAccel = true;
 // ...and all four for PLAYER 2 (cfg `secp2extras`, on). Every one of them was written back to
 // m_player1 only, so in a dual section p2 took its boost accumulator and pad flag from whichever
 // node was stepped last, and on the checkpoint path its y velocity off the 0.001 grid as well.
@@ -691,6 +791,38 @@ inline std::unordered_map<int, CheckpointObject*> g_anchors;
 inline void releaseAnchors() {
     for (auto& kv : g_anchors) if (kv.second) kv.second->release();
     g_anchors.clear();
+}
+
+// The bytes the per-node tables hold allocated (their capacities, not their sizes), for the line that
+// says what freeNodeTables gave back.
+inline size_t nodeTableBytes() {
+    return g_cps.capacity() * sizeof(CheckpointObject*) + g_nodes.capacity() * sizeof(Node)
+           + (g_dash.capacity() + g_dash2.capacity()) * sizeof(DashState)
+           + (g_vy.capacity() + g_accel.capacity() + g_vy2.capacity() + g_accel2.capacity()) * sizeof(double)
+           + g_pad.capacity() + g_pad2.capacity();
+}
+
+// The per-node tables, let go with their buffers: clear() keeps a vector's allocation, and one
+// search of a custom level holds ~620k nodes (hooks_gamelayer.cpp's note at its `worlds`), about
+// 360 bytes each across these. The node checkpoints still held are released first -- a search
+// releases each as its layer is passed (releaseCp), so what is left is a search that never got
+// to the end -- except node 0's, which is the section checkpoint (g_ckpt) and has its own owner.
+// A search starts by filling all of these afresh, so emptying them changes nothing it reads.
+// Swapped with an empty vector: `v = {}` is the initializer-list assignment, which empties the
+// vector and keeps its buffer, the same as clear().
+inline void freeNodeTables() {
+    for (size_t i = 1; i < g_cps.size(); ++i)
+        if (g_cps[i]) g_cps[i]->release();
+    { decltype(g_cps) e; g_cps.swap(e); }
+    { decltype(g_nodes) e; g_nodes.swap(e); }
+    { decltype(g_dash) e; g_dash.swap(e); }
+    { decltype(g_dash2) e; g_dash2.swap(e); }
+    { decltype(g_vy) e; g_vy.swap(e); }
+    { decltype(g_accel) e; g_accel.swap(e); }
+    { decltype(g_pad) e; g_pad.swap(e); }
+    { decltype(g_vy2) e; g_vy2.swap(e); }
+    { decltype(g_accel2) e; g_accel2.swap(e); }
+    { decltype(g_pad2) e; g_pad2.swap(e); }
 }
 
 // ---- deadband (cfg `secdeadband`) ------------------------------------------
@@ -833,9 +965,10 @@ inline void reset() {
     g_frontierNow = 0;
     g_keepDropped = 0;   // cfg seckeepsize's count (a search also starts it at 0)
     g_psnapLied = false;
+    g_liedWindows.clear();   // cfg seclieskippsnap: the windows are this layer's
     g_spineLostT = -1;
     g_done = false;
-    g_active = false;
+    setSearching(false);
     // A search dropped in the middle -- the player left the level -- also leaves these raised,
     // and the next session inherited them: with g_noKill up the destroyPlayer hook swallowed
     // every death, so the next solve "cleared" at once and replayed (lv16, lv20), or never got
@@ -846,10 +979,7 @@ inline void reset() {
     g_rungCoin = -1;
     g_feed = 0;
     g_held = 0;
-    g_nodes.clear();
-    g_dash.clear();
-    g_dash2.clear();
-    g_cps.clear();
+    freeNodeTables();   // after the task: its frame indexes them
     releaseAnchors();
     g_movSet.clear();
     g_worldOn = false;

@@ -19,6 +19,23 @@ inline double topAheadAt(double x) {
     if (i >= (long long)g_topAhead.size()) return -1e9;
     return g_topAhead[(size_t)i];
 }
+// --escdyn (default on since 2026-10): the same suffix maximum over the MOVING objects (L.dyn), which g_topAhead
+// leaves out -- it is built from L.objs / pads / orbs / portals only. Each object counts with the
+// highest top it has anywhere in the recording, or its placed top plus every upward move its
+// controllers can add, whichever is higher, at the leftmost x it is recorded at: "can it ever be
+// above the body", not "where is it now", because the prune asks whether the body can EVER come
+// down. A custom level's flipped ball (t=8,634, x=13,533, y-pH 225, static topAhead 210) was pruned
+// while GD's ball landed on the underside of a descending block group (bottom ~277) ten ticks
+// later and lived 349 more ticks. Frame 0 only; empty without the flag.
+inline bool g_escDyn = true;
+inline std::vector<double> g_topAheadDyn;   // per 30 px bucket, on g_topAhead's grid
+inline double topAheadDynAt(double x) {
+    if (g_topAheadDyn.empty()) return -1e18;
+    long long i = (long long)((x - g_bucketX0) / 30.0);
+    if (i < 0) i = 0;
+    if (i >= (long long)g_topAheadDyn.size()) return -1e18;
+    return g_topAheadDyn[(size_t)i];
+}
 // Rotated-frame version. frame 0 is the same as above. The right thing is to
 // DO THE SAME TEST IN THE FRAME'S COORDINATES, not to disable it: disabled, the
 // "can never come back" branches were left unpruned and squeezed the frontier
@@ -59,13 +76,13 @@ inline double g_cubeVq = 10.0;
 // Dedupe multiplier for a dual's second body while it is in open air (see
 // stepBoth / keyOf). 0.125 = 4 px / 0.8 vy bins instead of 0.5 px / 0.1.
 inline double g_dualFreeQ = 0.125;
-// --heldkeyread (off): key `held` only for a body whose next tick reads it or writes it from the
+// --heldkeyread (default on since 2026-10): key `held` only for a body whose next tick reads it or writes it from the
 // button -- ship, UFO, wave and swing (and every dual) -- instead of in every mode. Only the wave
 // and flight branches write `held` (without --heldall), so in a cube, ball, robot or spider it
 // is whatever the last flight section left, read by nothing, and it split those cells: measured
 // by --searchcensus over the 22 official levels and 7 customs, 15% of cube cells, 21% of ball
 // and 6% of spider cells were kept apart by `held` alone.
-inline constexpr bool kDefHeldKeyRead = false;
+inline constexpr bool kDefHeldKeyRead = true;
 inline bool g_heldKeyRead = kDefHeldKeyRead;
 // --keyxq / --keyxqfly (default 4.0 = the 0.25 px x bucket): the x-phase bucket multiplier for
 // the ground modes (cube, ball, robot, spider) and for the flying ones (ship, UFO, wave, swing).
@@ -158,7 +175,20 @@ inline bool bandClamps(const State& s) {
     auto m = [](int k) { return k == 1 || k == 2 || k == 3 || k == 4 || k == 6 || k == 7; };
     return m(s.mode) || (s.dual && m(s.mode2));
 }
-inline uint64_t keyOf(const State& s, long long t) {
+// The model's dedupe key of a state (everything but the route's part), and the route's part under
+// --coins. A search keys a state by modelKeyOf ^ its rules' keyBits (search_dp.hpp CurrentRules,
+// which takes coinKeyBits); keyOf is the two together, for what keys a state outside a search
+// (the census, the dumps). Every term is xor-ed in, so the split changes no key.
+// --coins: the collected set (State::coins). Same argument as the trigger mask -- a state that took
+// the coin and one that flew through the same cell without it answer the rest of the level
+// differently, and only one of them can ever reach the goal. Gated on non-zero so every run without
+// the flag keeps a bit-identical key; with it, only the cells inside a coin's window ever split. Its
+// own multiplier: with the arm bit's, coins == 1 and an armed state would cancel to the key of
+// neither.
+inline uint64_t coinKeyBits(const State& s) {
+    return s.coins ? ((uint64_t)s.coins * 0x2545F4914F6CDD1Dull) : 0;
+}
+inline uint64_t modelKeyOf(const State& s, long long t) {
     // dedupe key: exact enough to keep distinct behaviours, coarse enough to
     // saturate. cube y 0.5px / vy 0.1; ship coarser (y 1px / vy 0.2) or the
     // per-layer set is ~100k cells and the run needs >10GB
@@ -316,6 +346,14 @@ inline uint64_t keyOf(const State& s, long long t) {
            // --dualdash: ...and the second body's dash, which its own step now keeps (0 off)
            ^ ((s.dual && s.dashing2)
                   ? (0x5B2E7A1D93C4F086ull ^ ((uint64_t)s.action << 31)) : 0)
+           // --p2xoff: ...and how far the second body runs ahead of the first (State::dx2), in
+           // 0.25 px buckets. Two pairs alike in everything else meet different objects with
+           // their second body. 0 without the flag and in every pair that never separated, so
+           // those keys stay bit-identical.
+           ^ ((s.dual && s.dx2 != 0.f)
+                  ? ((uint64_t)(uint32_t)(int32_t)std::lround((double)s.dx2 * 4.0)
+                     * 0xD6E8FEB86659FD93ull)
+                  : 0)
            // ...and near a TOGGLE BLOCK it has not fired (g_pressWin), for the
            // same reason: the block fires on the parent's button, so the held
            // child and the released one of an airborne cube -- same y, same vy
@@ -384,6 +422,10 @@ inline uint64_t keyOf(const State& s, long long t) {
            // bit-identical there; the second body's bit only counts in a dual.
            ^ ((s.a1cLatch & 1u) ? 0x6A09E667F3BCC909ull : 0)
            ^ ((s.dual && (s.a1cLatch & 2u)) ? 0xBB67AE8584CAA73Bull : 0)
+           // --ballscaleair: GD's +0x728 (State::ball728). Same (y,vy), but whether a size portal
+           // re-stakes the ball's spin differs. 0 without the flag; the second body's only in a dual.
+           ^ ((uint64_t)(s.ball728 & 3u) * 0xA54FF53A5F1D36F1ull)
+           ^ (s.dual ? (uint64_t)((s.ball728 >> 2) & 3u) * 0x510E527FADE682D1ull : 0)
            // --lawcontact (always on since the 2026-10 slope clean-up): a law seat last tick
            // (State::seatT > 0) makes this tick a continuing contact.
            ^ ((s.seatT > 0) ? 0x3C6EF372FE94F82Bull : 0)
@@ -443,18 +485,10 @@ inline uint64_t keyOf(const State& s, long long t) {
            // The spider's teleport age while it still spares a side kill (State::spiderJumpT):
            // two spiders at the same (y, vy) answer a wall inside their box differently for the
            // ticks that are left. 0 outside the window, so every other key is bit-identical.
-           ^ ((s.spiderJumpT < kSpiderJumpGraceTicks)
+           ^ ((s.spiderJumpT < spiderJumpGraceTicks())
                   ? ((uint64_t)(s.spiderJumpT + 1) * 0x94D049BB133111EBull) : 0)
-           // --coins: the collected set (State::coins). Same argument as the
-           // trigger mask -- a state that took the coin and one that flew
-           // through the same cell without it answer the rest of the level
-           // differently, and only one of them can ever reach the goal. Gated
-           // on non-zero so every run without the flag keeps a bit-identical
-           // key; with it, only the cells inside a coin's window ever split.
-           // Its own multiplier: with the arm bit's, coins == 1 and an armed
-           // state would cancel to the key of neither.
-           ^ (s.coins ? ((uint64_t)s.coins * 0x2545F4914F6CDD1Dull) : 0)
-           // ...and the pickup items -- but as a COUNT, not as the set. What
+           // (The collected coins are the route's part: coinKeyBits.)
+           // The pickup items -- but as a COUNT, not as the set. What
            // reads them is a Count trigger, which compares the number; and the
            // pickups are passed in x order, so two states at the same x that
            // took different ones have the same ones left to take. Keying the
@@ -547,8 +581,14 @@ inline uint64_t keyOf(const State& s, long long t) {
                  ^ ((uint64_t)(b + 1) * 0xBF58476D1CE4E5B9ull);
         }
     }
+    // --ctrltouch: a branch whose controls a touched Options trigger switched off answers no press,
+    // so it is not the one beside it that can still jump (State::ctrlT), and near a box a held button
+    // switches off the button is part of the state (nearCtrlHoldBox). 0 keeps every key as it was.
+    if (s.ctrlT) k ^= 0x2545F4914F6CDD1Dull;
+    if (s.action && nearCtrlHoldBox((double)s.xAbs)) k ^= 0x9FB21C651E98DF25ull;
     return k;
 }
+inline uint64_t keyOf(const State& s, long long t) { return modelKeyOf(s, t) ^ coinKeyBits(s); }
 
 // --groupfire (off): the search's speed groups are split by WHEN each box whose chain is still
 // moving was entered, not only by which boxes were.
@@ -566,7 +606,8 @@ inline uint64_t keyOf(const State& s, long long t) {
 // which would leave up to three ticks of the same error. A box at rest drops out, as it does from
 // the key: its chain has finished the same way for everyone.
 inline bool g_groupFire = false;
-// --groupxsplit (off): a speed group is also split where its members' x leave a gap across which
+// --groupxsplit (on by default since 2026-10-07, together with --rampendclick; --no-groupxsplit is
+// the off arm): a speed group is also split where its members' x leave a gap across which
 // the two parts' object windows cannot meet, so each part builds its windows from its own x span.
 // The widest window margin is the speed portals' 80 px (cli.hpp, the group's windows), so the
 // windows [lo - 80, hi + dx + 80] of two parts are disjoint exactly when the gap between them is
@@ -586,7 +627,38 @@ inline bool g_groupFire = false;
 // bookkeeping that is per part now: the latest fire tick and lock offset each part places its
 // geometry from, the order the parts are emitted in, and their separate dedupe maps. Off, or on
 // with no gap over the threshold, every state is part 0 and the layer is processed as before.
-inline bool g_groupXSplit = false;
+inline bool g_groupXSplit = true;
+// --search dp|beam|montecarlo: the search a call's answer comes from (search_dp.hpp). 0 = the layer
+// DP (searchLayers, the default), 1 = the plain beam (searchBeam, a prototype for the yardstick),
+// 2 = Monte Carlo rollouts (searchMontecarlo, the reference search that draws random numbers).
+// --beam B: the beam's width. --mcrollouts / --mcwindow / --mctoggles: a Monte Carlo round's shape;
+// --mcsteps its budget in steps (what keeps it reproducible), --mcsafety the wall-clock safety valve
+// in seconds. --mcstall K: give up when K rollouts in a row commit nothing deeper (0 = never) -- a
+// dead end then returns in K rollouts, not in the whole step budget; counted in rollouts, so the
+// stop stays reproducible. 200000 (measured 2026-10-05 on 29 dead-end calls of loop runs): the
+// slowest dead end, about 770 us a rollout, then returns in about 155 s, a quarter of the valve.
+// It costs one call measured that solved after 416916 rollouts without progress; 500000 kept it
+// but left that dead end at 387 s, too near the valve. --mccall N (a measurement): draw the random
+// sequence of the run's call N, to repeat one call of a loop run from leveldp alone (-1 = this
+// process's own count).
+// --seed: the seed for leveldp alone (in the mod the run's seed, cfg dpseed, is used).
+inline int g_searchMethod = 0;
+inline int g_beamWidth = 2000;
+inline int g_mcRollouts = 300;
+inline int g_mcWindow = 1000;
+inline int g_mcToggles = 30;
+inline long long g_mcSteps = 30000000;
+inline double g_mcSafetyS = 600.0;
+inline long long g_mcStall = 200000;
+inline long long g_mcCall = -1;
+inline long long g_searchSeed = 0;
+// --witnessauto (a measurement, default off): the witness walk fires the autonomous triggers on its
+// own crossing, as --replay does, from their state before the search -- instead of reading the firing
+// the search decided from its frontier's leader (model.hpp fireAutoTriggers), which can be ticks
+// early for a lineage behind the leader (lv20: t=4220 against the plan's own 4225).
+// g_rolloutFiresAuto is the switch cliMainOnce sets around that walk (model.hpp rollout).
+inline bool g_witnessAuto = false;
+inline bool g_rolloutFiresAuto = false;
 constexpr double kGroupWinMargin = 80.0;    // the widest of the group's window margins (speeds)
 inline long long g_groupXSplitLayers = 0;   // layers where some group split (printed at the end)
 inline int g_groupXSplitMax = 0;            // the most parts one group split into

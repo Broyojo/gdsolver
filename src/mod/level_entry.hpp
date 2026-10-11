@@ -3,8 +3,23 @@
 // swap. A level the player picks goes through the game's own play button and the play menu
 // (hooks_playmenu.cpp).
 #include "mod/helpers_game.hpp"
+#include "mod/level_warnings.hpp"
 
 using namespace p1;
+
+// The level's own two-player setting, header key kA10 (LevelSettingsObject), read the way the play
+// menu's red note reads it (levelwarn::scan). GJGameLevel::m_twoPlayerMode is the online listing's
+// flag, which a level built from a file never carries: it printed 0 for a kA10=1 level. -1 when the
+// string is not at hand.
+inline int levelHeaderTwoPlayer(std::string s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return -1;
+    s = s.substr(b);
+    if (s.rfind("H4sI", 0) == 0) s = std::string(cocos2d::ZipUtils::decompressString(s, false, 0));
+    if (s.empty()) return -1;
+    const std::string_view all(s);
+    return levelwarn::field(all.substr(0, all.find(';')), "kA10") == "1" ? 1 : 0;
+}
 
 // ---- where a suite level comes from (cfg `leveldir`, see suite:: in config.hpp) ----
 //
@@ -128,12 +143,17 @@ inline bool enterConfiguredLevel() {
     // official levels have DIFFERENT physics. The rig's gravity-flipped ship climbed at
     // 0.069/tick while the same condition in lv7 gave 0.103. Compares the defaults of
     // GJGameLevel::create() against the values from getMainLevel.
+    // twoPlayer is the level's header kA10 (levelHeaderTwoPlayer); listTwoPlayer the listing's flag.
     writeResult(fmt::format(
         "levelinfo: id={} type={} levelVersion={} gameVersion={} "
-        "twoPlayer={} objCount={}",
+        "twoPlayer={} listTwoPlayer={} objCount={}",
         g_cfg.levelId, (int)level->m_levelType, level->m_levelVersion,
-        level->m_gameVersion, (int)level->m_twoPlayerMode,
-        (int)level->m_objectCount).c_str());
+        level->m_gameVersion,
+        levelHeaderTwoPlayer(srcKind == "main"
+                                 ? std::string(LocalLevelManager::sharedState()->getMainLevelString(
+                                       g_cfg.levelId))
+                                 : srcBytes),
+        (int)level->m_twoPlayerMode, (int)level->m_objectCount).c_str());
     log::info("phase1: entering level {}", g_cfg.levelId);
     g_forceCleanStart = true;
     auto* scene = PlayLayer::scene(level, false, false);
@@ -241,6 +261,9 @@ public:
         writeResult("suite: level=" + std::to_string(g_cfg.levelId)
                     + " (" + std::to_string(suite::g_at + 1) + "/"
                     + std::to_string(suite::g_levels.size()) + ")");
+        // cfg memcensus (print only): a suite's later levels start their session here, not where the
+        // first one wrote `session_start`
+        dpsolve::memCensus("session start");
         updateWindowTitle();
         if (enterConfiguredLevel()) return;
         // It could not be entered. Do not stall the sweep on it -- report it and take the next,

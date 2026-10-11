@@ -365,8 +365,36 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     //   player against it (t=16,760). The bindings carry no name for the byte, so
     //   it is read at a literal offset, as the field probe in hooks_player.cpp
     //   already does.
+    // - multiact / nomultiact: EnhancedGameObject's m_isMultiActivate (99) and
+    //   m_isNoMultiActivate (444). canMultiActivate (0x1a4a60) answers the first
+    //   in a classic level and NOT the second in a platformer one, and an object
+    //   that can multi-activate is never marked used (activatedByPlayer 0x1a4a90),
+    //   so collisionCheckObjects keeps offering it: a ring with the flag fires
+    //   again on the next press while the player is still inside it. 0 on every
+    //   object that is not an EnhancedGameObject.
+    // - gmod / gpl: the gravity trigger's (id 2066) m_gravityValue (148), which
+    //   EffectGameObject::triggerObject (0x4a5f30, its case at 0x4a6e1c) writes into
+    //   the player's m_gravityMod, and which players it writes: bit 0 m_targetPlayer1
+    //   (138, player 1 only), bit 1 m_targetPlayer2 (200, player 2 only), bit 2
+    //   m_followCPP (201, the player that set it off). 0 on every other object.
+    // - dontslide: the gameplay rotation's (id 2900) m_dontSlide (585). rotateGameplay raises
+    //   the velocity-limit exemption (+0x952) when it swaps the axes (0x399faa) and lowers it
+    //   again only for this flag (0x39a00d). 0 on every other object.
           "editvel,vmodx,vmody,ovrvel,force,free,touch,spawn,chan,axis,exstat,rev,"
-          "nocol\n";
+    // - tpfm,tpf,tpang,tprmod,tprmin,tprmax: the velocity a teleport (type 28, the trigger 3022,
+    //   the orb 3027) gives the player after the move -- the static or redirected force and the
+    //   direction it takes; see where they are computed. 0 on every other object.
+          "nocol,multiact,nomultiact,gmod,gpl,dontslide,"
+          "tpfm,tpf,tpang,tprmod,tprmin,tprmax,"
+    // - optudg: the Options trigger's (id 2899) m_unlinkDualGravity (property 160), On=1 / Off=-1 /
+    //   unchanged=0 like optp1. processOptionsTrigger copies it to the layer byte (+0x860) that
+    //   GJBaseGameLayer::flipGravity tests before turning the dual partner, and toggleDualMode
+    //   tests before giving the new body the inverse gravity. 0 on every other object.
+          "optudg,"
+    // - extcol: GameObject::m_hasExtendedCollision (+0x280, property 511). addToSection (0x226500) files
+    //   such an object in the collision pass's always-checked list instead of its section cell, and
+    //   checkCollisions tests that list every tick after the 3x3 cells around the player.
+          "extcol\n";
     // PlayLayer's anti-cheat spike (id 8, created last, at 0,105) sits in m_objects but never
     // collides: GD only hands it to destroyPlayer as a check (hooks_playlayer.cpp). Written out,
     // the model read it as a hazard on the spawn point and a ship or ball start died on tick 2
@@ -387,13 +415,27 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         }
         double tpy = 0.0, tpex = 0.0, tpey = 0.0;
         int tpg = 0, tpix = 0, tpiy = 0;
-        if ((int)obj->m_objectType == 28) {
+        int tpfm = 0;
+        float tpf = 0.f, tpang = 0.f, tprmod = 0.f, tprmin = 0.f, tprmax = 0.f;
+        // The teleport TRIGGER (id 3022) is a TeleportPortalObject too, created as a trigger:
+        // EffectGameObject::triggerObject (0x4a5f30, its id table at 0x4a8384 / 0x4a8350) sends it
+        // to the same teleportPlayer with no player, which then moves player 1 to the target
+        // group's object, honouring the same gravity mode and ignoreX/Y. Its row is type 20, so
+        // leveldp reads none of these columns from it unless it asks for them.
+        // The teleport ORB (GameObjectType 46, id 3027) as well: PlayerObject::ringJump (0x398c00,
+        // its type 46 branch at 0x398faf) hands the ring itself to teleportPlayer as the portal,
+        // with the player that pressed it. Taken only when the object really is one.
+        if ((int)obj->m_objectType == 28 || obj->m_objectID == 3022
+            || ((int)obj->m_objectType == 46
+                && geode::cast::typeinfo_cast<TeleportPortalObject*>(obj))) {
             auto* tp = static_cast<TeleportPortalObject*>(obj);
             tpy = obj->getRealPosition().y + tp->m_teleportYOffset;
             tpg = tp->m_gravityMode;
             tpix = tp->m_ignoreX ? 1 : 0;
             tpiy = tp->m_ignoreY ? 1 : 0;
+            GameObject* exitObj = nullptr;
             if (tp->m_orangePortal) {
+                exitObj = tp->m_orangePortal;
                 auto ep = tp->m_orangePortal->getRealPosition();
                 tpex = ep.x;
                 tpey = ep.y;
@@ -408,6 +450,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
                 const int n = grp ? (int)grp->count() : 0;
                 if (n >= 1) {
                     auto* ex = static_cast<GameObject*>(grp->objectAtIndex(0));
+                    exitObj = ex;
                     auto ep = ex->getRealPosition();
                     tpex = ep.x;
                     tpey = ep.y;
@@ -416,6 +459,31 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
                     log::info("solver: teleport uid {} target group {} has {} "
                               "members (random exit - NOT deterministic)",
                               obj->m_uniqueID, tp->m_targetGroupID, n);
+            }
+            // The velocity teleportPlayer gives after the move (0x2103e7..0x2105c8):
+            // tpfm bit 0 m_staticForceEnabled (345), bit 1 m_staticForceAdditive (443),
+            // bit 2 m_redirectForceEnabled (347, which wins over the static force);
+            // tpf m_staticForce (346); tprmod / tprmin / tprmax the redirect's
+            // m_redirectForceMod / Min / Max, passed to PlayerObject::redirectPlayerForce
+            // (0x39fc60). tpang is the direction both use, in degrees, computed in float as
+            // the game does: from the exit when there is one -- (flipped in x ? 180 : 0) +
+            // (an exit of id 38 / 747 / 749 / 2064 / 2902 ? 180 : 90) - its rotation
+            // (0x210105..0x210173) -- else from the portal itself, (flipped in x ? 180 :
+            // 0) - its rotation (0x2103ba). A random exit (several members) takes member 0.
+            tpfm = (tp->m_staticForceEnabled ? 1 : 0) | (tp->m_staticForceAdditive ? 2 : 0)
+                   | (tp->m_redirectForceEnabled ? 4 : 0);
+            tpf = tp->m_staticForce;
+            tprmod = tp->m_redirectForceMod;
+            tprmin = tp->m_redirectForceMin;
+            tprmax = tp->m_redirectForceMax;
+            if (exitObj) {
+                const int eid = exitObj->m_objectID;
+                const bool portalLike = eid == 38 || eid == 747 || eid == 749 || eid == 2064
+                                        || eid == 2902;
+                const float a = (portalLike ? 180.f : 90.f) - exitObj->getRotation();
+                tpang = (exitObj->m_isFlipX ? 180.f : 0.f) + a;
+            } else {
+                tpang = (obj->m_isFlipX ? 180.f : 0.f) - obj->getRotation();
             }
         }
         double tw = 0.0;
@@ -450,7 +518,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         // ovrvel=m_overrideVelocity(584) is an absolute assignment, not a
         // multiplication. The parsed member values are dumped, so GD's own
         // defaults carry over as-is.
-        int editvel = 0, ovrvel = 0;
+        int editvel = 0, ovrvel = 0, dontslide = 0;
         float vmodx = 0.f, vmody = 0.f;
         if (obj->m_objectID == 2900) {
             auto* rg = static_cast<RotateGameplayGameObject*>(obj);
@@ -458,6 +526,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
             gnddir = rg->m_groundDirection;
             editvel = rg->m_editVelocity ? 1 : 0;
             ovrvel = rg->m_overrideVelocity ? 1 : 0;
+            dontslide = rg->m_dontSlide ? 1 : 0;
             vmodx = rg->m_velocityModX;
             vmody = rg->m_velocityModY;
         }
@@ -485,11 +554,12 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         const int fly = obj->m_isFlipY ? 1 : 0;
         const int nofx = obj->m_hasNoEffects ? 1 : 0;
         const int notch = obj->m_isNoTouch ? 1 : 0;
-        int optp1 = 0, optp2 = 0;
+        int optp1 = 0, optp2 = 0, optudg = 0;
         if (obj->m_objectID == 2899) {
             auto* go = static_cast<GameOptionsTrigger*>(obj);
             optp1 = (int)go->m_disableP1Controls;
             optp2 = (int)go->m_disableP2Controls;
+            optudg = (int)go->m_unlinkDualGravity;
         }
         // The trigger properties the x-crossing queue and the band need. Read
         // from the typed members like every other column here, not from a raw
@@ -511,6 +581,19 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         }
         if (auto* c = geode::cast::typeinfo_cast<CameraTriggerGameObject*>(obj))
             exstat = c->m_exitStatic ? 1 : 0;
+        int multiAct = 0, noMultiAct = 0;
+        if (auto* eg = geode::cast::typeinfo_cast<EnhancedGameObject*>(obj)) {
+            multiAct = eg->m_isMultiActivate ? 1 : 0;
+            noMultiAct = eg->m_isNoMultiActivate ? 1 : 0;
+        }
+        double gmod = 0.0;
+        int gpl = 0;
+        if (obj->m_objectID == 2066) {
+            auto* e = static_cast<EffectGameObject*>(obj);
+            gmod = e->m_gravityValue;
+            gpl = (e->m_targetPlayer1 ? 1 : 0) | (e->m_targetPlayer2 ? 2 : 0)
+                  | (e->m_followCPP ? 4 : 0);
+        }
         rf << obj->m_objectID << "," << (int)obj->m_objectType << ","
            << (r.origin.x + r.size.width * 0.5f) << ","
            << (r.origin.y + r.size.height * 0.5f) << ","
@@ -532,6 +615,13 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << freem << "," << touch << "," << spawn << "," << chan
            << "," << axis << "," << exstat << "," << rev
            << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[gdoff::kObjPassable]
+           << "," << multiAct << "," << noMultiAct
+           << "," << gmod << "," << gpl
+           << "," << dontslide
+           << "," << tpfm << "," << tpf << "," << tpang
+           << "," << tprmod << "," << tprmin << "," << tprmax
+           << "," << optudg
+           << "," << (obj->m_hasExtendedCollision ? 1 : 0)
            << "\n";
     }
 }
@@ -539,7 +629,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
 // Extract orb POIs etc. from the level's live memory (m_objects).
 // No parser needed: the real coordinates, with rotation, scale and placement
 // already resolved, can be used as-is.
-inline void buildPois(GJBaseGameLayer* l) {
+inline void buildPois(GJBaseGameLayer* l, bool obbNoLatch = false) {
     g_pois.clear();
     g_hazards.clear();
     g_solids.clear();
@@ -714,16 +804,39 @@ inline void buildPois(GJBaseGameLayer* l) {
             const float rot = obj->getRotation();
             const float m = std::fabs(std::fmod(rot, 90.f));
             if (m < 0.5f || m > 89.5f) continue;
+            // getOrientedBox() is not a read. When the box is missing or dirty it sets the rect latch
+            // (m_shouldUseOuterOb, 0x1a153c), builds the box (OBB2D::create, retained) and recomputes
+            // the cached rect through the latch, and the latch is cleared only when an object is added
+            // to a layer. So every rotated object of a session that ran this export collided as a
+            // latched one, and GD itself latches only the ones a transform action touches: a saw on
+            // SubZero 4002 killed 7 ticks later with this export than without it. cfg obbnolatch
+            // puts back what the call changed and writes the latch as it was before the call.
+            OBB2D* const box0 = obj->m_orientedBox;
+            const bool latch0 = obj->m_shouldUseOuterOb;
+            const bool boxDirty0 = obj->m_isOrientedBoxDirty;
+            const bool rectDirty0 = obj->m_isObjectRectDirty;
+            const cocos2d::CCRect rect0 = obj->m_objectRect;
             auto* ob = obj->getOrientedBox();
-            if (!ob) continue;
-            auto p = obj->getPosition();
-            bf << obj->m_uniqueID << "," << obj->m_objectID << ","
-               << (int)obj->m_objectType << "," << p.x << "," << p.y << ","
-               << rot;
-            for (int i = 0; i < 4; ++i)
-                bf << "," << ob->m_corners[i].x << "," << ob->m_corners[i].y;
-            bf << "," << (obj->m_shouldUseOuterOb ? 1 : 0) << "\n";
-            ++n;
+            if (ob) {
+                auto p = obj->getPosition();
+                bf << obj->m_uniqueID << "," << obj->m_objectID << ","
+                   << (int)obj->m_objectType << "," << p.x << "," << p.y << ","
+                   << rot;
+                for (int i = 0; i < 4; ++i)
+                    bf << "," << ob->m_corners[i].x << "," << ob->m_corners[i].y;
+                bf << "," << ((obbNoLatch ? latch0 : obj->m_shouldUseOuterOb) ? 1 : 0) << "\n";
+                ++n;
+            }
+            if (obbNoLatch) {
+                obj->m_shouldUseOuterOb = latch0;
+                obj->m_isOrientedBoxDirty = boxDirty0;
+                obj->m_isObjectRectDirty = rectDirty0;
+                obj->m_objectRect = rect0;
+                if (!box0 && obj->m_orientedBox) {
+                    obj->m_orientedBox->release();
+                    obj->m_orientedBox = nullptr;
+                }
+            }
         }
         log::info("obb: {} rotated objects", n);
     }
@@ -910,7 +1023,15 @@ inline void buildPois(GJBaseGameLayer* l) {
               //               group instead of toggling it (the second slot of the
               //               layer's +0x198 handler, taken when ring+0x741 is set).
               //               0 on everything that is not a RingObject.
-              "sponly\n";
+              //   fyspd/fydel/fyoff/fymax: Follow Player Y's (1814) m_followYSpeed,
+              //               m_followYDelay, m_followYOffset and m_followYMaxSpeed
+              //               (properties 90 / 91 / 92 / 105). triggerObject hands the
+              //               four to createPlayerFollowCommand (0x25cbf0), and
+              //               processPlayerFollowActions (0x22ded0) moves every object of
+              //               the target group toward player 1's y by a share of the gap
+              //               each tick. Written on every row (the defaults where the
+              //               row is not a 1814).
+              "sponly,fyspd,fydel,fyoff,fymax\n";
         // uid → groups it belongs to. One object can belong to several groups,
         // so the mapping is many-to-many
         std::ofstream gf(std::string(DATA_DIR) + "/objgroups.txt", std::ios::trunc);
@@ -1065,7 +1186,9 @@ inline void buildPois(GJBaseGameLayer* l) {
                 else
                     tf << ",-1,-1,-1,0,0,-1,-1,-1,0,-1,-1,-1,-1";
                 auto* ring = geode::cast::typeinfo_cast<RingObject*>(obj);
-                tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0) << "\n";
+                tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0) << ","
+                   << e->m_followYSpeed << "," << e->m_followYDelay << ","
+                   << e->m_followYOffset << "," << e->m_followYMaxSpeed << "\n";
             }
             ++nTrig;
         }
@@ -1150,6 +1273,43 @@ inline void buildPois(GJBaseGameLayer* l) {
         }
         if (n) log::info("rotgameplay: {} rotation-gameplay objects", n);
     }
+    // ---- areas.txt: the area triggers (3006..3010) and what their effect reads ----------
+    // dp's --areamove places an Area Move's objects by GD's formula (src/solver/areaenv.hpp) from the
+    // state's own player; triggers.txt holds none of these fields. `special` is m_specialTarget, the centre
+    // processAreaEffects (0x2283e0) reads at +0x614 (-1 P1, -2 P2, a group otherwise); `raw614` is that word
+    // read raw, so the name can be checked against the offset in the file itself.
+    {
+        std::ofstream af(std::string(DATA_DIR) + "/areas.txt", std::ios::trunc);
+        af << "uid,id,cx,cy,target,special,raw614,center,dirType,xy,inbound,twoDir,len,lenV,off,offV,offY,offYV,"
+              "modFront,modBack,deadzone,moveDist,moveDistV,angle,angleV,moveX,moveXV,moveY,moveYV,relative,"
+              "relFade,eInType,eInRate,eInBuf,eOut,eOutType,eOutRate,eOutBuf,dur,scaleX,scaleXV,scaleY,scaleYV,"
+              "rot,rotV\n";
+        long long n = 0;
+        for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
+            if (!obj || obj->m_objectID < 3006 || obj->m_objectID > 3010) continue;
+            auto* e = geode::cast::typeinfo_cast<EnterEffectObject*>(obj);
+            if (!e) continue;
+            auto tr = obj->getObjectRect();
+            af << obj->m_uniqueID << "," << obj->m_objectID << ","
+               << (tr.origin.x + tr.size.width * 0.5f) << "," << (tr.origin.y + tr.size.height * 0.5f) << ","
+               << e->m_targetGroupID << "," << e->m_specialTarget << ","
+               << *reinterpret_cast<int*>(reinterpret_cast<char*>(e) + 0x614) << "," << e->m_centerGroupID << ","
+               << e->m_directionType << "," << (e->m_xyMode ? 1 : 0) << "," << (e->m_inbound ? 1 : 0) << ","
+               << (e->m_twoDirections ? 1 : 0) << "," << e->m_length << "," << e->m_lengthVariance << ","
+               << e->m_offset << "," << e->m_offsetVariance << "," << e->m_offsetY << "," << e->m_offsetYVariance
+               << "," << e->m_modFront << "," << e->m_modBack << "," << e->m_deadzone << "," << e->m_moveDistance
+               << "," << e->m_moveDistanceVariance << "," << e->m_moveAngle << "," << e->m_moveAngleVariance << ","
+               << e->m_moveX << "," << e->m_moveXVariance << "," << e->m_moveY << "," << e->m_moveYVariance << ","
+               << (e->m_relative ? 1 : 0) << "," << e->m_relativeFade << "," << (int)e->m_easingInType << ","
+               << e->m_easingInRate << "," << e->m_easingInBuffer << "," << (e->m_easeOutEnabled ? 1 : 0) << ","
+               << (int)e->m_easingOutType << "," << e->m_easingOutRate << "," << e->m_easingOutBuffer << ","
+               << e->m_duration << "," << e->m_areaScaleX << "," << e->m_areaScaleXVariance << ","
+               << e->m_areaScaleY << "," << e->m_areaScaleYVariance << "," << e->m_areaRotation << ","
+               << e->m_areaRotationVariance << "\n";
+            ++n;
+        }
+        if (n) log::info("areas: {} area triggers", n);
+    }
     // ---- levelsettings.txt: the level's own compatibility flags -------------
     // Their own file rather than a column: they are ONE value per level, and
     // objrects is per object. Nothing reads it yet.
@@ -1171,6 +1331,14 @@ inline void buildPois(GJBaseGameLayer* l) {
            << "\nplatformerMode=" << (ls->m_platformerMode ? 1 : 0)
            << "\nreverseGameplay=" << (ls->m_reverseGameplay ? 1 : 0)
            << "\n";
+        // ...and where GD ends the level (the solver's --goalgd): PlayLayer::checkForEnd finishes it when the
+        // player reaches EndPortalObject::getSpawnPos, the portal's x - 300 / zoom (+ for a portal flipped in x).
+        // 0 = no end portal. The End triggers (id 3600) are counted: they can finish it earlier.
+        sf.precision(9);
+        sf << "endPortalX=" << (l->m_endPortal ? l->m_endPortal->getPositionX() : 0.f)
+           << "\nendPortalFlipX=" << ((l->m_endPortal && l->m_endPortal->m_flippedX) ? 1 : 0)
+           << "\nendTriggers=" << g_endTriggers
+           << "\n";
         log::info("levelsettings: fixRadiusCollision={} platformer={} "
                   "reverse={}", (int)ls->m_fixRadiusCollision,
                   (int)ls->m_platformerMode, (int)ls->m_reverseGameplay);
@@ -1183,6 +1351,11 @@ inline long long g_deathsP1 = 0, g_deathsP2 = 0, g_deathsOther = 0;
 // m_anticheatSpike). They kill nobody and are counted instead of logged -- see the destroyPlayer
 // hook. Per session: printed and zeroed at the session's end.
 inline long long g_anticheatCalls = 0;
+// The last `killer:` line's facts (the destroyPlayer hook), for the repair loop's cfg voidband: the tick,
+// and the object GD named (-1 = none) with its position.
+inline long long g_killTick = -1;
+inline int g_killUid = -1;
+inline float g_killX = 0.f, g_killY = 0.f;
 
 // Diagnostics (emitted by cmd `diag`). serve/replay have no onDeath path, so
 // lastDeath/groundGap/injAtDeath stay 0

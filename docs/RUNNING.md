@@ -16,9 +16,18 @@ no stored solution of that kind. **Start** (or `Enter`) starts the level in the 
 game's own, so any level can be picked. A platformer level gets no menu: the solver does not play
 platformer mode, so its play button just plays it.
 
-Under Solve there is also an **Avoid glitches** switch (experimental): the searches drop the routes
-that rest on frame-level glitches. That narrows the search on purpose, so it can lose the only
-route there is, and while it is ticked a yellow line says so.
+Under Solve an **Options** button in the top-right corner opens the settings about how the level is
+searched, which keep the last Start's choices:
+
+* **Avoid glitches** (experimental): the searches drop the routes that rest on frame-level
+  glitches. That narrows the search on purpose, so it can lose the only route there is, and while
+  it is ticked a yellow line in the menu says so.
+* **Search** — which search answers the solver's calls, picked with the arrows (or `←` / `→`):
+  **DP**, the reachability DP every result in this repository comes from (the default); **Beam**,
+  which keeps the best states by the solver's own score at each tick; or **Monte Carlo**, random
+  playouts from a fixed seed. The last two are experiments, more likely to fail a level the DP
+  clears, and while one is chosen a red line in the menu says so. Whatever the search, every plan
+  is flown and judged by the game.
 
 The choice is made per play. The menu opens on Replay when a solution for the level is stored (with Coins ticked when the coin solution is), and on Solve when none is. Turning the mod setting **Choose
 the mode on Play** off removes the menu, and the play button then just plays the level. The mod
@@ -33,12 +42,14 @@ them refuses the run.
 * **Red — not modelled by the solver:** the level holds something the model cannot express at
   all, so it plans blind there and only the section solver can get through: such a level is
   unlikely to be solved.
-  The line names what it found: teleports that move you sideways, keep your height, push you or
-  have several exits; teleport orbs and teleport triggers; the gravity trigger; more gravity
-  portals than the solver can hold (past 128 it shares their slots, which fails in a level that
-  also reverses the player or puts two of them close together); or a level that runs differently
+  The line names what it found: teleports that move you sideways or have several exits, teleport
+  orbs that push you, teleport triggers set off by touch or a spawn or keeping an offset; gravity
+  triggers set off by touch or a spawn, or for player 2; Follow Player Y triggers with a delay or set off by touch or a spawn, or more than two
+  of them running at once; more gravity portals than the solver can hold (past 128 it shares their slots, which fails in a level that
+  also reverses the player or puts two of them close together); a level that runs differently
   from one attempt to the next (an Item Compare or Item Edit that reads the attempt count, or Item
-  Persistence).
+  Persistence); or a two-player level, whose second player has a button of its own that the bot
+  does not press.
 * **Yellow — objects from 2.0 on** (custom levels only): the model is measured against the newer
   mechanics one at a time and much of that is still to do, so such a level is slower to solve and
   may not be solved. It counts the objects of types that did not exist before 2.0 (robot, spider,
@@ -99,6 +110,7 @@ game flying a plan. It is hidden while the level is held still.
 | `F5` | rendering on / off. Only in a solve: there the frames go back to the fast loop, which is most of the speed. In a plain replay it does nothing — a replay you cannot see is not a replay |
 | `F6` | hitboxes: off / on / **only** (the game's own debug drawing; "only" hides the artwork so nothing is left but the geometry the physics uses) |
 | `F7` | replay from the start — works after the replay has finished too |
+| `F8` | end a human takeover (a debugging session, [TAKEOVER.md](TAKEOVER.md)); does nothing elsewhere |
 | `F9` | quit to the level screen |
 | `F10` | the iteration map: where the repair loop spent its rounds. On during a solve, off in a replay, and this flips whichever it currently is |
 | `←` `→` | seek back / forward. A tap is five seconds; holding accelerates. While the game is stopped they step a frame instead. Refused during a solve: the level is the loop's own verification replay and nudging it would spoil the round |
@@ -118,6 +130,13 @@ The level is blacked out while it fast-forwards, with a `▶▶▶` indicator: t
 hundreds of physics steps a frame and is not worth looking at. Rendering is *not* switched off for
 this — resuming it is the path that restarts the level (and crashes on the way back), so the level
 is painted over instead.
+
+A replay takes a checkpoint every 600 ticks (2.5 s) as it plays, and a seek starts from the latest
+one at or before its target instead of from the start; the way up to that checkpoint also skips the
+visibility pass and the draw. A run restored from a checkpoint is checked tick by tick against the
+run from the start, and the first difference turns the checkpoints off for the rest of the session
+(`seekcp: parted` in `result.txt`). `seekcp=0` in `autorun.cfg` turns them off, `seekblind=0` the
+faster way up to them.
 
 ## The iteration map (`F10`)
 

@@ -90,8 +90,13 @@ struct TouchTrig {
         int uid;
         uint8_t on;        // 1 = the Toggle activates the group, 0 = deactivates
         double delay;      // ticks after this box fires (the chain's spawn delays)
+        int grp = 0;       // the group the Toggle switches (read by --tapdisarm, Dynamics::disarmEv)
     };
     std::vector<TogEv> togEv;
+    // --tapdisarm (g_tapDisarm): ...and the TRIGGERS those Toggles switch, the same way (uid, which way,
+    // delay). togEv keeps objects only. Tied to g_autoTrig entries by the CLI (g_autoDisarm). Empty
+    // without the flag.
+    std::vector<TogEv> trigTog;
     // A pickup that switches its group on when touched (--activators, g_activators). Its bit
     // is set the way an ordinary box's is -- the player's box overlapping its rect.
     bool activator = false;
@@ -102,6 +107,9 @@ struct TouchTrig {
     // goes to the ring, so the grounded jump or tap it would have made does not happen
     // (step.hpp, `ringTookPress`).
     bool spawnRing = false;
+    // --boxoff: an activator whose switch is OFF. Its objects stay on their recording, and the
+    // box only takes them out once it has fired (Dynamics::offBox) -- see the loader.
+    bool offSwitch = false;
     // ---- a COUNT trigger rather than a box (1611 / 1811) ------------------
     // Same chain, same bit, same fire tick -- only the firing CONDITION
     // differs: not "the player entered this rect" but "the item counter has
@@ -169,6 +177,24 @@ struct TouchTrig {
     // -1 = the box does not move (every box in lv1-21).
     int followIdx = -1;
     double followX0 = 0.0, followY0 = 0.0;
+    // --boxarm: a toggle block that switches Moves back on, with rows of its own in the recording (its group moves
+    // and turns it, which followIdx refuses): markTouched tests it where the recording has it on the tick, turned.
+    // Set by the CLI; null otherwise.
+    const std::vector<DynSample>* recBox = nullptr;
+    // ---- a box whose own trigger a Toggle switches (--touchoff) -----------
+    // The x-crossing Toggles whose target group holds this box's trigger, in x order: which
+    // way each switches and its g_autoTrig index (resolved by the CLI once g_autoTrig is
+    // loaded). markTouched skips the box while the last of them to fire switched it off
+    // (touchOwnOn, step.hpp). Empty without the flag, and empty when a spawned or touched
+    // Toggle switches that group too -- a chain this does not follow, so the box is left as
+    // it was.
+    struct OwnTog {
+        int uid;
+        double cx;
+        uint8_t on;
+        int autoIdx;
+    };
+    std::vector<OwnTog> ownTog;
 };
 // The uids of this level's coins, filled by the CLI before the touch window is
 // built (level_loader.hpp's coinUids). Empty = not known, and then the filter
@@ -279,6 +305,12 @@ inline bool g_airPress = kDefAirPress;
 // places geometry -- so everything past the first ADOPT is about a substitute
 // lineage, and the watch says so (g_refAdoptT, g_refAdoptFields).
 inline bool g_refAdopt = false;
+// --refadoptmem (off; implies --refadopt): ...and also through a merge whose survivor differs in
+// `jumpBuf` (the press buffer) or the ring memory (usedOrb, usedOrbOld, usedOrbHist, both bodies),
+// which the key leaves out too. Diagnostic: it asks whether such a merge loses the reference's
+// route or only relabels it. A ship's thrust, a cube's buffered landing jump and a ring's one-use
+// rule read these, so a lineage past such an ADOPT is a substitute, named as the others are.
+inline bool g_refAdoptMem = false;
 // --spawnroots (off): under --coins, a Count (1611/1811) or a Tap (1595) that a box's chain SPAWNS
 // is a root of its own and the walk stops at it (as it already does at an Item Compare), and the
 // root is ARMED by that box (TouchTrig::armBy) rather than by its x: the Count listens, and the
@@ -376,8 +408,10 @@ inline void buildTouchMoveTicks() {
     for (size_t b = 0; b < g_touch.size(); ++b) g_touchStops[b] = g_touch[b].stops;
     for (size_t b = 0; b < g_touch.size(); ++b) {
         double d = 0.0;
+        // --spawnlag: a queued hop starts later, so its move runs that much longer after the
+        // entry (spawnLag is 0 without the flag).
         for (const TrigCtl& c : g_touch[b].ctl)
-            d = std::max(d, c.durTicks);
+            d = std::max(d, c.durTicks + (double)c.spawnLag);
         for (const TrigCtl& c : g_touch[b].ctl) d = std::max(d, c.lockTicks);
         // A switch this box sets off lands `delay` ticks after it fires (resolveOn), so until
         // then two states that fired it at different ticks are in different worlds. With no
@@ -533,6 +567,9 @@ struct TrigRow {
     // The item columns (37th on), for the counter gates. `count` < 0 means the
     // dump predates them or the row is not a Count trigger at all.
     int item = 0, item2 = 0, count = -1, actgrp = -1, cmode = -1;
+    // A Touch trigger's (1595) hold and toggle modes (thold / ttog: properties 81 / 82). Read only by
+    // --ctrltouch (modifiers.hpp), for a box a held button switches off.
+    int thold = 0, ttog = 0;
     // An ITEM COMPARE's (3620) own columns, the 46th on (i1mode .. res3):
     // ItemTriggerGameObject's m_item1Mode / m_item2Mode / m_targetItemMode /
     // m_mod1 / m_mod2 / m_resultType1..3. `cmpCols` is false on dumps that
@@ -556,6 +593,11 @@ struct TrigRow {
     // A toggle ring's (1594) m_isSpawnOnly, the 59th column: 1 = pressing it SPAWNS the
     // target group rather than toggling it. 0 on everything else and on dumps that predate it.
     int sponly = 0;
+    // Follow Player Y's (1814) speed / delay / offset / max speed, the 60th-63rd columns
+    // (properties 90 / 91 / 92 / 105). `fyCols` is false on dumps that predate them.
+    bool fyCols = false;
+    double fySpeed = 0.0, fyDelay = 0.0, fyMax = 0.0;
+    int fyOffset = 0;
 };
 
 
@@ -573,6 +615,17 @@ struct TrigRow {
 // (45 of 141 spawns), so this is inert on lv1-21. On by default since v0.1.4,
 // after cold runs judged it; --no-spawnremap turns it off.
 inline bool g_spawnRemap = true;
+
+// --touchvisual (default on since 2026-10): a Pulse (1006) or an Alpha (1007) in a chain is a dead end. It colours
+// or fades its target group and fires none of the triggers in it, so the walks neither follow it
+// into those triggers nor claim the group's objects. A custom level's touch Spawns at x=15,675,
+// 15,795 and 21,975 spawn group 86, whose Pulse names group 85 -- the whole first section, the
+// jump orbs a Rotate swings among them -- so every one of those orbs was `controlled` by three boxes
+// with a zero offset, its recording was set aside until a box fired, and the model held the orb
+// where it was loaded while GD's had swung 64 px up and right (the orb a plan's one press at t=855
+// takes in GD).
+inline bool g_touchVisual = true;
+inline bool visualOnly(int id) { return id == 1006 || id == 1007; }
 
 // Apply a remap to a group id; unmapped ids pass through.
 inline int remapGroup(const std::vector<std::pair<int, int>>& rm, int g) {
@@ -703,6 +756,10 @@ inline bool loadTrigRows(const std::string& path,
                     r.actgrp = act;
                     r.cmode = cmd;
                 }
+                if (got >= 7) {
+                    r.thold = th;
+                    r.ttog = tt;
+                }
                 // sponly, the 59th column (58 commas in): after the thirteen Item Compare
                 // columns, which every row carries (-1/0 where the row is not one).
                 {
@@ -713,6 +770,19 @@ inline bool loadTrigRows(const std::string& path,
                         ++cs;
                     }
                     if (cs == 58 && s < line.size()) r.sponly = std::atoi(line.c_str() + s);
+                    // fyspd,fydel,fyoff,fymax: the four columns after sponly.
+                    if (cs == 58 && (s = line.find(',', s)) != std::string::npos) {
+                        double sp = 0.0, de = 0.0, mx = 0.0;
+                        int of = 0;
+                        if (std::sscanf(line.c_str() + s + 1, "%lf,%lf,%d,%lf", &sp, &de, &of,
+                                        &mx) == 4) {
+                            r.fyCols = true;
+                            r.fySpeed = sp;
+                            r.fyDelay = de;
+                            r.fyOffset = of;
+                            r.fyMax = mx;
+                        }
+                    }
                 }
                 if (got >= 17) {
                     r.cmpCols = true;
@@ -742,8 +812,10 @@ struct TrigRowsCache {
     std::string path, bytes;
     std::unordered_map<int, TrigRow> rows;
 };
+// (namespace scope, not a function's static, so cli.hpp's releaseCrossCallCaches can empty it)
+inline TrigRowsCache g_trigRowsCache;
 inline const std::unordered_map<int, TrigRow>* trigRowsCached(const std::string& path) {
-    static TrigRowsCache c;
+    TrigRowsCache& c = g_trigRowsCache;
     std::string bytes;
     if (!readFileBytes(path, bytes)) return nullptr;
     if (!(c.valid && c.path == path && c.bytes == bytes)) {
@@ -762,9 +834,10 @@ struct GroupMembersCache {
     std::string path, bytes;
     std::unordered_map<int, std::vector<int>> byGroup;
 };
+inline GroupMembersCache g_groupMembersCache;   // (namespace scope, as g_trigRowsCache)
 inline const std::unordered_map<int, std::vector<int>>* groupMembersCached(
         const std::string& path) {
-    static GroupMembersCache c;
+    GroupMembersCache& c = g_groupMembersCache;
     std::string bytes;
     if (!readFileBytes(path, bytes)) return nullptr;
     if (!(c.valid && c.path == path && c.bytes == bytes)) {
@@ -793,29 +866,52 @@ inline const std::unordered_map<int, std::vector<int>>* groupMembersCached(
 // of them decides (the uid breaks a tie, so the answer does not hang on the map's order). A SPAWNED
 // Toggle that switches T's group on is a chain this does not follow; `spawnOn` reports one, and the
 // callers leave such a trigger as it was (lv19's Move uid 14066 is that case).
+// Every Toggle (1049, with a direction) whose target group holds the trigger `uid`, in the map's
+// order: the switches that decide whether that trigger is on. Read by offAtCrossing (an x-crossing
+// Move) and, under --touchoff, by the touch boxes (TouchTrig::ownTog).
+template <class Fn>
+inline void forTogglesHolding(int uid, const std::unordered_map<int, TrigRow>& trig,
+                              const std::unordered_map<int, std::vector<int>>& byGroup, Fn&& fn) {
+    for (const auto& kv : trig) {
+        const TrigRow& X = kv.second;
+        if (X.id != 1049 || X.togon < 0 || X.target == 0 || X.uid == uid) continue;
+        const auto gi = byGroup.find(X.target);
+        if (gi == byGroup.end()
+            || std::find(gi->second.begin(), gi->second.end(), uid) == gi->second.end())
+            continue;
+        fn(X);
+    }
+}
 inline bool offAtCrossing(const TrigRow& T, const std::unordered_map<int, TrigRow>& trig,
                           const std::unordered_map<int, std::vector<int>>& byGroup,
                           bool* spawnOn = nullptr) {
-    auto holds = [&](int g) {
-        const auto gi = byGroup.find(g);
-        return gi != byGroup.end()
-               && std::find(gi->second.begin(), gi->second.end(), T.uid) != gi->second.end();
-    };
     const TrigRow* last = nullptr;
     bool sOn = false;
-    for (const auto& kv : trig) {
-        const TrigRow& X = kv.second;
-        if (X.id != 1049 || X.togon < 0 || X.target == 0 || X.uid == T.uid) continue;
-        if (!holds(X.target)) continue;
+    forTogglesHolding(T.uid, trig, byGroup, [&](const TrigRow& X) {
         if (X.spawn) {
             if (X.togon == 1) sOn = true;
-            continue;
+            return;
         }
-        if (X.touch || X.cx >= T.cx) continue;
+        if (X.touch || X.cx >= T.cx) return;
         if (!last || X.cx > last->cx || (X.cx == last->cx && X.uid > last->uid)) last = &X;
-    }
+    });
     if (spawnOn) *spawnOn = sOn;
     return last && last->togon == 0;
+}
+// --boxarm: is there a toggle block (1594, "activate group", not spawn-fired) whose target group holds the trigger
+// `uid`? Such a block switches the group back on when it fires (the press inside it), and a Move in it that an
+// x-crossing Toggle switched off fires at its own x again. Read by loadAutoTriggers (the Move is kept, offInit)
+// and loadTouchTriggers (the block's trigTog).
+inline bool boxArmsTrigger(int uid, const std::unordered_map<int, TrigRow>& trig,
+                           const std::unordered_map<int, std::vector<int>>& byGroup) {
+    for (const auto& kv : trig) {
+        const TrigRow& B = kv.second;
+        if (B.id != 1594 || B.actgrp != 1 || B.spawn || B.target == 0) continue;
+        const auto gi = byGroup.find(B.target);
+        if (gi != byGroup.end() && std::find(gi->second.begin(), gi->second.end(), uid) != gi->second.end())
+            return true;
+    }
+    return false;
 }
 
 // The collectibles (items.txt). Only the ones GD calls a PICKUP item: a
@@ -838,7 +934,12 @@ inline bool loadCollectibles(const std::string& path) {
         // not: lv22's first coin is fed by Pickup triggers a touch box spawns,
         // and those have pickup=0 because nothing touches them. g_collect is
         // still only what the player can walk into.
-        if (item != 0 && id != 1816) g_itemGiver[uid] = item;
+        // ...and not a Counter (1615) either: GameObject::createWithKey builds it as a
+        // LabelGameObject (case 0x64f), whose methods only draw the value -- it DISPLAYS the item it
+        // names and never writes a counter (GJBaseGameLayer::updateCounters does). A chain that moves
+        // the readout was credited as adding to the counter: on lv21 under --worldgates each of the
+        // "n of 10" Counts moves the readout, so each one firing "gave" item 1 again.
+        if (item != 0 && id != 1816 && id != 1615) g_itemGiver[uid] = item;
         if (!pickup || item == 0) continue;
         g_collect.push_back({cx, cy, w * 0.5, h * 0.5, item, uid});
     }
@@ -852,9 +953,17 @@ inline bool loadCollectibles(const std::string& path) {
 // The MOD's two dumps, joined into "enter this box -> these uids move by this".
 // Chains are followed through intermediate triggers (spawn -> move -> geometry)
 // because that is how the levels are actually built.
-// --touch-from-anchor: keep the 32 touch triggers AHEAD of the anchor instead
-// of the first 32 in the level. Off by default -- see the note at the cap.
-inline bool g_touchFromAnchor = false;
+// (--touch-from-anchor, the opt-in that kept the 32 touch triggers AHEAD of the anchor instead of the first 32
+// in the level, is gone; the window is now opened only by the auto-window gate and --touchwinahead.)
+// --touchwinahead: ...and window from the anchor also when the plain list (the first 32) leaves out
+// a box ahead that the anchor can reach -- the first box it drops lies within the horizon (3,000
+// ticks without one) at the fastest start speed. lv22: an anchor at x=7,655 kept x=511..7,785 and
+// dropped the touch Toggle at x=8,229 that switches a gameplay rotation off, so the model rotated
+// where the game did not (cli.hpp, the window gate). With it, an anchor window also never starts
+// inside a run of boxes that move the same objects (the cap block below). On by default since
+// 2026-10-06; --no-touchwinahead is the off arm. The run guard covers adjacent boxes with the same
+// control uid only: a box of another group between two of them stops the step back.
+inline bool g_touchWinAhead = true;
 // --trigdump: print one line per touch box BEFORE the 32-cap (see the print
 // site). Diagnostic only -- nothing reads it and no run that omits the flag
 // changes by a byte.
@@ -938,6 +1047,9 @@ inline size_t g_trigTotal = 0, g_trigRelevantN = 0, g_trigKept = 0,
 // 0 / 0 when no window was cut.
 inline size_t g_trigDroppedBehind = 0, g_trigDroppedAhead = 0;
 inline double g_trigMaxKeptX = 0.0;
+// ...and the cx of the first box dropped ahead (1e300 when none was), which --touchwinahead's gate
+// reads off the plain probe (cli.hpp).
+inline double g_trigFirstAheadX = 1e300;
 
 // `fromX` = where this solve starts (the --start anchor, or the level's head).
 // The mask in State::trig has 32 bits, so a level with more touch triggers than
@@ -967,7 +1079,7 @@ inline std::unordered_map<int, int> loadObjTypes(const std::string& objPath) {
     return loadObjTypesFrom(in);
 }
 // The same table from a stream. An IN-PROCESS call's argv[1] is the placeholder
-// "(in-process level)" (dp_bridge.cpp) and the level lives in g_levelCsv, so the
+// "(in-process level)" (dpcore.cpp) and the level lives in g_levelCsv, so the
 // path form above returns an empty map there: every box then reads as reaching
 // nothing collidable and --trigrelevant keeps the movers only. That is lv22's
 // "mod relevant 45 vs CLI 61" (open since 2026-09-21 morning). The caller picks
@@ -1036,6 +1148,39 @@ inline std::unordered_map<int, std::pair<double, double>> loadObjPos(std::istrea
     }
     return out;
 }
+// --spawnlag: uid -> cx of the objects the table marks spawn-triggered (its `spawn` column), for an
+// ordered Spawn's "first trigger by x" (g_spawnableX). Empty when the table has no such column.
+inline std::unordered_map<int, double> loadObjSpawnX(std::istream& in) {
+    std::unordered_map<int, double> out;
+    std::string line;
+    if (!std::getline(in, line)) return out;
+    int iu = -1, ix = -1, is = -1, n = 0;
+    {
+        std::stringstream hs(line);
+        std::string c;
+        while (std::getline(hs, c, ',')) {
+            if (c == "uid") iu = n;
+            else if (c == "cx") ix = n;
+            else if (c == "spawn") is = n;
+            ++n;
+        }
+    }
+    if (iu < 0 || ix < 0 || is < 0) return out;
+    while (std::getline(in, line)) {
+        std::stringstream ss(line);
+        std::string c;
+        int i = 0, uid = -1, sp = 0;
+        double x = 0.0;
+        while (std::getline(ss, c, ',')) {
+            if (i == iu) uid = std::atoi(c.c_str());
+            else if (i == ix) x = std::atof(c.c_str());
+            else if (i == is) sp = std::atoi(c.c_str());
+            ++i;
+        }
+        if (uid >= 0 && sp == 1) out[uid] = x;
+    }
+    return out;
+}
 // The GD object types the player can be stopped or killed by. A chain that
 // reaches none of these cannot change the collision geometry, whatever kind of
 // trigger sits at its root -- which is what makes the test independent of the
@@ -1058,6 +1203,46 @@ inline bool activatorTargetSafe(int t) {
     return t == 0 || t == 21 || t == 22 || t == 31 || t == 11 || t == 12 || t == 13
         || t == 29 || t == 32 || t == 35 || t == 37 || t == 38 || t == 43 || t == 7;
 }
+// --acttele: a 1594 (press inside the box) may also switch on a teleport portal (28): the teleport
+// then follows the press, where it stayed on its recording (off, if a Toggle took it off first).
+// A custom level turns a 747 (uid 122006, tpy 153) off at the start and a 1594 over it (uid
+// 122005, group 3) back on: GD's mini ship presses inside the box and is teleported 288.3 -> 153
+// at t=9,234 on its first tick over the portal; the model kept the portal off and flew past, and
+// GD died 49 ticks later where the model's plan never went. Only the press: pickups and spawn rings
+// that reach a teleport are not measured. On by default since 2026-10; --no-acttele turns it off.
+inline bool g_actTele = true;
+// --pressfresh: WHEN a toggle block (1594 press, not an off box) fires. The game takes a press in
+// the button pass that ends the parent's tick, against the boxes the parent's collision pass
+// touched: a press that begins while the parent is inside the box fires it there, the recording's
+// on row is the parent's tick, and what it switches on is already there in this step's collision
+// pass. A button already down when the boxes first overlap fires it in that tick's collision pass,
+// read from this step's input (the default reads the parent's, which is the same for a held
+// button and a tick late for a fresh one). Measured on a custom level (ship, box uid
+// 121982 -> 747 uid 121984): the press first moves the ship on t=8,790, GD's recording has the
+// 747 on at 8,789 and GD teleports on 8,790; the default fired the box on 8,791 and teleported on
+// 8,792. GD's on row is the plan's press tick + 1 there and on SubZero 4003's uid 4001 (plan
+// press 7,776, row 7,777). Only a teleport is made live on the press's own step (Obj::pendBox);
+// anything else a fresh press switches on still comes on with the next step.
+// ...in the SHIP and the UFO only (step.hpp, pressLatTwo): the model hands those two modes a press
+// two ticks after the plan's press tick and every other mode one tick after (cli.hpp, latOf), while
+// GD's button pass is one tick after it in all of them. So a cube's press step IS the button pass's
+// tick: it fires against this step's box on this step, with this step's input or the parent's --
+// 4003's cube, in the air inside the box, reads row 7,777 for the plan's 7,776 and the first
+// overlap (7,750) for a held press. On by default since 2026-10; --no-pressfresh turns it off.
+inline bool g_pressFresh = true;
+// --flyheldbox (default on since 2026-10): ...and in the ship and the UFO a held button does NOT fire a toggle block it
+// moves into; only a press that begins inside it does (pressFreshFires). A custom level's ship holds the button
+// from t=8,746 and enters the 1594 box uid 121982 at x 13,331 on t=8,771 (its square and the box's turned
+// rect overlap by 1.0 px at GD's own x, y and rotation); with the release moved to 8,770, 8,771 or 8,772 GD
+// never fires it -- the 747 it switches on stays off -- and fires it on the fresh press at 8,792, teleporting
+// on 8,800. The model fired it on the held button and teleported the ship at 8,782. The held form was measured
+// on a cube in the air (4003); --boxoff's off box found the same for a ship holding into it (t=1,722). The UFO
+// is grouped with the ship by pressLatTwo and is not measured here.
+inline bool g_flyHeldBox = true;
+// --boxoff: a toggle block or touch Toggle that switches its group OFF (loadTouchTriggers). On by
+// default since 2026-10-05 (three GD cases the replay matches, a kitref of 0 fixed and 0 broken in
+// 1,773 episodes on one exe, two custom levels cleared in cold solves); --no-boxoff is the off arm.
+inline bool g_boxOff = true;
 // An ITEM COMPARE (3620) that reads "item A at least C", as a gate: returns C,
 // or 0 for every other shape. Only this one is measured:
 //   - the operator: resultType3 = 2 is "at least" (rig calib_coingate6, constant
@@ -1074,6 +1259,11 @@ inline int itemCompareGate(const TrigRow& T) {
     if (T.item <= 0 || T.mod2 < 1.0 || T.mod2 != std::floor(T.mod2)) return 0;
     return (int)T.mod2;
 }
+// --tapdisarm: a trigger the player's x fires (checkSpawnObjects' queue) -- neither spawned nor touched, and not
+// one of the roots that x only arms (Tap, Count, Item Compare, toggle block).
+inline bool xCrossingRow(const TrigRow& T) {
+    return !T.spawn && !T.touch && T.id != 1595 && T.id != 1594 && T.id != 1611 && T.id != 1811 && T.id != 3620;
+}
 inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                                                 const std::string& grpPath,
                                                 double fromX = -1e18,
@@ -1084,6 +1274,7 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                                                     objPos = nullptr) {
     std::vector<TouchTrig> out;
     size_t nIrrelevant = 0;                             // --trigrelevant
+    size_t nGateCosmetic = 0;                           // --worldgates (see below)
     const std::unordered_map<int, TrigRow>* trigP = trigRowsCached(trigPath);
     if (!trigP) {
         std::fprintf(stderr, "triggers: cannot open %s\n", trigPath.c_str());
@@ -1105,15 +1296,18 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         // chain is walked exactly like a box's, and it takes a bit in the same
         // mask. What differs is only who sets that bit (the step child's item
         // test rather than markTouched).
+        // (Only while the gates are modelled: --coins, or --worldgates.)
         const bool isCount = (T.id == 1611 || T.id == 1811) && T.count >= 0
-                             && g_coinRoute;
+                             && gatesModelled();
         // ...and a TAP trigger (1595), armed by crossing and fired by a press.
-        const bool isTap = (T.id == 1595) && g_coinRoute;
+        // (--tapdisarm: also without the gates, for what its chain switches off -- isTapDisarm.)
+        const bool isTapDisarm = (T.id == 1595) && !gatesModelled() && g_tapDisarm && !T.touch && !T.spawn;
+        const bool isTap = ((T.id == 1595) && gatesModelled()) || isTapDisarm;
         // ...and an ITEM COMPARE (3620) in the one shape itemCompareGate reads.
         // Its chain is the TRUE branch (its target), and it fires the way a
         // Count does, from the counter; the chains that spawn it stop at it
         // (the walk below), so a tap alone no longer reaches what it guards.
-        const int cmpNeed = g_coinRoute ? itemCompareGate(T) : 0;
+        const int cmpNeed = gatesModelled() ? itemCompareGate(T) : 0;
         const bool isCmp = cmpNeed > 0;
         // ...and an ACTIVATOR (--activators, see g_activators): a pickup that switches its
         // target group on when touched. Only when everything in that group is something it is
@@ -1153,6 +1347,8 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                         if (trig.count(su)) continue;
                         const auto ot = objTypes->find(su);
                         const int t = ot == objTypes->end() ? -1 : ot->second;
+                        // --acthazoff (speed.hpp): a hazard the Toggle switches OFF
+                        if (g_actHazOff && t == 2 && S.togon == 0) continue;
                         if (!activatorTargetSafe(t) && t != 8 && t != 9 && t != 10 && t != 34) {
                             bad = su;
                             badType = t;
@@ -1178,6 +1374,10 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                             "(%d Toggle(s))\n", T.uid, T.cx, T.cy, T.target, nTog);
             }
         }
+        // --boxarm: the x-crossing Moves a toggle block's group holds that an x-crossing Toggle has switched off
+        // (offAtCrossing) -- the block switches them back on (TouchTrig::trigTog) instead of being left out.
+        std::vector<int> armUids;
+        std::vector<int> armSkip;   // ...and the unmodelled trigger objects such a block's group holds besides
         if (!isSpawnRing && objTypes && T.actgrp == 1 && T.target != 0
             && !T.spawn) {
             const auto ty = objTypes->find(T.uid);
@@ -1188,11 +1388,36 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                 int bad = -1, badType = 0;
                 if (gi != byGroup.end())
                     for (const int ou : gi->second) {
+                        if (g_boxArm && press && trig.count(ou)) {
+                            const TrigRow& M = trig.at(ou);
+                            bool spawnOn = false;
+                            if (M.id == 901 && xCrossingRow(M) && M.target != 0
+                                && offAtCrossing(M, trig, byGroup, &spawnOn) && !spawnOn) {
+                                armUids.push_back(ou);
+                                continue;
+                            }
+                        }
                         if (trig.count(ou)) { bad = ou; badType = -1; break; }
                         const auto ot = objTypes->find(ou);
                         const int t = ot == objTypes->end() ? -1 : ot->second;
-                        if (!activatorTargetSafe(t)) { bad = ou; badType = t; break; }
+                        // --boxarm: ...and a trigger object the table does not hold (type 20; nothing models
+                        // it) does not keep out a block that switches Moves back on. A custom level's group
+                        // holds one (id 1292) beside its Moves in one dump, and the block was left out there.
+                        if (g_boxArm && press && t == 20) {
+                            armSkip.push_back(ou);
+                            continue;
+                        }
+                        if (!activatorTargetSafe(t) && !(g_actTele && press && t == 28)) {
+                            bad = ou;
+                            badType = t;
+                            break;
+                        }
                     }
+                // (only for a block that does switch Moves back on: without them the old refusal stands)
+                if (bad < 0 && armUids.empty() && !armSkip.empty()) {
+                    bad = armSkip.front();
+                    badType = 20;
+                }
                 if (gi == byGroup.end()) {
                     std::printf("activators: uid %d (id %d) left out - group %d is empty\n",
                                 T.uid, T.id, T.target);
@@ -1207,11 +1432,56 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                 } else {
                     isActivator = true;
                     isPress = press;
+                    if (!armUids.empty()) {
+                        std::printf("boxarm: uid %d (id %d, x %.0f) switches group %d back on, %zu Move(s):",
+                                    T.uid, T.id, T.cx, T.target, armUids.size());
+                        for (const int u : armUids) std::printf(" %d", u);
+                        std::printf("\n");
+                    }
                 }
+            }
+        }
+        if (!isActivator) {
+            armUids.clear();
+            armSkip.clear();
+        }
+        // --boxoff (default on): ...and the same two without "activate group", which switch
+        // their group OFF -- a toggle block (1594, actgrp 0) when the button is down inside it, a
+        // touch-fired Toggle (1049, togon 0) on contact. A custom level's wall is five hazards in
+        // one group, a 1594 box 120 px before it targeting that group; the model kept the wall and
+        // GD killed the player there exactly as the model did, so the replay instruments passed
+        // while no route existed. Switching a hazard OFF cannot bring a kill in, so hazards are
+        // allowed here as well as everything an activator may switch on.
+        bool isOffBox = false;
+        if (g_boxOff && !isSpawnRing && !isActivator && objTypes && T.target != 0 && !T.spawn
+            && ((T.id == 1594 && T.actgrp == 0) || (T.id == 1049 && T.touch && T.togon == 0))) {
+            const auto gi = byGroup.find(T.target);
+            int bad = -1, badType = 0;
+            if (gi != byGroup.end())
+                for (const int ou : gi->second) {
+                    if (trig.count(ou)) { bad = ou; badType = -1; break; }
+                    const auto ot = objTypes->find(ou);
+                    const int t = ot == objTypes->end() ? -1 : ot->second;
+                    if (!activatorTargetSafe(t) && t != 2) { bad = ou; badType = t; break; }
+                }
+            if (gi == byGroup.end()) {
+                std::printf("boxoff: uid %d (id %d) left out - group %d is empty\n",
+                            T.uid, T.id, T.target);
+            } else if (bad >= 0) {
+                std::printf("boxoff: uid %d (id %d) left out - group %d holds uid %d of type %d\n",
+                            T.uid, T.id, T.target, bad, badType);
+            } else {
+                isActivator = true;
+                isPress = T.id == 1594;
+                isOffBox = true;
+                std::printf("boxoff: uid %d (id %d) at (%.0f,%.0f) switches group %d off "
+                            "(%zu objects)\n", T.uid, T.id, T.cx, T.cy, T.target,
+                            gi->second.size());
             }
         }
         if ((!T.touch && !isCount && !isTap && !isCmp && !isActivator) || T.target == 0)
             continue;
+        if (g_touchVisual && visualOnly(T.id)) continue;   // --touchvisual: a tint is no box
         TouchTrig tt{T.cx, T.cy, T.w * 0.5, T.h * 0.5, {}};
         tt.uid = T.uid;   // so an outside payload can name the box (see the field)
         tt.id = T.id;
@@ -1227,6 +1497,25 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
             tt.cmode = 3;
         }
         tt.tap = isTap;
+        // --touchoff (g_touchOwnOff): the x-crossing Toggles that switch this box's own trigger,
+        // through a group it sits in (TouchTrig::ownTog). The same Toggles offAtCrossing reads
+        // for an x-crossing Move; a box is touched more than once (the way there and the way
+        // back), so it is judged by when each of them fired rather than at one crossing.
+        if (g_touchOwnOff && T.touch) {
+            bool chained = false;
+            forTogglesHolding(T.uid, trig, byGroup, [&](const TrigRow& X) {
+                if (X.spawn || X.touch) {
+                    chained = true;
+                    return;
+                }
+                tt.ownTog.push_back({X.uid, X.cx, (uint8_t)(X.togon == 1), -1});
+            });
+            if (chained) tt.ownTog.clear();
+            std::sort(tt.ownTog.begin(), tt.ownTog.end(),
+                      [](const TouchTrig::OwnTog& a, const TouchTrig::OwnTog& b) {
+                          return a.cx < b.cx || (a.cx == b.cx && a.uid < b.uid);
+                      });
+        }
         // The root's own switch, when the root is a Toggle itself: the walk below
         // collects the Toggles it REACHES, and this is the one it starts from.
         // Only `togEv` takes it -- `togOnUids` (the coin gate) stays as it was.
@@ -1235,7 +1524,9 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
             if (gi != byGroup.end())
                 for (const int ou : gi->second)
                     if (!trig.count(ou))
-                        tt.togEv.push_back({ou, (uint8_t)(T.togon == 1), 0.0});
+                        tt.togEv.push_back({ou, (uint8_t)(T.togon == 1), 0.0, T.target});
+                    else if (g_tapDisarm && xCrossingRow(trig.at(ou)))
+                        tt.trigTog.push_back({ou, (uint8_t)(T.togon == 1), 0.0});
         }
         // ...and an activator switches its whole group on, with no delay (the key's
         // platforms are there on the tick after the touch, which is when the player's box is
@@ -1243,9 +1534,19 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         tt.activator = isActivator;
         tt.press = isPress;
         tt.spawnRing = isSpawnRing;
+        tt.offSwitch = isOffBox;
         // (A spawn ring switches nothing itself: its group's Toggles do, collected by the walk.)
-        if (isActivator && !isSpawnRing)
-            for (const int ou : byGroup[T.target]) tt.togEv.push_back({ou, 1, 0.0});
+        // (--boxoff: an off box switches it off; a 1049 root has already pushed its own switch.)
+        if (isActivator && !isSpawnRing && !(isOffBox && T.id == 1049))
+            for (const int ou : byGroup[T.target]) {
+                // --boxarm: a Move it switches back on is a trigger, not an object to show (trigTog below),
+                // and so is an unmodelled trigger object beside it
+                if (!armUids.empty() && (std::find(armUids.begin(), armUids.end(), ou) != armUids.end()
+                                         || std::find(armSkip.begin(), armSkip.end(), ou) != armSkip.end()))
+                    continue;
+                tt.togEv.push_back({ou, (uint8_t)(isOffBox ? 0 : 1), 0.0, T.target});
+            }
+        for (const int u : armUids) tt.trigTog.push_back({u, 1, 0.0});
         struct Item {
             int group; float dx, dy; double dur; int ease; double erate;
             double lock, lockY;
@@ -1261,6 +1562,14 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
             // and the chains measured so far carry sdelay 0 in front of one.
             double sdelay = 0.0;
             bool root = false;   // the box's own target group
+            // --spawnlag (g_spawnLag): when the triggers in `group` fire, in seconds after the
+            // entry (queued spawns only; an immediate chain is 0), and whether the Spawn that
+            // fires them is an ordered one (each then queued by its x behind the first).
+            double fireS = 0.0;
+            bool ordered = false;
+            // --tapdisarm: `group` is a Toggle's target. A Toggle spawns nothing (triggerObject case
+            // 0x419 calls toggleGroup alone), so the triggers in it are not followed.
+            bool togHop = false;
         };
         // Seed with the BOX'S OWN move. A touch row is often a bare Spawn whose
         // effect is nested (all 3 of lv19's are), and starting the walk at zero
@@ -1294,6 +1603,7 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         // where a selection rule would have to decide: the entry it pushes
         // carries everything the walk accumulated (offset, duration, lock).
         size_t nInert = 0;
+        size_t nTogHopSkip = 0;   // --tapdisarm: spawn-fired triggers in a Toggle's group, no longer followed
         double maxDur = 0.0, maxLock = 0.0, maxOff = 0.0;
         std::vector<Item> stack{{T.target, (float)T.ox, (float)T.oy,
                                  rootMoves ? T.dur * 240.0 : 0.0,
@@ -1305,6 +1615,11 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                                               : std::vector<std::pair<int, int>>{}}};
         stack[0].mover = rootMoves ? T.uid : 0;
         stack[0].root = true;
+        stack[0].togHop = g_tapDisarm && T.id == 1049;
+        if (g_spawnLag && T.id == 1268) {
+            stack[0].fireS = T.sdelay;
+            stack[0].ordered = T.sordd != 0;
+        }
         // A group can contain the trigger that targets it, so the walk needs a
         // hard bound rather than a visited set (the same group legitimately
         // appears twice under different offsets).
@@ -1314,9 +1629,29 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
             stack.pop_back();
             const auto g = byGroup.find(it.group);
             if (g == byGroup.end()) continue;
+            // --spawnlag: an ordered Spawn fires its group's first spawnable trigger (by x) on
+            // the spot and queues each other one (x - xFirst) / 311.58 s behind it.
+            double xFirst = 1e18;
+            if (g_spawnLag && it.ordered)
+                for (const int ou : g->second) {
+                    const auto sx = g_spawnableX.find(ou);
+                    if (sx != g_spawnableX.end()) xFirst = std::min(xFirst, sx->second);
+                    const auto tr = trig.find(ou);
+                    if (tr != trig.end() && tr->second.spawn)
+                        xFirst = std::min(xFirst, tr->second.cx);
+                }
             for (const int uid : g->second) {
                 const auto t2 = trig.find(uid);
                 if (t2 != trig.end()) {
+                    // --tapdisarm (Item::togHop): a Toggle spawns nothing, so the SPAWN-fired rows
+                    // in its group are not followed. Only those: the root Toggle's box still moves
+                    // an x-crossing Move it switches back on (g_offMoves, reOn below). Skipping
+                    // every row here dropped that, and Meltdown 1003's coin platform (the Move uid
+                    // 3437, confirmed in the game, see g_offMoves above) stayed up in the model.
+                    if (it.togHop && t2->second.spawn) {
+                        ++nTogHopSkip;
+                        continue;
+                    }
                     if (t2->second.target == 0) continue;
                     // Only SPAWN-fired rows belong to this chain. A row that is
                     // neither touched nor spawned is autonomous -- it fires on
@@ -1336,7 +1671,7 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                     // default stays as it was until a regression says otherwise.
                     // A row only fires from a chain if it is SPAWN-fired. This
                     // filter was here already but opt-in behind
-                    // --touch-from-anchor, so by default the walk followed
+                    // the (removed) touch window, so by default the walk followed
                     // autonomous Moves as well -- and lv19's group 96 is what
                     // that costs: the touch chain absorbed uid14066's -75 (an
                     // x-crossing Move) on top of uid13925's +36 and reported
@@ -1374,15 +1709,21 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                         }
                     }
                     if (!t2->second.spawn && !reOn) continue;
+                    if (g_touchVisual && visualOnly(t2->second.id)) continue;   // --touchvisual
+                    // --spawnlag: when this trigger fires (see Item::fireS)
+                    const double fireT2 = it.fireS
+                        + ((g_spawnLag && it.ordered && xFirst < 1e17)
+                               ? std::max(0.0, (t2->second.cx - xFirst) / 311.5801086425781)
+                               : 0.0);
                     // An Item Compare this build reads is a root of its own
                     // (see isCmp): what it spawns happens only when the counter
                     // says so. Walking through it credited lv22's tap box with
                     // switching the third coin on at the first press, where the
                     // game needs six.
-                    if (g_coinRoute && itemCompareGate(t2->second) > 0) continue;
+                    if (gatesModelled() && itemCompareGate(t2->second) > 0) continue;
                     // --spawnroots: and at a spawned Count or Tap (g_spawnRoots). It is
                     // armed by this box instead (TouchTrig::armBy, set once bits exist).
-                    if (g_coinRoute
+                    if (gatesModelled()
                         && ((((t2->second.id == 1611 || t2->second.id == 1811)
                               && t2->second.count >= 0))
                             || t2->second.id == 1595)) {
@@ -1439,6 +1780,7 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                             nx.tmode = (uint8_t)(1 + std::clamp(t2->second.mvaxis, 0, 2));
                             nx.tdx = (float)(tx - rx);
                             nx.tdy = (float)(ty - ry);
+                            nx.fireS = fireT2;   // --spawnlag
                             stack.push_back(std::move(nx));
                             continue;
                         }
@@ -1475,12 +1817,15 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                             for (const int ou : gi->second)
                                 if (!trig.count(ou)) {
                                     tt.togEv.push_back({ou,
-                                        (uint8_t)(t2->second.togon == 1), dl});
+                                        (uint8_t)(t2->second.togon == 1), dl, tg});
                                     // Unchanged from the coin gate's first
                                     // form: every nested switch-on, no delay
                                     // in the test. The delay lives in togEv.
                                     if (t2->second.togon == 1)
                                         tt.togOnUids.push_back(ou);
+                                } else if (g_tapDisarm && xCrossingRow(trig.at(ou))) {
+                                    tt.trigTog.push_back({ou,
+                                        (uint8_t)(t2->second.togon == 1), dl});
                                 }
                     }
                     const bool turns = (t2->second.deg != 0.0
@@ -1510,6 +1855,14 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                     stack.back().tdy = it.tdy;
                     // ...and the spawn delays down to here, for togEv only.
                     stack.back().sdelay = it.sdelay + t2->second.sdelay * 240.0;
+                    stack.back().togHop = g_tapDisarm && t2->second.id == 1049;
+                    // --spawnlag: what this trigger fires goes off its own delay later, and
+                    // in x order if it is an ordered Spawn.
+                    if (g_spawnLag) {
+                        const bool sp = t2->second.id == 1268;
+                        stack.back().fireS = fireT2 + (sp ? t2->second.sdelay : 0.0);
+                        stack.back().ordered = sp && t2->second.sordd != 0;
+                    }
                 } else {
                     // Recorded WITH a zero offset too. m_moveOffset is empty for
                     // GD's "move to target" mode, and lv19's third touch trigger
@@ -1537,8 +1890,29 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
                     tt.ctl.back().tmode = it.tmode;
                     tt.ctl.back().tdx = it.tdx;
                     tt.ctl.back().tdy = it.tdy;
+                    if (g_spawnLag) tt.ctl.back().spawnLag = spawnLagTicks(it.fireS);
                 }
             }
+        }
+        // --tapdisarm: a Tap spawns its group only when its press switches it ON (toggleGroupTriggered);
+        // one that switches it off, or that acts on the release (hold mode), switches no trigger
+        // off from the press this chain is fired by.
+        if (isTap && !(T.thold == 0 && T.ttog == 1)) tt.trigTog.clear();
+        // ...and only a switch-OFF can stop a trigger (none = on, autoDisarmed), so only that keeps a box the
+        // tests below would drop. Keeping more grows the box count past the window's 32 and changes which
+        // boxes a re-anchored call keeps.
+        const bool trigOff = std::any_of(tt.trigTog.begin(), tt.trigTog.end(),
+                                         [](const TouchTrig::TogEv& e) { return e.on == 0; });
+        // ...and a Tap is a box under the flag alone only for that: without the gates modelled
+        // (isTapDisarm), what its chain moves stays on the recording as before. Its switches stay
+        // (togEv): they are read only by the by-group on/off of the objects a disarm reaches
+        // (Dynamics::disarmEv) -- boxOnEvents leaves a Tap out.
+        if (isTapDisarm) {
+            if (!trigOff) continue;
+            tt.ctl.clear();
+            tt.togOnUids.clear();
+            tt.spawnsRoots.clear();
+            tt.stops.clear();
         }
         // A COUNT OR TAP ROOT EARNS ITS BIT ONLY IF ITS CHAIN REACHES A COIN.
         //
@@ -1560,7 +1934,8 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         // A trigger that is also a touch box (T.touch) keeps its bit either
         // way: it is in this list for a reason that has nothing to do with
         // coins, and dropping it would change a run that never asked for them.
-        if ((isCount || isTap || isCmp) && !T.touch && !g_coinUids.empty()) {
+        // --worldgates: every gate is the world's, whatever its chain reaches -- GD runs them all.
+        if ((isCount || isTap || isCmp) && !T.touch && !g_coinUids.empty() && !g_worldGates) {
             for (const TrigCtl& c : tt.ctl)
                 if (g_coinUids.count(c.uid)) { tt.reachesCoin = true; break; }
             // A TAP IS KEPT ON A SECOND GROUND: its chain feeds an item (a
@@ -1616,6 +1991,13 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         // reads as "no collidables" -- a distinction that matters: the probe
         // call at cli.hpp builds the same boxes without a map, and counting
         // its -1 as zero drops two real boxes on lv20.
+        if (g_tapDisarm && (nTogHopSkip || !tt.trigTog.empty())) {
+            std::printf("tapdisarm: box uid %d (id %d, x %.0f) switches %zu trigger(s)", tt.uid, tt.id,
+                        tt.cx, tt.trigTog.size());
+            for (const TouchTrig::TogEv& e : tt.trigTog)
+                std::printf(" %d:%s+%.0f", e.uid, e.on ? "on" : "off", e.delay);
+            std::printf("; %zu spawn-fired trigger(s) in a Toggle's group no longer followed\n", nTogHopSkip);
+        }
         int hard = objTypes ? 0 : -1;
         if (objTypes)
             for (const TrigCtl& c : tt.ctl) {
@@ -1648,13 +2030,29 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         // ...nor an activator: an orb it switches on is not collidable either.
         if (objTypes && !tt.ctl.empty() && !isCount && !isTap && !isCmp && !isActivator) {
             const bool moves = nInert < tt.ctl.size();
-            if (!moves && hard <= 0 && tt.togOn < 0) {
+            if (!moves && hard <= 0 && tt.togOn < 0 && !trigOff) {
                 ++nIrrelevant;
                 continue;
             }
         }
-        if (!tt.ctl.empty()) out.push_back(std::move(tt));
+        // --worldgates without --coins: a gate is the world's only where it acts on the world --
+        // its chain reaches something the player collides with, or it toggles. One that only
+        // moves decorations or a coin (lv22's two Counts: Pulses and an Alpha on decorations, and a
+        // Move of a coin) would take a slot in the touch window and push real boxes out of it:
+        // measured on lv22, four, among them the switch band's 18179 (35 collidables) and 2563.
+        // Without a type map nothing is known about the chain, and the gate stays.
+        if (g_worldGates && !g_coinRoute && (isCount || isTap || isCmp) && objTypes
+            && !tt.ctl.empty() && hard <= 0 && tt.togOn < 0 && !trigOff) {
+            ++nGateCosmetic;
+            continue;
+        }
+        // (--tapdisarm: a chain that only switches triggers off still has its box.)
+        // (--boxarm: ...and so does a toggle block that only switches Moves back on.)
+        if (!tt.ctl.empty() || trigOff || !armUids.empty()) out.push_back(std::move(tt));
     }
+    if (nGateCosmetic)
+        std::printf("triggers: --worldgates left out %zu gate(s) whose chain reaches nothing "
+                    "collidable and toggles nothing\n", nGateCosmetic);
     if (objTypes)
         std::printf("triggers: --trigrelevant dropped %zu box(es) that move "
                     "nothing, reach nothing collidable and toggle nothing; "
@@ -1667,10 +2065,11 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
     // fix for once (the five coverage numbers), in the same shape.
     g_trigDroppedBehind = 0;
     g_trigDroppedAhead = 0;
+    g_trigFirstAheadX = 1e300;
     std::sort(out.begin(), out.end(),
               [](const TouchTrig& a, const TouchTrig& b) { return a.cx < b.cx; });
     // one bit per trigger in the state's mask
-    // NOTE: opt-in (`--touch-from-anchor`), and it is NOT ready. Measured on
+    // NOTE: the window used to be opt-in (`--touch-from-anchor`, removed), and it is NOT ready. Measured on
     // lv22 at the switch band: with the window on, the DP sees the hanging
     // block at x=3,195 and the whole frontier dies FOUR TICKS after touching it
     // (41 alive at t=2,530 -> 0 at t=2,534) where the same solve without it
@@ -1712,12 +2111,17 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
         return false;
     };
     // The taps kept above only for feeding SOME item, and whose item no coin's
-    // gate reads after all.
-    out.erase(std::remove_if(out.begin(), out.end(),
-                             [&](const TouchTrig& t) {
-                                 return t.tap && !t.reachesCoin && !feedsACoin(t);
-                             }),
-              out.end());
+    // gate reads after all. (Not under --worldgates, which keeps every gate.)
+    if (!g_worldGates)
+        out.erase(std::remove_if(out.begin(), out.end(),
+                                 [&](const TouchTrig& t) {
+                                     // (--tapdisarm: not one kept for the triggers it switches off)
+                                     const bool off = std::any_of(
+                                         t.trigTog.begin(), t.trigTog.end(),
+                                         [](const TouchTrig::TogEv& e) { return e.on == 0; });
+                                     return t.tap && !t.reachesCoin && !feedsACoin(t) && !off;
+                                 }),
+                  out.end());
     std::vector<TouchTrig> counts;
     if ((int)out.size() > kTouchBits) {
         std::vector<TouchTrig> boxes;
@@ -1752,11 +2156,33 @@ inline std::vector<TouchTrig> loadTouchTriggers(const std::string& trigPath,
             // in when the tail is anchored still has to be enterable.
             const double lo = fromX - 200.0;
             while (first < out.size() && out[first].cx < lo) ++first;
+            // --touchwinahead: never start inside a run of boxes that move the same objects. A box
+            // dropped behind loses its offset while its neighbour's is kept, and a formula-driven
+            // object then sits off by the dropped move -- a platform moved -12 by one box and +12 by
+            // an autonomous Move sat 12 px high and killed one tick past the anchor. Walk back to
+            // the head of the run; the window gives up boxes at its far end instead.
+            if (g_touchWinAhead && first > 0 && first < out.size()) {
+                const size_t was = first;
+                while (first > 0) {
+                    std::unordered_set<int> moved;
+                    for (const TrigCtl& c : out[first].ctl) moved.insert(c.uid);
+                    bool shares = false;
+                    for (const TrigCtl& c : out[first - 1].ctl)
+                        if (moved.count(c.uid)) { shares = true; break; }
+                    if (!shares) break;
+                    --first;
+                }
+                if (first != was)
+                    std::printf("triggers: --touchwinahead starts the window %zu box(es) back, at "
+                                "x=%.0f, so it does not cut a run that moves the same objects\n",
+                                was - first, out[first].cx);
+            }
             // Never leave fewer than the window in hand (an anchor near the end
             // of the level would otherwise keep only a handful).
             if (out.size() - first < keep) first = out.size() - keep;
         }
         const size_t total = out.size();
+        if (first + keep < total) g_trigFirstAheadX = out[first + keep].cx;
         out = std::vector<TouchTrig>(out.begin() + (long long)first,
                                      out.begin() + (long long)(first + keep));
         // The two sides, published and not only printed -- see the globals.
@@ -1865,24 +2291,35 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
         // offAtCrossing); a box that switches it back on moves its group (loadTouchTriggers).
         // Only a Move: an autonomous Toggle's on/off is read from the recording, which is what GD
         // did, while a Move is placed from the row's own offset.
+        bool offInit = false;
         if (T.id == 901) {
             bool spawnOn = false;
             if (offAtCrossing(T, trig, byGroup, &spawnOn) && !spawnOn) {
-                std::printf("autotrig: uid %d (move, x=%.0f) is switched off when the player "
-                            "reaches it - it moves nothing on its own\n", T.uid, T.cx);
-                continue;
+                // --boxarm: ...unless a toggle block switches its group back on; then it is kept, off at its
+                // crossing until a box of the state has fired (dynamics.hpp autoFireT).
+                if (g_boxArm && boxArmsTrigger(T.uid, trig, byGroup)) {
+                    offInit = true;
+                    std::printf("autotrig: uid %d (move, x=%.0f) is switched off when the player reaches it "
+                                "- kept, a toggle block switches it back on (--boxarm)\n", T.uid, T.cx);
+                } else {
+                    std::printf("autotrig: uid %d (move, x=%.0f) is switched off when the player "
+                                "reaches it - it moves nothing on its own\n", T.uid, T.cx);
+                    continue;
+                }
             }
         }
         AutoTrig at;
+        at.offInit = offInit ? 1 : 0;
         at.uid = T.uid;
         at.cx = T.cx;
         at.delay = (T.id == 1049) ? 0 : 1;
+        at.toggleRoot = (T.id == 1049) ? 1 : 0;
         // The root's own switch, when the root is a Toggle (see AutoTrig::tog).
         if (T.id == 1049 && T.togon >= 0) {
             const auto gi = byGroup.find(T.target);
             if (gi != byGroup.end())
                 for (const int ou : gi->second)
-                    if (!trig.count(ou)) at.tog.push_back({ou, (uint8_t)(T.togon == 1), 0.0});
+                    if (!trig.count(ou)) at.tog.push_back({ou, (uint8_t)(T.togon == 1), 0.0, T.target});
         }
         struct Item {
             int group; float dx, dy; double dur; int ease; double erate;
@@ -1925,14 +2362,16 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
                     // (6,334.5, 122.325) from (5,914.5, 182.325) -- +420/-60, the two Moves that
                     // target 171 itself (5427, 5446) and nothing else.
                     if (T.id == 901) continue;
+                    if (g_touchVisual && visualOnly(t2->second.id)) continue;   // --touchvisual
                     const double dl = it.sdelay + t2->second.sdelay * 240.0;
                     // A Toggle spawned in the chain: its switch, after the delays so far.
                     if (t2->second.id == 1049 && t2->second.togon >= 0) {
-                        const auto gi = byGroup.find(remapGroup(it.remap, t2->second.target));
+                        const int tg = remapGroup(it.remap, t2->second.target);
+                        const auto gi = byGroup.find(tg);
                         if (gi != byGroup.end())
                             for (const int ou : gi->second)
                                 if (!trig.count(ou))
-                                    at.tog.push_back({ou, (uint8_t)(t2->second.togon == 1), dl});
+                                    at.tog.push_back({ou, (uint8_t)(t2->second.togon == 1), dl, tg});
                     }
                     const bool moves = (t2->second.ox != 0.0 || t2->second.oy != 0.0);
                     const double d2 = t2->second.dur * 240.0;
@@ -1957,7 +2396,22 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
                 }
             }
         }
-        if (!at.ctl.empty()) out.push_back(std::move(at));
+        // --touchoff (g_touchOwnOff): ...and a Toggle that switches nothing the model places,
+        // but does switch a touch box's own trigger. Its crossing tick (fireT) is what
+        // markTouched reads for that box.
+        bool keepForTouch = false;
+        if (g_touchOwnOff && at.ctl.empty() && T.id == 1049 && T.togon >= 0) {
+            const auto gi = byGroup.find(T.target);
+            if (gi != byGroup.end())
+                for (const int ou : gi->second) {
+                    const auto t2 = trig.find(ou);
+                    if (t2 != trig.end() && t2->second.touch) {
+                        keepForTouch = true;
+                        break;
+                    }
+                }
+        }
+        if (!at.ctl.empty() || keepForTouch) out.push_back(std::move(at));
     }
     // ...and the uids some ROTATE turns, by the same walk. Still not placed by
     // the model -- an object a rotation carries cannot be described by offsets,
@@ -2037,6 +2491,7 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
     // suite.
     g_rotated.clear();
     g_rotSpec.clear();
+    g_rotTailParts.clear();
     for (const auto& kv : trig) {
         const TrigRow& T = kv.second;
         if (T.id != 1346 || T.target == 0) continue;
@@ -2063,6 +2518,12 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
         spec.ease = T.ease;
         spec.erate = T.erate;
         spec.lockrot = T.lockrot;
+        rot.rotTotal = spec.total;
+        rot.rotDurT = spec.durT;
+        rot.rotEase = spec.ease;
+        rot.rotErate = spec.erate;
+        rot.rotLock = T.lockrot ? 1 : 0;
+        rot.rotAngleOk = T.hasAngle ? 1 : 0;
         // No angle means the dump predates t360, and `deg` alone would be the
         // remainder of a turn -- silently wrong rather than absent. Refuse the
         // spec instead, so the recording stays in charge for that object.
@@ -2077,16 +2538,23 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
             if (it == byGroup.end()) continue;
             for (const int uid : it->second) {
                 const auto t2 = trig.find(uid);
-                if (t2 != trig.end() && t2->second.target != 0)
-                    stack.push_back(t2->second.target);
-                else {
+                if (t2 != trig.end() && t2->second.target != 0) {
+                    // --rotnospawn: the Rotate turns this trigger and fires nothing (dynamics.hpp)
+                    if (!g_rotNoSpawn) stack.push_back(t2->second.target);
+                } else {
                     g_rotated.insert(uid);
                     // The pivot is not carried by its own rotation, so a spec
                     // for it would place it on top of itself.
                     if (usable && uid != centre) g_rotSpec[uid] = spec;
+                    // --rottail: an autonomous Rotate with a known angle about a single centre object,
+                    // or about each object's own position (no centre group)
+                    if (autonomous && T.hasAngle && uid != centre && (T.center == 0 || centre != 0))
+                        g_rotTailParts[uid].push_back({T.uid, centre, spec.total, spec.durT, spec.erate,
+                                                      spec.ease, (uint8_t)(T.lockrot ? 1 : 0), T.cx});
                     if (autonomous) {
                         TrigCtl c{};
                         c.uid = uid;
+                        c.orbit = (T.center != 0 && uid != centre) ? 1 : 0;   // any centre group, the target's own included
                         rot.ctl.push_back(c);
                     }
                 }
@@ -2094,6 +2562,35 @@ inline std::vector<AutoTrig> loadAutoTriggers(const std::string& trigPath,
         }
         if (autonomous && !rot.ctl.empty()) out.push_back(std::move(rot));
     }
+    // ...in crossing order, so Rotates about different centres turn the object in the order GD fires them
+    // (the trigger map's own order is a hash's)
+    for (auto& kv : g_rotTailParts)
+        std::stable_sort(kv.second.begin(), kv.second.end(),
+                         [](const RotTailPart& a, const RotTailPart& b) {
+                             return a.trigCx != b.trigCx ? a.trigCx < b.trigCx : a.trigUid < b.trigUid;
+                         });
+    // --autostop: an x-crossing Stop is an entry of its own, so its crossing is resolved the way
+    // any root's is (delay 0: fireT is the crossing tick), and it names the Moves of its target
+    // group. Its pause/resume mode and control-ID option are not in the dump; every one is read
+    // as a plain stop, and each is printed so a level that relies on the others can be told apart.
+    if (g_autoStop)
+        for (const auto& kv : trig) {
+            const TrigRow& T = kv.second;
+            if (T.id != 1616 || T.touch || T.spawn || T.target == 0) continue;
+            const auto gi = byGroup.find(T.target);
+            if (gi == byGroup.end()) continue;
+            AutoTrig st;
+            st.uid = T.uid;
+            st.cx = T.cx;
+            st.delay = 0;
+            for (const int u : gi->second) {
+                const auto t2 = trig.find(u);
+                if (t2 != trig.end() && t2->second.id == 901) st.stopMoves.push_back(u);
+            }
+            std::printf("autostop: Stop uid %d at x=%.0f halts %zu Move(s) of group %d\n", T.uid,
+                        T.cx, st.stopMoves.size(), T.target);
+            if (!st.stopMoves.empty()) out.push_back(std::move(st));
+        }
     std::sort(out.begin(), out.end(),
               [](const AutoTrig& a, const AutoTrig& b) { return a.cx < b.cx; });
     if (!out.empty())

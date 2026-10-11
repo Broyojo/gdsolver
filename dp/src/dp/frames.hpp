@@ -98,6 +98,9 @@ struct RotTrig {
     // m_overrideVelocity(584). When set, vmodY is an absolute assignment, not a
     // multiplier. lv22 has no instance (carried only).
     uint8_t ovrVel = 0;
+    // m_dontSlide(585): rotateGameplay lowers the velocity-limit exemption its axis swap raised
+    // (--rotboost). Read by name from the objrects `dontslide` column; 0 when the dump has none.
+    uint8_t dontSlide = 0;
     // The object's RAW rotation and flipX, kept because the queue's sort order
     // is a function of them and of nothing else. `frame` above cannot serve:
     // it is overridden from gnddir, and GD's own sort reads the rotation.
@@ -404,7 +407,7 @@ inline bool g_ceilPush = false;
 // --dualcubeband (on by default since 2026-10): in a dual, a cube or robot stands on the band's
 // floor (upright) and ceiling (flipped) as the ball and spider do (step.hpp, ceilHere / floorHere).
 // (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
-// --dualband (default off): the band inside a dual is updateDualGround's, for either body's mode
+// --dualband (default on since 2026-10): the band inside a dual is updateDualGround's, for either body's mode
 // portal. GD (toggleDualMode, updateDualGround, animateInDualGroundNew, 2.2081):
 //   * the portal that turns the dual ON is kept at layer+0x408 (a dual portal met while the dual is
 //     already on returns early and changes nothing), and every later band is placed from ITS y;
@@ -417,7 +420,7 @@ inline bool g_ceilPush = false;
 // wrote bandFor(0, 300) = [90,390] (cli.hpp, the anchor's band seed). Measured on custom level C
 // t=10,570: the dual was turned on at x=6,915 by uid 36984 (cy 465, group 1); GD's band read
 // [330,600] with H 270 and [300,600] with H 300, both bandFor(465, H); the model wrote [90,390].
-inline bool g_dualBand = false;
+inline bool g_dualBand = true;
 // ...its two per-step channels, thread_local because phase 1 steps the layer in parallel.
 // g_bandPortalWrote: set by the portal band write in stepOne (step.hpp), so stepBoth can tell a
 // band the second half WROTE from the one it only carried -- the band's tween (bandAnim) moves
@@ -425,7 +428,7 @@ inline bool g_dualBand = false;
 // to the second half's height (GD runs p1's collisions first); -1 = read s.mode2 as before.
 inline thread_local bool g_bandPortalWrote = false;
 inline thread_local int g_dualOtherMode = -1;
-// --dualslide (default off): each dual body keeps its own DART SLIDE arm (State::slideT2 beside
+// --dualslide (on by default since 2026-10-07; --no-dualslide is the off arm): each dual body keeps its own DART SLIDE arm (State::slideT2 beside
 // slideT; modifiers.hpp slideBoxTouch). GD's is per player: collisionCheckObjects sets THAT body's
 // +0xb78 to 2 when it touches an id-1755 box (0x215ab7), PlayerObject::update steps it down, and
 // collidedWithObjectInternal gives a wave the solid push-out only while it is >= 1. The model had one
@@ -434,7 +437,26 @@ inline thread_local int g_dualOtherMode = -1;
 // 56076's top at 0.01 px; p2, in the upper lane with no 1755, sinks 0.25-3.48 px into block 56066's
 // top with collidedWithObject returning 0 and dies at 5.1 px -- where the model, on p1's arm, seated
 // p2 at 575 (step.hpp swapHalves, fixup.hpp stepBoth, the dual entry).
-inline bool g_dualSlide = false;
+// Acceptance for the default: kitref on 69 kits (the 13 levels with a dual portal and 1755 boxes, plus
+// one more dual-ball level), 1,028 episodes: no change; lv16/21/22 one-session [fp] identical; no positive replay of the
+// scene above (its level is not in the lab).
+inline bool g_dualSlide = true;
+// --dualhover (default on since 2026-10): each dual robot keeps its own hover budget (State::rHover2 beside
+// rHover). GD's is per player (+0x830, zeroed in updateJump's jump block); the model had one for the
+// pair and kept the first half's, so a second body that jumped alone lost its hover on the next
+// tick. A custom level's dual robot, only the second body jumping (the first one's controls off):
+// GD holds its vy at +5.615 for 7 ticks (7,035..7,041) and then falls at -0.195 a tick; the model's
+// fell from the jump tick on. NOT seeded at an --start anchor (rHover is not either).
+inline bool g_dualHover = true;
+// --rotlatch (default on since 2026-10): the cube's spin keeps the size it was staked at, and a cube entered in
+// the air from a ship, UFO, wave or swing is staked there. runNormalRotation (0x38d220) reads the size
+// (+0x9f0) and the gravity when it is called, and updateRotation turns by what it wrote until the next
+// call; togglePlayerScale (0x3a0700) does not call it for the cube, while resetPlayerIcon (0x39b2e0,
+// from toggleFlyMode / toggleBirdMode / toggleDartMode / toggleSwingMode) does. The model took the
+// rate from this tick's size and the sign from the previous tick. A cube entered in the air from
+// the ball waits for the fall stake, as --cubeentryspin's robot and spider do (toggleRollMode clears
+// the spin). See the cube's spin block in step.hpp for the measurements.
+inline bool g_rotLatch = true;
 // --dualdash: each dual body keeps its own dash (State::dashing2 / dashSlope2): GD's m_isDashing is
 // per player, and with one shared field the second body ran the first body's dash (step.hpp
 // swapHalves, fixup.hpp stepBoth, the dual entry, search_key.hpp).
@@ -490,6 +512,24 @@ inline bool g_dualSlide = false;
 // ball GD puts on a ceiling ramp's top strip) that nothing told apart from the witness; with it off
 // the rest of the branch fixes the same 22 and breaks none, the witness (custom level B, iteration 33) included.
 inline bool g_stripVetoOrder = false;
+// --ringspendflap (default on since 2026-10): a ring that takes the press also takes the flap a mode portal buffered
+// for the next tick on it (step.hpp, the ring's press spend; State::pFlap).
+inline bool g_ringSpendFlap = true;
+// --ballportalflap (default on since 2026-10; 2026-10-10): an airborne ball's press that nothing spent is still
+// +0x986 when a portal makes the body a UFO, and the UFO flaps on it the next tick (step.hpp, the
+// portal flap; State::pFlap). updateJump's ball arm clears +0x986 only on the ground (0x9c1), and its
+// UFO arm flaps on `+0x986 && +0x985`; a custom level's attempt, pressed one tick before a ball ->
+// UFO portal and held through it: GD flaps (vy 6.871) the tick after the portal, the model fell on.
+inline bool g_ballPortalFlap = true;
+// --bvar9kill (default on since 2026-10): a UFO that rode a ramp last tick and meets a different ramp of the other
+// side dies on that ramp's lethal outline as on a spiked one (step.hpp, the spiked-ramp pass; GD's bVar9).
+inline bool g_bvar9Kill = true;
+// --spiderringfirst (default on since 2026-10): a grounded spider's fresh press inside any ring goes to the ring, not
+// to the teleport (step.hpp, spiderTpOrbFirst; pushButton offers the press to the touched rings first).
+inline bool g_spiderRingFirst = true;
+// --flipceilball (default on since 2026-10): a flipped ball's ride on a ceiling ramp's gravity-facing side continues
+// along the line as the cube's does (step.hpp, --flipceilride's cubeRide).
+inline bool g_flipCeilBall = true;
 // --ballungroundramp (on by default; --no-ballungroundramp is the off arm): a ship / UFO that a ramp
 // with a smaller uid than the ball portal seated is not on the ground on the tick it becomes a ball
 // (step.hpp, the mode change in the portal pass).
@@ -895,18 +935,38 @@ inline const char* const kHistNames[] = {"pressSpent", "pressSpent2"};
 // since the ride's clock +0x598 was stamped, read against +0xaa0) and
 // `slopeLanded` (a grounded row since then). -1 = not said. Parsed always,
 // seeded only under --anchorride (cli.hpp maps them onto the ride fields).
-inline std::array<const char*, 9> histNamesFor(int version) {
+// Version 5 adds the second body's dash: `dashing2` (p2's m_isDashing) and
+// `dashRing2` (the uid of the ring p2 dashes from, -1 for none). --start carries
+// p1's dash (its 17th/18th fields) and nothing carried p2's, so an anchor taken
+// while both bodies of a dual dash started State::dashing2 at 0 and p2 fell. The
+// slope is rebuilt from the ring's angle as the dash's own start does (step.hpp),
+// so the value stays an integer.
+// Version 6 adds the press latch's first byte itself, per body: `jumpBuf` (GD's
+// m_jumpBuffered, +0x985) and `jumpBuf2` (-1 = no second body). pressSpent is
+// +0x985 && !+0x986, which cannot tell "the button is up" from "the button is down
+// and a ball's tap cleared +0x985", and the second is State::holdDead (the hold
+// latch): a ship entered on that hold does not thrust. Seeded under --holdseed.
+inline std::array<const char*, 13> histNamesFor(int version) {
+    if (version == 6)
+        return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
+                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded", "dashing2", "dashRing2",
+                "jumpBuf", "jumpBuf2"};
+    if (version == 5)
+        return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
+                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded", "dashing2", "dashRing2",
+                nullptr, nullptr};
     if (version == 4)
         return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
-                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded"};
+                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded", nullptr, nullptr,
+                nullptr, nullptr};
     if (version == 3)
         return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", nullptr,
-                nullptr, nullptr, nullptr, nullptr};
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     if (version == 2)
         return {"pressSpent", "pressSpent2", "freeMode", nullptr, nullptr,
-                nullptr, nullptr, nullptr, nullptr};
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     return {kHistNames[0], kHistNames[1], nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr};
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 }
 // --anchorride / --no-anchorride (default on since 2026-09-30): seed the anchor's
 // slope-ride fields from the hist payload's version-4 values (cli.hpp, after the
@@ -1165,6 +1225,14 @@ inline std::vector<int> g_spentPad;
 // A/B switch (--no-spentpad): ignore the list above, i.e. seed only from the
 // boxes overlapped at t0, which is what every build before 2026-09-06 did.
 inline bool g_spentPadSeed = true;
+// --spentpadhold (on; --no-spentpadhold is the off arm): every pad --spentpad names stays spent for the whole run (Obj::spentRun),
+// not only those still inside the release's x window at t0. The four usedPad slots are released on
+// x alone, so a pad fired before the anchor and met again after the player has been away is live
+// to the model where GD's latch still holds. SubZero 4002: the -90 deg pink pad uid 16219 is fired
+// on the way out (it is in the list), the anchor at x=29,714 is outside its window, and on the way
+// back at t=24,800 the model fired it (vy 6.72) where GD -- shown in the game with the spider's head
+// up to 6.6 px inside its box -- fires nothing. A Multi Activate pad is never latched and is skipped.
+inline bool g_spentPadHold = true;
 // (--norevtoggle, which turned off the reverse-run toggle of a same-frame 2900,
 // is gone since the flag clean-up.)
 
@@ -1200,6 +1268,46 @@ inline bool ctrlOffAt(long long t) {
         if (t >= w.first && t <= w.second) return true;
     return false;
 }
+// --ctrlwinlag: the window's first tick still takes the button as it is; the window holds it at 0
+// from the second tick on. A custom level's ship, its window 7,271..7,331 (the ctrlOff column), five
+// plans in GD that differ only in the press:
+//   held from 7,270, released by the plan on 7,272  thrust 7,270-7,271, falls from 7,272
+//   held from 7,270, released by the plan on 7,292  the same rows: the window released it on 7,272
+//   held from 7,269                                  thrust 7,269-7,271, falls from 7,272
+//   a fresh press reaching 7,271                     thrust on 7,271, falls from 7,272
+//   a fresh press reaching 7,272                     no thrust at all
+// So the flag the column shows is raised after the tick's own buttons. The model zeroed 7,271 too.
+// `heldBefore` is kept for the callers; the measurement does not need it.
+// On by default since 2026-10-06; --no-ctrlwinlag is the off arm.
+inline bool g_ctrlWinLag = true;
+inline bool ctrlInputOffAt(long long t, bool heldBefore) {
+    (void)heldBefore;
+    if (!ctrlOffAt(t)) return false;
+    return !g_ctrlWinLag || ctrlOffAt(t - 1);
+}
+// --ctrlwin2 / --ctrlwinp2 (--ctrlwinp2 on by default since 2026-10): the windows above are player 1's m_controlsDisabled, and
+// the Options trigger switches the two players separately (processOptionsTrigger 0x223d50: +0x754
+// calls disable/enablePlayerControls on player 1, +0x758 on player 2). --ctrlwin2 carries the second
+// body's own windows (the dump's p2ctrlOff). A custom level's dual robot: an Options trigger with
+// only the player-1 box set raises ctrlOff at 7,012, and on the plan's press at 7,035 GD's second
+// body jumps (vy +5.615) while the first, held on its band, does not; the model held both. With the
+// flag the second half of a dual tick (stepBoth's second stepOne) reads --ctrlwin2 instead of
+// --ctrlwin. The replay's window re-push (cli.hpp) is still built from --ctrlwin alone: a second-body
+// window that lifts under a held button is not measured.
+inline std::vector<std::pair<long long, long long>> g_ctrlWin2;
+inline bool g_ctrlWinP2 = true;
+inline bool ctrlOff2At(long long t) {
+    for (const auto& w : g_ctrlWin2)
+        if (t >= w.first && t <= w.second) return true;
+    return false;
+}
+// Whether the body being stepped takes no button at t: the second half reads its own windows
+// under --ctrlwinp2.
+inline bool ctrlBodyInputOffAt(long long t, bool secondHalf) {
+    if (!(g_ctrlWinP2 && secondHalf)) return !g_ctrlWin.empty() && ctrlInputOffAt(t, false);
+    if (!ctrlOff2At(t)) return false;
+    return !g_ctrlWinLag || ctrlOff2At(t - 1);
+}
 // Jump ticks that come from a window's re-push (= w1+1). GD's buffered jump has
 // holding already at 0 when it fires, so **no hover starts** -- the model side,
 // which mirrors it with a synthetic press, would create s.action=1, so the jump
@@ -1227,6 +1335,43 @@ inline void fromFrame(int f, double u, double v, double& X, double& Y) {
         case 2:  X = -u; Y = -v; break;
         default: X = -v; Y =  u; break;
     }
+}
+// --dualunlink (default on since 2026-10): the Options trigger's Unlink Dual Gravity (id 2899, property 160;
+// objrects `optudg`, On=1 / Off=-1). processOptionsTrigger (0x223d50) copies it to the layer byte
+// +0x860, and three places test that byte before they touch the other body:
+//   GJBaseGameLayer::flipGravity (0x212b00)      skips the partner call (a portal's, a ring's, a pad's)
+//   playerWillSwitchMode (0x212ef0)              skips the dual mode portal's re-mirror
+//   toggleDualMode (0x2168d0)                    gives the new body player 1's gravity and vy, not the
+//                                                inverse and the negation
+// Measured on a custom level whose 2899 at x=10,305 raises it: two dual mini balls of opposite polarity
+// inside a green orb at (10950,1035), one press, replayed in GD --
+//   both bodies inside                           p1 0 -> 1 and p2 1 -> 0, each at the ring's full 6.2888
+//   p2 alone (p1 moved out by an injection)      p2 1 -> 0; p1 neither flips nor halves
+//   no press                                     neither flips
+// where the model's coupling turned each body's flip back on the other (p1 halved, both unflipped). A
+// level that never raises the byte keeps every coupling as it was measured (the custom dual cubes at
+// --dualorbflip's note). Fired on the player's x crossing the trigger's, like the zoom and static-camera
+// triggers; the crossing queue runs in checkSpawnObjects, after both bodies' collisions, so a crossing
+// counts from the next tick. Touch- and spawn-triggered rows are not read. In a rotated frame the
+// test is still "the last trigger at or behind the player's world x", which is a crossing history
+// only while x does not run back.
+inline bool g_dualUnlink = true;
+struct UnlinkTrig {
+    double cx;   // world x
+    int8_t v;    // 1 unlinks, -1 links again
+};
+inline std::vector<UnlinkTrig> g_unlinkTrigs;   // sorted by cx at load
+// Whether the pair is unlinked during a tick that starts at (u, v) in `frame`.
+inline bool dualUnlinkedAt(int frame, double u, double v) {
+    if (!g_dualUnlink || g_unlinkTrigs.empty()) return false;
+    double X = u, Y = v;
+    if (frame & 3) fromFrame(frame, u, v, X, Y);
+    int8_t st = -1;
+    for (const UnlinkTrig& t : g_unlinkTrigs) {
+        if (t.cx > X) break;
+        st = t.v;
+    }
+    return st == 1;
 }
 // The travel coordinate of a world point in this frame (what `cx` becomes).
 inline double frameU(int f, double X, double Y) {

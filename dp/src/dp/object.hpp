@@ -53,6 +53,10 @@ struct Obj {
     // tick from the recording or the trigger definitions). Fixups do not
     // apply near one -- see nearDynObject in fixup.hpp.
     uint8_t dynObj = 0;
+    // Extended Collision (GameObject::m_hasExtendedCollision, +0x280, level property 511), from the
+    // objrects `extcol` column. addToSection (0x226500) files such an object in the collision pass's
+    // always-checked list (+0x35e0) instead of a section cell, so --bigsection leaves it alone.
+    uint8_t extCol = 0;
     // Slope (GameObjectType 25). The MOD samples GD's own slopeYPos() at the
     // left and right edge of the object's rect, so sy0/sy1 ARE the surface line
     // and the model never has to know which of the 30 slope object ids faces
@@ -114,6 +118,12 @@ struct Obj {
     // 0 = leave gravity alone, which is what all 20 of lv20's are.
     double tpY = 0.0;
     uint8_t tpGrav = 0;
+    // A teleport's m_ignoreX / m_ignoreY (objrects tpix / tpiy), bit 0 keeps the player's x and
+    // bit 1 its y: the orb's (read under --teleportorb) and the portal's (type 28, read under
+    // --tpkeepy). Left 0 on everything else.
+    uint8_t tpKeep = 0;
+    // The velocity a teleport portal sets after the move (--tppush; objrects tpfm..tprmax).
+    TpForce tpForce;
     // The EXIT half's real position (objrects' tpex/tpey, added 2026-08-18).
     // teleportPlayer resolves the target from m_orangePortal (portal+0x748)
     // when it is linked, and the closed tpY formula above is the id-747 branch
@@ -127,6 +137,9 @@ struct Obj {
     // objFacingDown(). objrects' 31st column (flipy). Falls back to 0 in an old
     // export that lacks the column.
     uint8_t flipY = 0;
+    // ...and isFlipX(), objrects' 30th column (flipx): a dash ring's line turns by 180 (--dashclamp,
+    // speed.hpp).
+    uint8_t flipX = 0;
     // FREE MODE (a mode portal's level-string property 111, objrects' `free`
     // column). A portal that carries it does NOT rewrite the flying band:
     // playerWillSwitchMode copies it into the layer and updateDualGround then
@@ -140,6 +153,28 @@ struct Obj {
     // mirrors the player's x about the object, is gated on the player's copy of
     // the level's reverseSync (kA42, +0x562), which no level here sets.
     uint8_t rev = 0;
+    // MULTI ACTIVATE (level-string property 99, EnhancedGameObject::m_isMultiActivate,
+    // objrects' `multiact` column). GD never marks such an object used
+    // (activatedByPlayer 0x1a4a90 skips the per-player bytes, hasBeenActivatedByPlayer
+    // 0x1a4af0 answers false), so a ring with it fires again on the next press while the
+    // player is still inside it; only the player's per-press ring set (+0x848, emptied by
+    // pushButton 0x397f40) stops a second firing on the same press. Read under --multiorb.
+    // A classic level's rule: in a platformer canMultiActivate reads the opposite flag (444).
+    uint8_t multiAct = 0;
+    // --spentpadhold (frames.hpp): a pad --spentpad names, fired before the anchor; GD's latch on it
+    // holds for the whole attempt. Set once per run, on the level's copy.
+    uint8_t spentRun = 0;
+    // --pressfresh (triggers.hpp): the touch box (State::trig bit) of the toggle block that switches
+    // this teleport on, -1 for everything else. `pendOff` is per group, written with cx/cy when the
+    // dynamic set places it: 1 = off here only because that box has not fired in this group's
+    // world. Such a teleport is still collected, and live only on the step whose fresh press fires
+    // the box.
+    int16_t pendBox = -1;
+    uint8_t pendOff = 0;
+    // --holdtap (below): the x of the hold-mode Touch trigger that switches this object off while the
+    // button is held (0 = none), and whether the recording has it on at this tick (Dynamics::seek).
+    float holdTapX = 0.f;
+    uint8_t recOn = 1;
 };
 
 // A verbatim port of GameObject::isFacingDown() (2.2081 win 0x1a1910). GD turns
@@ -276,9 +311,29 @@ constexpr double kSawMargin = 0.05;
 // place -- and another old custom level has a witness against it: a mini ship at t=3,297 with its
 // box corner 32.3037 from a 32.3 saw (uid 1184) that GD does not kill (it kills on the next tick,
 // at 31.66), where the default 0.05 killed a tick early.
+// --sawexactwave (default on since 2026-10): the WAVE's addend is 0 as well. A custom level's wave zig-zags over a
+// static saw (uid 3970, id 1707, scaled radius 9.30225) with its box corner 9.3074 from the centre at
+// t=378 and its box edge 9.3022 above it at t=380/382/384, and GD kills none of them; the default 0.05
+// killed it at t=378 (the wave's addend was never measured -- it is the default above).
+inline bool g_sawExactWave = true;
+// --sawexactufo (default on since 2026-10): the UFO's (mode 3) addend is 0 too. A custom level's upside-down UFO passes a
+// group-moved saw (id 187, radius 21.87) with its box corner 21.8907 from the centre and GD lets it live that
+// tick, where the default 0.05 killed it a tick early. Injecting the UFO's y on the tick before and sweeping it
+// puts GD's boundary between 21.8654 (dies) and 21.8708 (lives): the radius itself, nothing added (the UFO's
+// addend was never measured -- it is the default above).
+inline bool g_sawExactUfo = true;
+// --sawexactcube (default on since 2026-10): the CUBE's (mode 0) addend is 0 as well. The note above kept the cube's 0.05
+// because taking every mode to 0 moved one custom level's route against a wall -- a route effect, not a
+// measurement. Measured in an official level: a cube injected in the air beside a static saw (id 1734, radius 32)
+// dies at a box-corner distance of 32.00 and lives at 32.02, so GD's boundary is the radius itself and the
+// default 0.05 kills a band GD flies through.
+inline bool g_sawExactCube = true;
 inline double sawMarginFor(uint8_t mode) {
     if (mode == 5) return 0.10;
     if (mode == 2 || mode == 1) return 0.0;
+    if (mode == 4 && g_sawExactWave) return 0.0;
+    if (mode == 3 && g_sawExactUfo) return 0.0;
+    if (mode == 0 && g_sawExactCube) return 0.0;
     return kSawMargin;
 }
 
@@ -363,9 +418,42 @@ inline bool outOfSweepReach(const Obj* o, double x0, double y0, double x1,
         || o->cy + ey + reach < std::min(y0, y1) || o->cy - ey - reach > std::max(y0, y1);
 }
 
+// --holdtap (default on since 2026-10): a hazard in the group of a Touch trigger (1595) in hold mode with toggle
+// "off" (properties 81 = 1, 82 = 2), crossed on the x queue, is off on a tick whose previous tick had
+// the button down and on otherwise -- the state's own button, not the recording's. The recording is
+// one attempt's presses, so a plan that holds where that attempt released met the spikes it had
+// switched on, and the search found no way through. Measured on a custom level (Touch uid at
+// x=16,725, eight spikes of group 101 on a floor, x 17,248-17,676), replaying one plan with the
+// release moved: released on 9,779 / 9,790 / 9,800 / 9,815 / 9,830 / 9,960 -> dead on the next tick
+// (on a spike), on 9,970 / 9,985 / 10,010 -> alive 90 ticks on; and the recordings put the switch a
+// tick after the button: a press on 9,805 has the spike off from row 9,806, a release on 9,830 on from
+// 9,831. In the corpus (2026-10-10): 6 of 531 levels have a hold-mode 1595 at all, and of the 183 with
+// a kit only that one level's targets a solid or a hazard -- eight hazards, no solid, so only the
+// hazard test reads it. A press held from before the trigger's crossing counts as down, which GD,
+// with no fresh press after it, may not do (the --ctrltouch rule says the same). Needs --heldall
+// (State::held is the button in every mode); frame 0 only.
+inline bool g_holdTap = true;
+inline thread_local int8_t t_holdHeld = -1;   // the stepped state's button on the previous tick; -1: none
+inline thread_local double t_holdX = 0.0;     // ...and its x at the start of the tick
+inline bool holdTapGone(const Obj* o) {
+    if (o->holdTapX <= 0.f || t_holdHeld < 0) return false;
+    if (t_holdX > (double)o->holdTapX) return t_holdHeld != 0;
+    return o->recOn == 0;   // before the trigger is crossed, as recorded
+}
+// The x spans of the objects such a trigger switches (with 30 px before and 15 after): there the
+// button is part of the state, as nearCtrlHoldBox makes it for --ctrltouch.
+inline std::vector<std::pair<double, double>> g_holdTapSpans;
+inline bool nearHoldTap(double x) {
+    if (!g_holdTap) return false;
+    for (const auto& sp : g_holdTapSpans)
+        if (x >= sp.first - 30.0 && x <= sp.second + 15.0) return true;
+    return false;
+}
+
 inline bool hazardHit(const Obj* o, double px, double py, double half,
                       double margin, double sawAdd = kSawMargin,
                       int mode = -1, int mini = 0) {
+    if (g_holdTap && holdTapGone(o)) return false;
     if (o->radius > 0.0) {
         const double dx = px - o->cx, dy = py - o->cy;
         const double hRect = sawRectHalfB(mode, mini);   // -1 when unmeasured
@@ -475,8 +563,8 @@ inline bool hazardHit(const Obj* o, double px, double py, double half,
     // box's normal axis does not, and one row later the player is past the rect's x
     // bound, so the box has no row left) -- GD survives all nine, at rot 15/30/45/63
     // and by 0.97 to 3.55 px. Three control cells, where both shapes fire, die on the
-    // predicted row. So `--hazaabb` (the rect alone in stage 1) is not GD's shape: it
-    // kills in a region GD leaves alone. It stays a diagnostic, default off.
+    // predicted row. So the rect alone in stage 1 (the former `--hazaabb`, removed) is not GD's
+    // shape: it kills in a region GD leaves alone.
     //
     // Reading a column sweep as a shape boundary is what made the flag look right:
     // the player crosses a hazard diagonally (dx +1.298, dy -1.298 per row), so every
@@ -493,7 +581,7 @@ inline bool hazardHit(const Obj* o, double px, double py, double half,
     // cannot decide it. What is left: the player box's centre may sit off the dumped
     // (x,y) by an offset that turns with the player (the rig's player is at -1 deg,
     // lv19's at -13.4), which is unmeasured.
-    if (o->obbOk && !g_hazAabb) {
+    if (o->obbOk) {
         const double dx = px - o->cx, dy = py - o->cy;
         const double h = half + margin;
         // the player's square projected onto the box's axes (same width on
@@ -520,6 +608,18 @@ inline bool hazardHit(const Obj* o, double px, double py, double half,
     // cold run recorded 12 `kill` fixups in that one corridor, all at y=384.
     return std::fabs(px - o->cx) <= o->hw + half + margin
         && std::fabs(py - o->cy) <= o->hh + half + margin;
+}
+// --hazrectgate: the first stage where the caller goes on to the box-vs-box test (`boxFollows`, i.e. --obb-all):
+// a turned hazard's recorded rect against the player's rect, the game's first stage. The turned-box branch above
+// projects the player's square UNturned, so with the player turned it can refuse what both of the game's stages
+// accept. A custom level's turned spike against a ship at 4.3 deg: rects overlap by 0.29 px, boxes overlap, the game
+// kills, and the unturned square missed the box's normal axis by 0.24 px -- the model died a tick late.
+inline bool hazardStage1(const Obj* o, double px, double py, double half, double margin, double sawAdd,
+                         int mode, int mini, bool boxFollows) {
+    if (g_hazRectGate && boxFollows && o->obbOk && o->radius <= 0.0)
+        return std::fabs(px - o->cx) <= o->hw + half + margin
+            && std::fabs(py - o->cy) <= o->hh + half + margin;
+    return hazardHit(o, px, py, half, margin, sawAdd, mode, mini);
 }
 
 }  // namespace dp

@@ -23,6 +23,7 @@ Traps:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import struct
 import sys
@@ -49,7 +50,21 @@ def _worker_exe() -> Path:
 
 
 EXE = _worker_exe()
-BRO = REPO / "build" / "_deps" / "bindings-src" / "bindings" / "2.2081" / "GeometryDash.bro"
+
+
+# The bindings the build used: GEODE_BINDINGS_REPO_PATH when it is set (a pinned clone, which
+# Geode's CMake reads instead of fetching), else the copy CPM fetched into this checkout's build.
+def _broma() -> Path:
+    rel = Path("bindings") / "2.2081" / "GeometryDash.bro"
+    env = os.environ.get("GEODE_BINDINGS_REPO_PATH")
+    cands = ([Path(env) / rel] if env else []) + [REPO / "build" / "_deps" / "bindings-src" / rel]
+    for c in cands:
+        if c.exists():
+            return c
+    return cands[-1]
+
+
+BRO = _broma()
 
 
 class PE:

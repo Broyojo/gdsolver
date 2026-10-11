@@ -48,12 +48,18 @@ public:
         return true;
     }
 
+    // textOnly: the second row is a caption with no groove or fill (a phase with no measurable end).
     void refresh(bool visible, double levelFrac, const char* levelText, bool searching,
-                 double searchFrac, const char* searchText) {
+                 double searchFrac, const char* searchText, bool textOnly = false) {
         setVisible(visible);
         if (!visible) return;
         setRow(0, true, levelFrac, levelText);
         setRow(1, searching, searchFrac, searchText);
+        if (searching && textOnly) {
+            m_track[1]->setVisible(false);
+            if (m_fillRect[1]) m_fillRect[1]->setVisible(false);
+            if (m_fillSprite[1]) m_fillSprite[1]->setTextureRect({0.f, 0.f, 0.f, m_fillH[1]});
+        }
     }
 
 private:
@@ -152,11 +158,12 @@ inline void updateBars(cocos2d::CCNode* parent, bool show, float& y) {
     // search (its ticks), else a recording pass of the moving geometry (x over the level), else
     // a section search in the game (its layers, 1 .. g_horizon: the loop in
     // hooks_gamelayer.cpp), else the game flying a plan (the player's x over the level). While
-    // the level is held still -- a plan being installed, a reset -- the row is hidden.
+    // the level is held still -- a plan being installed, a reset -- the row names the phase
+    // (phase.hpp) as text, with no fill, and is hidden only if no phase is set.
     const dpbridge::SolveProgress pr = dpbridge::progress();
     double sf = 0.0;
     char st[96] = "";
-    bool second = false;
+    bool second = false, textOnly = false;
     if (pr.running && pr.horizon > pr.from) {
         sf = (double)(pr.tick - pr.from) / (double)(pr.horizon - pr.from);
         snprintf(st, sizeof(st), "search %.1f%%", sf * 100.0);
@@ -178,6 +185,13 @@ inline void updateBars(cocos2d::CCNode* parent, bool show, float& y) {
         snprintf(st, sizeof(st), "section search %.1f%%   layer %d / %d", sf * 100.0,
                  secsolve::g_depth, secsolve::g_horizon);
         second = true;
+    } else if (std::string pname; !pr.running && phase::current(pname, sf)) {
+        // None of the four measures applies, but the loop has said what it is doing (phase.hpp):
+        // the name and how long it has taken, as text -- there is no end to fill towards.
+        snprintf(st, sizeof(st), "%s  %.0f s", pname.c_str(), sf);
+        sf = 0.0;
+        second = true;
+        textOnly = true;
     } else if (!pr.running && !g_paused && len > 1.f) {
         // A flight, the first one included (no plan installed yet: it runs on whatever the loop
         // gave it). The player's x over the level: a plan's last input is not where its flight
@@ -189,7 +203,7 @@ inline void updateBars(cocos2d::CCNode* parent, bool show, float& y) {
                  (double)px, (double)len);
         second = true;
     }
-    bars->refresh(true, lf, lt, second, sf, st);
+    bars->refresh(true, lf, lt, second, sf, st, textOnly);
 }
 
 }  // namespace progressbars
