@@ -35,9 +35,14 @@ jobs:
 
       # `sdk: given` (the default) takes the Geode version out of mod.json, so CI and a desk
       # build are the same SDK without a second place to keep it up to date.
+      # The bindings are pinned to the commit the desk builds use: the action otherwise takes the
+      # bindings repo's latest main, and a change there on 2026-10-06 made GJGameState's copy
+      # assignment implicitly deleted, which src/solver/psnap.hpp relies on.
       - name: Build the mod
         id: build
         uses: geode-sdk/build-geode-mod@main
+        with:
+          bindings-ref: f050fd74ad531b0827377c97510cb807903ff1b3
 
       - name: Upload the package
         uses: actions/upload-artifact@v7
@@ -71,6 +76,7 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         with:
           target: Android64
+          bindings-ref: f050fd74ad531b0827377c97510cb807903ff1b3
           configure-args: -DGDSOLVER_BUILD_DP=OFF -DCMAKE_CXX_FLAGS=-ferror-limit=0
 
       # ninja stops at the first failing file. While the port is incomplete, go on through
