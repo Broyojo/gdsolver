@@ -383,8 +383,8 @@ struct CurrentRules {
             // has moved is tested where it is now, and one the group has
             // switched off is not in the list at all -- GD credits neither
             // a moved coin at its old place nor a disabled one.
-            for (const CoinLive& C : coinLive) {
-                const uint8_t bit = (uint8_t)(1u << C.bit);
+            for (const CoinLive& lc : coinLive) {
+                const uint8_t bit = (uint8_t)(1u << lc.bit);
                 if (kid.s.coins & bit) continue;
                 // --coindbg: how close anything got. Recorded BEFORE the
                 // collect test and only inside the x bound, so a coin that
@@ -394,15 +394,15 @@ struct CurrentRules {
                 if (g_coinDbgT >= 0 && gframe == 0 && px > g_coinProbeMaxX)
                     g_coinProbeMaxX = px;
                 if (g_coinDbgT >= 0 && gframe == 0
-                    && std::fabs(px - C.cx) <= C.hw + ph) {
-                    ++g_coinSeen[C.bit];
-                    const double dy = std::fabs(py - C.cy);
-                    double& best = g_coinNearDy[C.bit];
+                    && std::fabs(px - lc.cx) <= lc.hw + ph) {
+                    ++g_coinSeen[lc.bit];
+                    const double dy = std::fabs(py - lc.cy);
+                    double& best = g_coinNearDy[lc.bit];
                     if (best < 0.0 || dy < best) {
                         best = dy;
-                        g_coinNearX[C.bit] = px;
-                        g_coinNearY[C.bit] = py;
-                        g_coinNearT[C.bit] = (long long)t;
+                        g_coinNearX[lc.bit] = px;
+                        g_coinNearY[lc.bit] = py;
+                        g_coinNearT[lc.bit] = (long long)t;
                     }
                 }
                 // Touching counts (measured: exactly on the boundary is
@@ -413,17 +413,17 @@ struct CurrentRules {
                 // takes a third of it -- measured on lv21, where the search
                 // then had no route left it could call a collection. A
                 // quarter of the bound is the cap.
-                const double mx = std::min(kCoinMargin, (C.hw + ph) * 0.25);
-                const double my = std::min(kCoinMargin, (C.hh + ph) * 0.25);
-                if (std::fabs(px - C.cx) <= C.hw + ph - mx
-                    && std::fabs(py - C.cy) <= C.hh + ph - my) {
+                const double mx = std::min(kCoinMargin, (lc.hw + ph) * 0.25);
+                const double my = std::min(kCoinMargin, (lc.hh + ph) * 0.25);
+                if (std::fabs(px - lc.cx) <= lc.hw + ph - mx
+                    && std::fabs(py - lc.cy) <= lc.hh + ph - my) {
                     // --coindbg: WHERE the model decided it had one, once
                     // per coin. "The game refused a coin the plan claimed"
                     // names the coin and nothing else, so without this the
                     // claim's own position is only inferable -- and the two
                     // sides were compared at different ticks twice before.
-                    if (g_coinDbgT >= 0 && !g_coinSaid[C.bit]) {
-                        g_coinSaid[C.bit] = 1;
+                    if (g_coinDbgT >= 0 && !g_coinSaid[lc.bit]) {
+                        g_coinSaid[lc.bit] = 1;
                         // ...with vy and the mode, because the next question
                         // this line gets asked is always "does the game
                         // survive from there", and that is an injection
@@ -435,11 +435,11 @@ struct CurrentRules {
                                     " vy=%.4f mode=%d mini=%d frame=%d"
                                     " live=(%.3f,%.3f) |dx|=%.3f |dy|=%.3f"
                                     " bound=(%.3f,%.3f)\n",
-                                    (long long)t, C.bit, px, py,
+                                    (long long)t, lc.bit, px, py,
                                     (double)kid.s.vy, (int)kid.s.mode,
-                                    (int)kid.s.mini, gframe, C.cx, C.cy,
-                                    std::fabs(px - C.cx), std::fabs(py - C.cy),
-                                    C.hw + ph - mx, C.hh + ph - my);
+                                    (int)kid.s.mini, gframe, lc.cx, lc.cy,
+                                    std::fabs(px - lc.cx), std::fabs(py - lc.cy),
+                                    lc.hw + ph - mx, lc.hh + ph - my);
                     }
                     kid.s.coins |= bit;
                 }
@@ -522,8 +522,8 @@ struct CurrentRules {
                 const CoinOnGate& G = coinGate[gi];
                 if (kid.s.coins & (uint8_t)(1u << G.coinIdx)) continue;
                 bool liveNow = false;
-                for (const CoinLive& C : coinLive)
-                    if (C.bit == G.coinIdx) { liveNow = true; break; }
+                for (const CoinLive& lc : coinLive)
+                    if (lc.bit == G.coinIdx) { liveNow = true; break; }
                 if (liveNow) continue;
                 bool canStill = false;
                 for (const auto& on : G.ons)
@@ -577,10 +577,10 @@ struct CurrentRules {
             for (size_t ci = 0; !dead && gframe == 0 && ci < L.coins.size(); ++ci) {
                 if (!coinPruneOk[ci]) continue;
                 if (kid.s.coins & (uint8_t)(1u << ci)) continue;
-                const Obj& C = L.coins[ci];
+                const Obj& oc = L.coins[ci];
                 // x only ever grows in frame 0, and coinPruneOk says every
                 // later return to frame 0 is past this coin, so it is final.
-                if (px > C.cx + C.hw + ph) { dead = true; break; }
+                if (px > oc.cx + oc.hw + ph) { dead = true; break; }
             }
         }
     }

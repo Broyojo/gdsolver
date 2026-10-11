@@ -8,8 +8,8 @@
 #include <thread>        // the solver worker
 #if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
 #include <xmmintrin.h>   // _mm_getcsr: see the fpenv line in logSolverArgs
-#include "dp/band_rows.hpp"   // dp_band.txt's rows, shared with dptest (addWorldArgs)
 #endif
+#include "dp/band_rows.hpp"   // dp_band.txt's rows, shared with dptest (addWorldArgs)
 // Stage C: the repair loop, inside the game.
 //
 // The loop is a loop around two things the mod already has: solving (dp/, linked in since
