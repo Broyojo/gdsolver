@@ -68,6 +68,14 @@
 // 26002420), which moved every function and took 0x40 bytes out of GJBaseGameLayer at m_effectManager. A build for the
 // first has GEODE_COMP_GD_VERSION 22090, one for the second 22091 (the bindings branch is the other half of the choice).
 // GD209(earlier, update) is the win209 value of each: a constant that did not move is written once.
+//
+// THE STATIC_ASSERTS ARE NOT THE PROOF. gd_offsets_check.cpp compares this header with the bindings, and both can carry the same stale number: on
+// the update (4EEE06D5) LevelInfoLayer gained an 8-byte member after m_unk2, both still said 0x27d for m_enterTransitionFinished, every assert passed, and
+// the Play menu's early-out read a byte of m_orbsIcon (byte 5 of the sprite's address: zero whenever that address is below 2^40, then no menu and the level just started). A value is right when the
+// EXECUTABLE says so: the same code in both builds must use the number, in the function that uses the member. The check that was made for the whole
+// header (107 of its 122 values read from both executables, one wrong, 14 not read by any function) is the lab's layout_scan.py + gd_offsets_verify.py,
+// which need both game executables and so cannot be a test here; re-run them when a new build of the game appears. And a change in a class's layout
+// that this header has no value for (a member the mod names through the bindings) is the bindings' to carry: the PAD in bindings/2.209 for the update.
 #if GEODE_COMP_GD_VERSION >= 22091
 #define GD209(earlier, update) (update)
 #else
@@ -228,7 +236,7 @@ inline constexpr std::size_t kInstTargetGroupIndex = GDOFF(0xc0, 0xc0, 0xe0);   
 
 // ---- Menu layers (hooks_playmenu.cpp's early-out asserts) ----
 inline constexpr std::size_t kLevelInfoBusy = GDOFF(0x1e0, 0x1e8, 0x1e0);          // LevelInfoLayer::m_isBusy
-inline constexpr std::size_t kLevelInfoTransitionDone = GDOFF(0x275, 0x27d, 0x275); // LevelInfoLayer::m_enterTransitionFinished
+inline constexpr std::size_t kLevelInfoTransitionDone = GDOFF(0x275, GD209(0x27d, 0x285), 0x275); // LevelInfoLayer::m_enterTransitionFinished
 inline constexpr std::size_t kLevelPageBusy = GDOFF(0x1a0, 0x1a0, 0x1a0);          // LevelPage::m_isBusy
 inline constexpr std::size_t kEditLevelExiting = GDOFF(0x1e0, 0x1f0, 0x1e0);       // EditLevelLayer::m_exiting
 inline constexpr std::size_t kLevelRequiredCoins = GDOFF(0x434, 0x4a4, 0x344);     // GJGameLevel::m_requiredCoins

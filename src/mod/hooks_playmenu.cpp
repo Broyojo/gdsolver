@@ -1334,6 +1334,52 @@ class $modify(PlayHoldItem, CCMenuItemSpriteExtra) {
     }
 };
 
+// Diagnostic, cfg `uishow=infoplay[:<stars>][:z]`: the real route to the Play menu of an online / downloaded level, short of the click. A level (cfg
+// `levelfile`, cfg `level` for its id, <stars> stars, default 0) is opened on a LevelInfoLayer the way the game opens one, and once the page has come in
+// onPlay is called on it -- the hooked one above, so "play menu: lv<N> checked" in the Geode log (or its absence) is the answer, and the result lines say
+// what the hook saw: the layer's m_isBusy and m_enterTransitionFinished by the bindings, and the bytes at +0x27d and +0x285. (Written for the update
+// of 2.209: the hook read m_enterTransitionFinished at the old build's offset, which in the update is a byte of m_orbsIcon, the sprite pointer's byte 5,
+// zero whenever that address is below 2^40.) With `:z` the byte at +0x27d is set to 0 just before the press: the case of the update's old offset reading a zero, made on purpose (it corrupts
+// m_orbsIcon, which nothing reads before the process is closed). LevelInfoLayer::scene has no Windows address in the bindings, so its place in each build is here.
+#if GEODE_COMP_GD_VERSION >= 22090
+namespace infoplay {
+inline void run(int stars, bool zero27d) {
+    if (g_cfg.levelFile.empty()) { writeResult("infoplay: no cfg levelfile"); return; }
+    std::ifstream f(g_cfg.levelFile, std::ios::binary);
+    const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto* level = GJGameLevel::create();
+    level->m_levelName = "preview";
+    level->m_levelID = g_cfg.levelId;
+    level->m_levelType = GJLevelType::Saved;
+    level->m_levelString = gdcompat::compressLevelString(raw);
+    level->m_stars = stars;
+    using SceneFn = cocos2d::CCScene* (*)(GJGameLevel*, bool);
+    const auto scene = reinterpret_cast<SceneFn>(geode::base::get() + (GEODE_COMP_GD_VERSION >= 22091 ? 0x41bc20 : 0x418ec0));
+    CCDirector::sharedDirector()->replaceScene(scene(level, false));
+    writeResult("infoplay: lv" + std::to_string(g_cfg.levelId) + " stars=" + std::to_string(stars) + " opened");
+    std::thread([id = (int)g_cfg.levelId, stars, zero27d] {
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        Loader::get()->queueInMainThread([id, stars, zero27d] {
+            auto* running = CCDirector::sharedDirector()->getRunningScene();
+            LevelInfoLayer* layer = nullptr;
+            if (running)
+                for (auto* c : CCArrayExt<CCNode*>(running->getChildren()))
+                    if (auto* l = typeinfo_cast<LevelInfoLayer*>(c)) layer = l;
+            if (!layer) { writeResult("infoplay: lv" + std::to_string(id) + " no LevelInfoLayer in the running scene"); return; }
+            auto* raw = reinterpret_cast<unsigned char*>(layer);
+            if (zero27d) raw[0x27d] = 0;
+            writeResult("infoplay: lv" + std::to_string(id) + " stars=" + std::to_string(stars) + " m_isBusy=" + std::to_string((int)layer->m_isBusy)
+                        + " m_enterTransitionFinished(bindings)=" + std::to_string((int)layer->m_enterTransitionFinished)
+                        + " byte[0x27d]=" + std::to_string((int)raw[0x27d]) + " byte[0x285]=" + std::to_string((int)raw[0x285])
+                        + " m_level=" + std::to_string(layer->m_level != nullptr ? 1 : 0) + (zero27d ? " (byte[0x27d] forced to 0)" : ""));
+            layer->onPlay(nullptr);
+            writeResult("infoplay: lv" + std::to_string(id) + " onPlay returned");
+        });
+    }).detach();
+}
+}  // namespace infoplay
+#endif
+
 // Diagnostic, cfg `uishow=<kind>` (default none): one of the popups above over the main menu 3 s after it appears, so a layout can be looked at
 // (and photographed) without playing to it. info0 / info1 / info2 are Options' (i) texts; options is the Options popup with every choice moved off its
 // default; info3 is the Hold Play row's; menu is the Solve menu for cfg level (a main level) or levelfile (a custom one), also with Options moved off the defaults.
@@ -1354,6 +1400,13 @@ class $modify(PlayMenuPreview, MenuLayer) {
     void preview(float) {
         const std::string kind = g_cfg.uiShow;
         if (kind.empty()) return;
+#if GEODE_COMP_GD_VERSION >= 22090
+        if (kind.rfind("infoplay", 0) == 0) {
+            infoplay::run(kind.size() > 9 && kind[8] == ':' ? std::atoi(kind.c_str() + 9) : 0,
+                          kind.size() >= 2 && kind.compare(kind.size() - 2, 2, ":z") == 0);
+            return;
+        }
+#endif
         if (kind == "info0") { playmenu::showInfo("Section search", playmenu::secSolveDetails()); return; }
         if (kind == "info1") { playmenu::showInfo("Avoid glitches", playmenu::glitchDetails()); return; }
         if (kind == "info2") { playmenu::showInfo("Search", playmenu::searchDetails()); return; }

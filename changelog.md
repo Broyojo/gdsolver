@@ -1,21 +1,29 @@
+# v0.6.1
+
+ * **The Play menu opens for every online or downloaded level on GD 2.2091** (Geode's name for the hotfix executable of 2.209, the one Steam
+   has now). A click on Play could start the level without the mod's menu: the check that decides whether the level page has finished loading
+   read a member of the page at the position it has in the first 2.209 executable, and 2.2091 has one more member before it. The mod now reads
+   the member where each executable keeps it. The solver is the same as in v0.6.0.
+
 # v0.6.0
 
- * **Geometry Dash 2.209 (Windows).** This version is built for GD 2.209 on Steam.
-   2.209 exists as two executables with one version string, the first Steam build
-   and a hotfix that moved nearly every function, and Geode checks only the version
-   string. So before it hooks anything the mod checks the executable it is in (the
-   build stamps of GeometryDash.exe, libcocos2d.dll and libExtensions.dll). On a game
-   it was not built for it stays off, writes one line to the log, shows one line on
-   screen, and the game plays as if it were not installed. Geode does not support
-   2.209 yet and runs in its forward-compatibility mode, where its own menus are not
-   available, so the mod brings its own popups, scrolling and keys. These stopgaps,
-   the executable check among them, go once Geode supports 2.209.
- * **No Android build this time.** The Android game is 2.209 too, and there is no
-   2.209 Android port of the bindings yet. v0.5.0's Android pre-release stays as it
-   was, for GD 2.2081.
- * **All 22 main levels clear on 2.209**, cold, in one game session: in 27 repairs
+ * **Geometry Dash 2.2091 (Windows).** This version is built for GD 2.2091 on Steam,
+   Geode's name for the hotfix of 2.209. The first 2.209 executable and the hotfix
+   carry one version string, the hotfix moved nearly every function, and Geode checks
+   only the version string. So before it hooks anything the mod checks the executable
+   it is in (the build stamps of GeometryDash.exe, libcocos2d.dll and
+   libExtensions.dll). On a game it was not built for it stays off, writes one line to
+   the log, shows one line on screen, and the game plays as if it were not installed.
+   Geode does not support 2.2091 yet and runs in its forward-compatibility mode, where
+   its own menus are not available, so the mod brings its own popups, scrolling and
+   keys. These stopgaps, the executable check among them, go once Geode supports
+   2.2091.
+ * **No Android build this time.** The Android game is on the new version too, and
+   there is no Android port of its bindings yet. v0.5.0's Android pre-release stays
+   as it was, for GD 2.2081.
+ * **All 22 main levels clear on 2.2091**, cold, in one game session: in 27 repairs
    for the end of the level (v0.5.0 on 2.2081: 35) and in 33 with every coin (v0.5.0:
-   60). The paths are the same on both 2.209 executables.
+   60). The paths are the same on the first 2.209 executable.
  * **The levels the game features.** A new survey took 126 custom levels from the
    game's own lists: 50 of the last year's Daily levels, the last 50 Weekly levels
    and every Event level in the Safe list, each solved cold at the release defaults
@@ -71,8 +79,8 @@
    memory an earlier step had freed, which on some custom levels took the game
    down. `F10` could leave the iteration map's path on the level after it was
    hidden.
- * **Nothing is recorded while it drives, on 2.209 too.** 2.209 adds a death
-   tracker that uploads where players die. While the bot drives, that upload and
+ * **Nothing is recorded while it drives, on 2.2091 too.** Since 2.209 the game has
+   a death tracker that uploads where players die. While the bot drives, that upload and
    the other new records (play time, the death sessions) are blocked like the rest.
    Each session's log ends with a memory audit of the save, which should read
    `none` for the level's record.
