@@ -97,7 +97,11 @@ $env:GEODE_BINDINGS_REPO_PATH = $bnd
 
 Step "configure and build ($Compiler, GD $GdVersion, GEODE_COMP_GD_VERSION $Comp)"
 if (Test-Path $build) { Remove-Item $build -Recurse -Force }
-$cfg = @('-S', $repo, '-B', $build, "-DGEODE_DONT_INSTALL_MODS=ON", "-DGEODE_GD_VERSION=$GdVersion", "-DGEODE_COMP_GD_VERSION=$Comp")
+# SKIP_BUILDING_CODEGEN=OFF: the bindings' CMake otherwise downloads Codegen from geode-sdk/bindings' rolling `codegen` release, which is
+# whatever upstream built last, not the generator of the pinned ref. After 2026-10-18 that download emits `#include <Geode/mapping/...>`
+# for headers the pinned tree does not have, and every unit of GeodeBindings stopped there. Built from the ref, it matches the ref.
+$cfg = @('-S', $repo, '-B', $build, "-DGEODE_DONT_INSTALL_MODS=ON", "-DGEODE_GD_VERSION=$GdVersion", "-DGEODE_COMP_GD_VERSION=$Comp",
+         '-DSKIP_BUILDING_CODEGEN=OFF')
 if ($Compiler -eq 'clang') {
     # what geode-sdk/build-geode-mod passes on Windows, and two additions:
     #  -DCMAKE_LINKER_TYPE=LLD  CMake >= 4 otherwise passes -fuse-ld=lld-link, which a recent clang rejects as an invalid linker name
