@@ -8925,6 +8925,11 @@ inline int cliMain(int argc, char** argv) {
         if (i + 1 < argc && !std::strcmp(argv[i], "--gridmap")) { ++i; continue; }
         base.push_back(argv[i]);
     }
+    // --minclicks: the ladder starts at 2,000 at least. At the loop's 125 a press-aware cap has no room for
+    // both the routes that stay alive and the ones that press less: on the synthetic suite 5 of 6 died there,
+    // and at 2,000 all 6 cleared (ship0 18 presses against 330 without the flag at 125).
+    if (c0 > 0 && c0 < 2000 && std::find(base.begin(), base.end(), std::string("--minclicks")) != base.end())
+        c0 = 2000;
     if (c0 <= 0) return cliMainOnce(argc, argv);
     // --ladderprefix (search_dp.hpp LadderPrefixCache): read here, where the ladder is; each attempt's
     // own parse would reset it with the rest of the call's state. On by default; --no-ladderprefix

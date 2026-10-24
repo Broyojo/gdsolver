@@ -2264,7 +2264,15 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             // The flight band as a class of its own, and --coinwin's cell (rules.bandClass,
             // rules.winCell).
             const bool bandClass = rules.bandClass();
-            auto coinWinCell = [&rules](const State& s) -> uint64_t { return rules.winCell(s); };
+            // --minclicks: the presses the water-fill ranks a member by -- a cell's fewest under the cell cap
+            std::vector<uint16_t> cellFew;
+            if (g_minClicks && cellCap) {
+                cellFew.assign(nxt.size(), 0xffff);
+                for (size_t i = 0; i < nxt.size(); ++i)
+                    cellFew[cellOf[i]] = std::min(cellFew[cellOf[i]], nxt[i].presses);
+            }
+            auto fewOf = [&](uint32_t i) { return cellFew.empty() ? nxt[i].presses : cellFew[i]; };
+            auto coinWinCell =[&rules](const State& s) -> uint64_t { return rules.winCell(s); };
             auto classOf = [bandClass, &coinWinCell, &rules](const State& s) {
                 return coinWinCell(s) ^ ((uint64_t)s.mode << 32) ^ ((uint64_t)s.mini << 24)
                        ^ ((uint64_t)s.flip << 16) ^ ((uint64_t)s.dual << 8)
@@ -2330,6 +2338,22 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 const size_t take = std::min(v.size(), fair);
                 if (take == v.size()) {
                     keepIdx.insert(keepIdx.end(), v.begin(), v.end());
+                } else if (g_minClicks && take > 0) {
+                    // --minclicks: the stride below, but each window [i, i + stride) gives its
+                    // fewest-press member (a cell by its fewest, under the cell cap; the first on a
+                    // tie) instead of its first. The cap still samples the class the way it does,
+                    // so it keeps the spread it exists to keep; presses only choose within a window.
+                    // Without it the cap is blind to presses and drops the third survivors the
+                    // dedupe kept (lv1 in the loop: cap 125 on 7,786 layers, and the plan pressed
+                    // 542 times against 536 without the flag).
+                    const double stride = (double)v.size() / (double)take;
+                    for (double i = 0; (size_t)i < v.size(); i += stride) {
+                        const size_t end = std::min(v.size(), (size_t)(i + stride));
+                        size_t best = (size_t)i;
+                        for (size_t k = best + 1; k < end; ++k)
+                            if (fewOf(v[k]) < fewOf(v[best])) best = k;
+                        keepIdx.push_back(v[best]);
+                    }
                 } else if (g_capEnvelope && take >= 3) {
                     // --capenvelope: the class's two extremes, then the stride over the rest.
                     auto lower = [&](uint32_t a, uint32_t b) {
