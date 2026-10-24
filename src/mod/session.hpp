@@ -88,12 +88,14 @@ inline bool uiConfigureSession(int levelId) {
         }
         // Section search: on unless Options turned it off (cfg dpsecauto=0, the same switch).
         if (!g_uiSecSolve) g_cfg.dpSecAuto = false;
+        // Fewest clicks: every solver call of the session asks for it (the same as cfg dparg=--minclicks).
+        if (g_uiMinClicks) g_cfg.dpArgs.push_back("--minclicks");
         // The search (Config::dpSearch): the layer DP unless Options chose an experimental one.
         g_cfg.dpSearch = uiSearchCfg(g_uiSearch);
-        log::info("panel: solve lv{} in-process{}{}{}{}, search {}", levelId,
+        log::info("panel: solve lv{} in-process{}{}{}{}{}, search {}", levelId,
                   g_uiCoins ? " with coins" : "", g_uiGlitch ? " avoiding glitches" : "",
                   g_uiGlitchMode >= UI_GLITCH_WAVE ? " (wave behaviour)" : "",
-                  g_uiSecSolve ? "" : ", no section search", g_cfg.dpSearch);
+                  g_uiSecSolve ? "" : ", no section search", g_uiMinClicks ? ", fewest clicks" : "", g_cfg.dpSearch);
     } else {
         const std::string name = uiSolutionPath(levelId, g_uiCoins);
         std::vector<InputCmd> plan;

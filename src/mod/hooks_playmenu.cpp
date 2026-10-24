@@ -265,6 +265,16 @@ inline std::vector<std::string> secSolveDetails() {
     return {std::string("On (default): ") + describeSecSolve(true), std::string("Off: ") + describeSecSolve(false)};
 }
 
+inline const char* describeMinClicks(bool on) {
+    return on ? "Of the routes it finds, the solver keeps the one that presses the button the fewest times (holding through "
+                "several jumps is one click). It is the fewest this search found, not a proven minimum, and a solve takes longer."
+              : "The solver keeps the route it finds, however many clicks it takes.";
+}
+
+inline std::vector<std::string> minClicksDetails() {
+    return {std::string("Off (default): ") + describeMinClicks(false), std::string("On: ") + describeMinClicks(true)};
+}
+
 // What an (i) button opens: the detail in a small popup whose text scrolls when it is longer than the
 // window (the game's own alert grows with its text and runs off the screen on the longer ones).
 // The geometry, all in the popup's own units (the numbers a port to other UI parts needs):
@@ -367,10 +377,10 @@ inline void showInfo(const char* title, const std::vector<std::string>& paragrap
 // page's. Solve faster is not a setting at all any more (cfg dpplainbeside=3 still starts it).
 class Options : public PopupBase {
 public:
-    using Change = std::function<void(int, int, bool)>;   // glitch mode, search, section search
-    static Options* create(int glitch, int search, bool secSolve, Change onChange) {
+    using Change = std::function<void(int, int, bool, bool)>;   // glitch mode, search, section search, fewest clicks
+    static Options* create(int glitch, int search, bool secSolve, bool minClicks, Change onChange) {
         auto* r = new Options();
-        if (r->init(glitch, search, secSolve, std::move(onChange))) { r->autorelease(); return r; }
+        if (r->init(glitch, search, secSolve, minClicks, std::move(onChange))) { r->autorelease(); return r; }
         delete r;
         return nullptr;
     }
@@ -379,16 +389,19 @@ protected:
     int m_glitch = UI_GLITCH_OFF;
     int m_search = UI_SEARCH_DP;
     bool m_secSolve = true;
+    bool m_minClicks = false;
     Change m_onChange;
     CCMenuItemToggler* m_secToggle = nullptr;
+    CCMenuItemToggler* m_clickToggle = nullptr;
     CCMenuItemToggler* m_menuToggle = nullptr;
     cocos2d::CCLabelBMFont* m_menuNote = nullptr;
     cocos2d::CCLabelBMFont* m_glitchValue = nullptr;
     cocos2d::CCLabelBMFont* m_searchValue = nullptr;
 
-    // Top to bottom: the title; the Section search row; Avoid glitches (title, value between arrows); Search (the same); the Hold Play row and,
-    // when it is checked, its note; OK. 284 high, inside GD's design height (320; the popup's close button rises above its frame).
-    static constexpr float kW = 300.f, kH = 284.f;
+    // Top to bottom: the title; the Section search row; the Fewest clicks row; Avoid glitches (title, value between arrows); Search (the
+    // same); the Hold Play row and, when it is checked, its note; OK. 300 high, inside GD's design height (320; the popup's close button
+    // rises above its frame).
+    static constexpr float kW = 300.f, kH = 300.f;
 
     // A checkbox with its label and its (i) button, the three centred as a row (as the menu's rows are).
     CCMenuItemToggler* addToggleRow(const char* id, const char* text, float y, bool on, cocos2d::SEL_MenuHandler handler, int infoWhat) {
@@ -448,28 +461,30 @@ protected:
         return t;
     }
 
-    bool init(int glitch, int search, bool secSolve, Change onChange) {
+    bool init(int glitch, int search, bool secSolve, bool minClicks, Change onChange) {
         using namespace cocos2d;
         if (!PopupBase::init(kW, kH)) return false;
         this->setID("play-menu-options"_spr);
         m_glitch = std::clamp(glitch, 0, UI_GLITCH_COUNT - 1);
         m_search = std::clamp(search, 0, UI_SEARCH_COUNT - 1);
         m_secSolve = secSolve;
+        m_minClicks = minClicks;
         m_onChange = std::move(onChange);
         this->setTitle("Options");
 
         m_secToggle = addToggleRow("section-search", "Section search", -50.f, m_secSolve, menu_selector(Options::onSecSolve), 0);
-        choiceRow("Avoid glitches", "glitch", -86.f, menu_selector(Options::onGlitch), m_glitchValue, 1);
-        choiceRow("Search", "search", -146.f, menu_selector(Options::onSearch), m_searchValue, 2);
+        m_clickToggle = addToggleRow("fewest-clicks", "Fewest clicks", -72.f, m_minClicks, menu_selector(Options::onMinClicks), 4);
+        choiceRow("Avoid glitches", "glitch", -104.f, menu_selector(Options::onGlitch), m_glitchValue, 1);
+        choiceRow("Search", "search", -162.f, menu_selector(Options::onSearch), m_searchValue, 2);
         // The setting is stored as "play-menu" (on: a click on Play opens the menu); this row is its inverse, "hold Play to open the
         // menu", checked when the setting is off.
-        m_menuToggle = addToggleRow("menu", "Hold Play to open this menu", -204.f, !Mod::get()->getSettingValue<bool>("play-menu"),
+        m_menuToggle = addToggleRow("menu", "Hold Play to open this menu", -218.f, !Mod::get()->getSettingValue<bool>("play-menu"),
                                     menu_selector(Options::onMenuSetting), 3);
         m_menuNote = CCLabelBMFont::create("", "chatFont.fnt");
         m_menuNote->setScale(.55f);
         m_menuNote->setColor(kWarnYellow);
         m_menuNote->setID("menu-note"_spr);
-        ui::addChildAtPosition(m_mainLayer, m_menuNote, Anchor::Top, ccp(0, -222.f));
+        ui::addChildAtPosition(m_mainLayer, m_menuNote, Anchor::Top, ccp(0, -236.f));
 
         auto* okSpr = ButtonSprite::create("OK", "goldFont.fnt", "GJ_button_01.png", .8f);
         auto* ok = CCMenuItemSpriteExtra::create(okSpr, this, menu_selector(Options::onOk));
@@ -500,12 +515,17 @@ protected:
         m_searchValue->setString(m_search == UI_SEARCH_DP ? "DP (default)" : uiSearchName(m_search));
         ui::limitNodeWidth(m_searchValue, 150.f, .6f, .3f);
         m_searchValue->setColor(m_search == UI_SEARCH_DP ? kWhite : kWarnRed);
-        if (m_onChange) m_onChange(m_glitch, m_search, m_secSolve);
+        if (m_onChange) m_onChange(m_glitch, m_search, m_secSolve, m_minClicks);
     }
 
     // CCMenuItemToggler calls its target before it flips its own state (see the menu's onCoins).
     void onSecSolve(CCObject*) {
         m_secSolve = !m_secToggle->isToggled();
+        refresh();
+    }
+
+    void onMinClicks(CCObject*) {
+        m_minClicks = !m_clickToggle->isToggled();
         refresh();
     }
 
@@ -523,10 +543,12 @@ protected:
 
     void onOk(CCObject*) { this->onClose(nullptr); }
 
-    // The (i) buttons: 0 Section search, 1 Avoid glitches, 2 Search -- every value of the choice, named -- and 3 Hold Play.
+    // The (i) buttons: 0 Section search, 1 Avoid glitches, 2 Search -- every value of the choice, named -- 3 Hold Play and
+    // 4 Fewest clicks.
     void onInfo(CCObject* sender) {
         switch (static_cast<cocos2d::CCNode*>(sender)->getTag()) {
             case 0: showInfo("Section search", secSolveDetails()); break;
+            case 4: showInfo("Fewest clicks", minClicksDetails()); break;
             case 1: showInfo("Avoid glitches", glitchDetails()); break;
             case 3: showInfo("Hold Play to open this menu", holdPlayDetails()); break;
             default: showInfo("Search", searchDetails()); break;
@@ -576,6 +598,7 @@ protected:
     // The Options popup's three choices (Solve only), and its button.
     int m_glitch = UI_GLITCH_OFF;
     bool m_secSolve = true;
+    bool m_minClicks = false;
     int m_search = UI_SEARCH_DP;
     CCMenuItemSpriteExtra* m_optBtn = nullptr;
     cocos2d::CCLabelBMFont* m_note = nullptr;
@@ -748,6 +771,7 @@ protected:
         // is only shown there. They keep the last Start's choices (saved values), like Coins.
         m_glitch = savedGlitchMode();
         m_secSolve = Mod::get()->getSavedValue<bool>("play-secsolve", true);
+        m_minClicks = Mod::get()->getSavedValue<bool>("play-minclicks", false);
         m_search = std::clamp(Mod::get()->getSavedValue<int>("play-search", UI_SEARCH_DP), 0,
                               UI_SEARCH_COUNT - 1);
         {
@@ -866,14 +890,17 @@ protected:
         m_optBtn->setEnabled(m_mode == UI_MODE_SOLVE);
         m_note->setVisible(bot);
         // The one line for what Options changed.
-        const bool optChanged = m_glitch != UI_GLITCH_OFF || !m_secSolve || m_search != UI_SEARCH_DP;
+        const bool optChanged = m_glitch != UI_GLITCH_OFF || !m_secSolve || m_search != UI_SEARCH_DP || m_minClicks;
         {
             std::string t;
             auto add = [&](const std::string& part) { t += (t.empty() ? "" : ", ") + part; };
             if (m_glitch != UI_GLITCH_OFF) add(std::string("Avoid glitches: ") + uiGlitchName(m_glitch));
             if (!m_secSolve) add("no section search");
             if (m_search != UI_SEARCH_DP) add(std::string("Search: ") + uiSearchName(m_search));
-            m_optNote->setString((t + ". The level is more likely not to be solved.").c_str());
+            // Fewest clicks narrows nothing, so it costs time rather than the chance of a clear.
+            const bool risky = m_glitch != UI_GLITCH_OFF || !m_secSolve || m_search != UI_SEARCH_DP;
+            if (m_minClicks) add("fewest clicks");
+            m_optNote->setString((t + (risky ? ". The level is more likely not to be solved." : ". A solve takes longer.")).c_str());
             ui::limitNodeWidth(m_optNote, kW - 60.f, .55f, .3f);
             m_optNote->setColor(m_search != UI_SEARCH_DP ? kWarnRed : kWarnYellow);
         }
@@ -942,6 +969,7 @@ protected:
         if (m_glitch != UI_GLITCH_OFF)
             v.push_back(std::string("Avoid glitches, ") + uiGlitchName(m_glitch) + ": " + describeGlitch(m_glitch));
         if (!m_secSolve) v.push_back(std::string("No section search: ") + describeSecSolve(false));
+        if (m_minClicks) v.push_back(std::string("Fewest clicks: ") + describeMinClicks(true));
         if (m_search != UI_SEARCH_DP)
             v.push_back(std::string("Search, ") + uiSearchName(m_search) + ": " + describeSearch(m_search));
         showInfo("Solve options", v);
@@ -951,10 +979,12 @@ protected:
     void onOptions(CCObject*) {
         if (m_mode != UI_MODE_SOLVE) return;
         Ref<Popup> self = this;
-        auto* o = Options::create(m_glitch, m_search, m_secSolve, [self](int glitch, int search, bool secSolve) {
+        auto* o = Options::create(m_glitch, m_search, m_secSolve, m_minClicks,
+                                  [self](int glitch, int search, bool secSolve, bool minClicks) {
             self->m_glitch = glitch;
             self->m_search = search;
             self->m_secSolve = secSolve;
+            self->m_minClicks = minClicks;
             self->refresh();
         });
         if (o) o->show();
@@ -968,6 +998,7 @@ protected:
         g_uiGlitchMode = m_mode == UI_MODE_SOLVE ? m_glitch : UI_GLITCH_OFF;
         g_uiGlitch = g_uiGlitchMode != UI_GLITCH_OFF;
         g_uiSecSolve = m_mode != UI_MODE_SOLVE || m_secSolve;
+        g_uiMinClicks = m_mode == UI_MODE_SOLVE && m_minClicks;
         g_uiSearch = m_mode == UI_MODE_SOLVE ? m_search : UI_SEARCH_DP;
         g_uiArmedLevel = m_level.data();
         Mod::get()->setSavedValue<int>("play-mode", m_mode);
@@ -977,14 +1008,16 @@ protected:
             Mod::get()->setSavedValue<int>("play-glitch-mode", m_glitch);
             Mod::get()->setSavedValue<bool>("play-glitch", m_glitch != UI_GLITCH_OFF);
             Mod::get()->setSavedValue<bool>("play-secsolve", m_secSolve);
+            Mod::get()->setSavedValue<bool>("play-minclicks", m_minClicks);
             Mod::get()->setSavedValue<int>("play-search", m_search);
         }
-        log::info("play menu: {} lv{}{}{}{}{} ({} coins in the level)", uiModeName(m_mode),
+        log::info("play menu: {} lv{}{}{}{}{}{} ({} coins in the level)", uiModeName(m_mode),
                   m_level->m_levelID.value(),
                   (m_mode != UI_MODE_NORMAL && m_coins) ? " with coins" : "",
                   g_uiGlitch ? (std::string(" avoiding glitches (") + uiGlitchName(g_uiGlitchMode) + ")")
                              : std::string(),
                   g_uiSecSolve ? "" : ", no section search",
+                  g_uiMinClicks ? ", fewest clicks" : "",
                   g_uiSearch != UI_SEARCH_DP ? std::string(", search ") + uiSearchName(g_uiSearch)
                                              : std::string(),
                   m_facts.coins);
@@ -1053,6 +1086,7 @@ $on_mod(Loaded) {
     g_uiGlitchMode = playmenu::savedGlitchMode();
     g_uiGlitch = g_uiGlitchMode != UI_GLITCH_OFF;
     g_uiSecSolve = Mod::get()->getSavedValue<bool>("play-secsolve", true);
+    g_uiMinClicks = false;   // like the search: only a Start with it chosen asks for it
     // The session reads g_uiSearch only after a Start, which sets it; the menu reads the saved
     // value itself. Left at the DP here, so nothing but a Start picks an experimental search.
     g_uiSearch = UI_SEARCH_DP;
@@ -1411,8 +1445,9 @@ class $modify(PlayMenuPreview, MenuLayer) {
         if (kind == "info1") { playmenu::showInfo("Avoid glitches", playmenu::glitchDetails()); return; }
         if (kind == "info2") { playmenu::showInfo("Search", playmenu::searchDetails()); return; }
         if (kind == "info3") { playmenu::showInfo("Hold Play to open this menu", playmenu::holdPlayDetails()); return; }
+        if (kind == "info4") { playmenu::showInfo("Fewest clicks", playmenu::minClicksDetails()); return; }
         if (kind == "options") {
-            if (auto* o = playmenu::Options::create(UI_GLITCH_WAVE, UI_SEARCH_BEAM, false, nullptr)) o->show();
+            if (auto* o = playmenu::Options::create(UI_GLITCH_WAVE, UI_SEARCH_BEAM, false, true, nullptr)) o->show();
             return;
         }
         if (kind == "infolong") {   // a text longer than the window, to see the scroll and its bar

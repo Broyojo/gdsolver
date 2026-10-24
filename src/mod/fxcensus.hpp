@@ -140,6 +140,9 @@ inline int g_uiGlitchMode = UI_GLITCH_OFF;
 // ...and whether a Solve may hand a wall to the section solver (cfg dpsecauto). On by default; a
 // choice about how to solve, like the two above, set in Options.
 inline bool g_uiSecSolve = true;
+// ...and whether a Solve asks the solver for the route with the fewest clicks (dp --minclicks). Off by
+// default; a choice about how to solve, set in Options like the others.
+inline bool g_uiMinClicks = false;
 // ...and the search a Solve's calls are answered by (cfg dpsearch): the layer DP, or one of the two
 // experimental searches. Chosen in the menu's Options with the glitch-avoid switch; like it, a
 // choice about how to solve, filed where Solve always files it. Numbered for the saved value
