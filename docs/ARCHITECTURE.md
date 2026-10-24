@@ -93,6 +93,23 @@ plan and the model trace the next divergence is measured against.
   property of how a state was reached rather than of the state. Ties keep the
   incumbent, so a level where nothing is tight emits exactly what the old rule
   did.
+* **Fewest clicks** (`--minclicks`, off by default). Each state also carries
+  `presses`: how many times its lineage pressed the button (held after released;
+  holding through several jumps is one click). Like `tight` it stays out of the
+  dedupe key. With the flag on, the goal is the live state with the fewest presses
+  (then the roomiest), chosen from every child that reached it rather than only the
+  dedupe's survivors; a horizon cut emits the fewest-press survivor; and a cell
+  whose two `vy` extremes both press more than its fewest-press child keeps that
+  child as a third survivor. Both dedupe paths record it, so one thread and many
+  emit the same plan. The CLI prints `clicks: N` beside `plan:`, and
+  `py/plan_clicks.py` counts any plan file. The count is the best the search
+  found, not a proven minimum: the cells are quantised, and a solution the loop
+  assembles also carries rejoined tails and section-solver splices, which the
+  flag does not choose. Measured on synthetic levels: ship stretches went from
+  177–295 clicks to 6–8, mixed cube/ship levels from 278–363 to 20–94, at
+  1.2–1.6× the search time (median 1.35×). With the flag off the plans, traces
+  and output are byte-identical to the build before it, and so is the speed.
+  In the loop it is `dparg=--minclicks`.
 * Output contracts: `SOLVED at ...`, `PARTIAL: frontier died at t=.. x=..`,
   `FAILED: ...` on stdout; files `<out>` (the plan, `input=<tick>,<buttons>` lines,
   where `<buttons>` is a bitmask of the buttons held from that tick: bit 0 is

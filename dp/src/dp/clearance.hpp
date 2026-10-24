@@ -215,6 +215,13 @@ inline double waveOffCentre(const std::vector<const Obj*>& near, double px, doub
 // that is there today, which is how the flag-off path stays bit-identical.
 inline bool roomierRoute(uint16_t cand, uint16_t held) { return cand < held; }
 
+// The goal pick's whole order. --minclicks puts fewer presses first; with the flag off every
+// `presses` is 0 and this is roomierRoute exactly.
+inline bool betterGoal(const State& cand, const State& held) {
+    if (g_minClicks && cand.presses != held.presses) return cand.presses < held.presses;
+    return roomierRoute(cand.tight, held.tight);
+}
+
 // One live child, as the probe sees it.
 struct ClearSample {
     uint64_t key;

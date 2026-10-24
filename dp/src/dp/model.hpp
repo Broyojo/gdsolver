@@ -585,6 +585,9 @@ inline bool inputAllowed(const State& s, int input, int gridNow, long long t) {
 // lock (a mode with latency 2 entered from one without).
 inline void noteInput(const State& prev, State& c, int input) {
     c.action = (uint8_t)input;
+    // --minclicks: a press is a tick held after a tick released (State::presses)
+    if (g_minClicks)
+        c.presses = (uint16_t)std::min(0xffff, (int)prev.presses + (input == 1 && prev.action != 1 ? 1 : 0));
     if (g_minPulse > 1 || g_wavePulse > 1)
         c.edgeAge = (input != (int)prev.action) ? 0 : (uint8_t)std::min(254, (int)prev.edgeAge + 1);
     const auto lat2 = [](uint8_t m) { return m == 1 || m == 3; };

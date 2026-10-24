@@ -1514,6 +1514,7 @@ inline int cliMainOnce(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--no-autoownpre")) g_autoOwnPre = false;
         // --twinaudit (search_census.hpp): value-less.
         if (!std::strcmp(argv[i], "--twinaudit")) g_twinAudit = true;
+        if (!std::strcmp(argv[i], "--minclicks")) g_minClicks = true;   // fewest presses first (thread_pool.hpp)
         // --trigraw: autonomous triggers behind the anchor trust the
         // recording's tick (history at g_trigRaw's declaration). These three sat
         // in the argc-1 loop and were never read when passed last
@@ -8635,6 +8636,7 @@ inline int cliMainOnce(int argc, char** argv) {
     // publisher inside the layer loop has to produce the same edges for the same ticks. The
     // note below is about the RULE, and is kept here where the plan is written.
     int edges = 0;
+    int clicks = 0;   // --minclicks: presses among the edges (printed below)
     {
         // ...and the UFO is mode 3, which this test was missing: it got the
         // cube's +1 and every flap in the plan came out one tick late in GD.
@@ -8662,9 +8664,12 @@ inline int cliMainOnce(int argc, char** argv) {
         // the mode at the tick that guess points at.
         const std::vector<PlanEdge> pe =
             planEdges(lvl, modeAt, t0, planPrevHeld(init), init.mode);
+        int prevLevel = planPrevHeld(init);
         for (const PlanEdge& e : pe) {
             out << "input=" << e.press << ',' << e.level << "\n";
             ++edges;
+            if ((e.level & 1) && !(prevLevel & 1)) ++clicks;
+            prevLevel = e.level;
         }
         // ...and remembered for the run (search_dp.hpp SearchRun): a verification compares the
         // plan it flew with this one.
@@ -8822,6 +8827,11 @@ inline int cliMainOnce(int argc, char** argv) {
         g_outcome.resimTrig = g_resimTrig;
         g_outcome.resimFrame = g_resimFrame;
     }
+    // --minclicks: the presses this plan makes (player 1's button going down), and how many
+    // third survivors the cells took to find it. Printed only under the flag, so the output of
+    // every other call is what it was.
+    if (g_minClicks)
+        std::printf("clicks: %d (fewest-kept=%lld)\n", clicks, g_fewestKept);
     std::printf("plan: %d edges, %zu ticks -> %s\n", edges, lvl.size(),
                 outPath.c_str());
     return 0;

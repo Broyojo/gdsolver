@@ -310,6 +310,7 @@ inline bool refSameState(const State& a, const State& b) {
     State x = a, y = b;
     x.parent = y.parent = 0;
     x.action = y.action = 0;
+    x.presses = y.presses = 0;   // --minclicks' count: how it was reached, as parent is
     return std::memcmp(&x, &y, sizeof(State)) == 0;
 }
 

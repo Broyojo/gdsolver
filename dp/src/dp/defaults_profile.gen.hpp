@@ -427,6 +427,8 @@ inline std::string defaultsProfile() {
     put(s, "g_waveCentre", g_waveCentre);
     put(s, "g_waveTidy", g_waveTidy);
     put(s, "g_waveToggle", g_waveToggle);
+    put(s, "g_minClicks", g_minClicks);
+    put(s, "g_fewestKept", g_fewestKept);
     put(s, "g_startEdge", g_startEdge);
     put(s, "g_glitchEmbed", g_glitchEmbed);
     put(s, "g_glitchDeco", g_glitchDeco);

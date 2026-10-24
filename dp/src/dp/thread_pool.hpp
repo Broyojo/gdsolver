@@ -191,6 +191,15 @@ inline double g_waveCentre = 0.0;
 //                       keeps the tidier route into a cell.
 inline double g_waveTidy = 0.0;
 inline int g_waveToggle = 0;
+//   --minclicks         fewest presses as the plan's FIRST preference, ahead of the route score (State::presses
+//                        counts them per lineage). Three changes, all keyed on the count and none on the physics:
+//                        the goal is the live state that reached it with the fewest presses (then the roomiest,
+//                        then the smallest ordinal), not only the best of the dedupe's survivors; each cell keeps,
+//                        beside its two vy extremes, the child with the fewest presses when both extremes have
+//                        more; and a horizon cut or a PARTIAL emits the fewest-press survivor. The count is the
+//                        best this search found, not a proven minimum: the dedupe still merges by a quantised key.
+inline bool g_minClicks = false;
+inline long long g_fewestKept = 0;   // --minclicks: third survivors the cells took (printed with `clicks:`)
 //   --startedge <ticks>  an anchored call: the ticks the button had already been in its present state at the anchor
 //                        (State::edgeAge of the start state; -1 = not said, which leaves it at "long ago"). The mod
 //                        reads it off the plan the game flew, so --wavepulse / --minpulse hold across a re-anchor.

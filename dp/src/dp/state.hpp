@@ -543,6 +543,14 @@ struct State {
     // (checkSpawnObjects 0x21a8f0) only moves forward, so a trigger it has passed does not fire again and
     // the next one fires once x is past that farthest x. It accumulates; seeded at an anchor from --startxhi.
     uint8_t tpBack = 0;
+    // --minclicks: how many times this lineage has pressed the button since the search's start --
+    // a tick whose input is 1 after one whose input was 0 (model.hpp noteInput). A route property,
+    // as `tight` is, and for the same reason NOT in keyOf: two states that differ only in it answer
+    // every future input identically. Read by the goal pick and by the per-cell fewest-clicks
+    // survivor (search_dp.hpp); nothing in the physics looks at it. Saturating, and 0 throughout
+    // whenever the flag is off. In the padding after tpBack, which the positional State{...} (cli.hpp,
+    // six fields) does not reach, so State keeps its size and every copy of it its cost.
+    uint16_t presses = 0;
     // [2026-08-21 r93] Marks the tick on which a warp interrupted a ride = THE
     // RAMP'S SLOPE-EXIT LAUNCH VALUE TO EMIT ON THE NEXT TICK (0 = none). Same
     // 1-tick lifetime as pFlap, not carried by the anchor. It holds
@@ -1360,6 +1368,10 @@ struct State {
 // an anchor from --startxhi (cli.hpp), not printed in --seeddump.
 // [2026-10-13] 552 -> 560: tpFromX (--tpjumpnext, x before this tick's forward teleport). One tick of life, so
 // nothing to seed.
+// [2026-10-23] presses (--minclicks, the lineage's press count) landed in the padding after tpBack: still
+// 560. It accumulates and is NOT seeded, deliberately: it counts the presses the search adds from its own
+// start, so an anchored call starts it at 0. It never reaches the physics, so a seeded and an unseeded
+// run step identically.
 constexpr size_t kStateBytes =
     (560u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))

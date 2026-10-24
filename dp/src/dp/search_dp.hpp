@@ -53,15 +53,21 @@ struct Slots { int hi = -1; int lo = -1; };
 struct CellMap {
     std::vector<uint64_t> keys;
     std::vector<Slots> vals;
+    // --minclicks only (empty otherwise, so Slots keeps its size): beside each slot, the ordinal of
+    // the cell's first live child with the fewest presses, which joins hi and lo when both of them
+    // press more.
+    std::vector<uint32_t> fo;
     std::vector<uint32_t> touched;
     size_t mask = 0;
     void ensure(size_t want) {
         size_t n = 1024;
         while (n < want * 4) n <<= 1;   // keep the load factor under 1/4
-        if (n <= keys.size()) return;
-        keys.assign(n, 0);
-        vals.assign(n, Slots{});
-        mask = n - 1;
+        if (n > keys.size()) {
+            keys.assign(n, 0);
+            vals.assign(n, Slots{});
+            mask = n - 1;
+        }
+        if (fo.size() != (g_minClicks ? keys.size() : 0)) fo.assign(g_minClicks ? keys.size() : 0, kNone);
     }
     void clear() {
         for (uint32_t i : touched) keys[i] = 0;
@@ -77,6 +83,7 @@ struct CellMap {
             if (keys[i] == 0) {
                 keys[i] = k;
                 vals[i] = Slots{};
+                if (!fo.empty()) fo[i] = kNone;
                 touched.push_back((uint32_t)i);
                 return vals[i];
             }
@@ -111,8 +118,8 @@ struct ShardMap {           // CellMap's open addressing, key -> rec index
     std::vector<uint32_t> vals;
     std::vector<uint32_t> touched;
     std::vector<KeyRec> recs;
+    std::vector<uint32_t> fo;   // --minclicks only: CellMap::fo, per rec, replayed per shard
     uint32_t goalOrd = kNone;
-    uint16_t goalTight = 0xffff;   // route score; see the goal pick below
     size_t mask = 0;
     void ensure(size_t want) {
         size_t n = 1024;
@@ -126,8 +133,8 @@ struct ShardMap {           // CellMap's open addressing, key -> rec index
         for (uint32_t i : touched) keys[i] = 0;
         touched.clear();
         recs.clear();
+        fo.clear();
         goalOrd = kNone;
-        goalTight = 0xffff;
     }
     // ensure() sizes for the EXPECTED keys per shard; a lopsided hash
     // could still overfill one shard's table, and a full open-addressing
@@ -277,15 +284,15 @@ struct CurrentRules {
         return s.frame == 0 && (double)s.xAbs >= goalX
                && (!coinOn || s.coins == (uint8_t)coinAll);
     }
-    // Of two states that reached it, is the one with route score `cand` to replace `held`?
-    bool prefer(uint16_t cand, uint16_t held) const { return roomierRoute(cand, held); }
+    // Of two states that reached it, is `cand` to replace `held`? (clearance.hpp betterGoal)
+    bool prefer(const State& cand, const State& held) const { return betterGoal(cand, held); }
     // How good `s` is, for a search that ranks states (the beam): more coins first under --coins,
     // then how far it has got.
     double score(const State& s) const {
         return (coinOn ? 1e7 * popCount32((uint32_t)s.coins) : 0.0) + progressOf(s).x;
     }
     // --coinpick: the state a cut or a PARTIAL emits -- the first one holding the most coins.
-    // Without --coins it is front().
+    // Without --coins it is front(). --minclicks: of those, the first with the fewest presses.
     const State& pick(const std::vector<State>& v) const {
         size_t best = 0;
         if (coinOn) {
@@ -295,6 +302,11 @@ struct CurrentRules {
                 if (c > most) { most = c; best = i; }
             }
         }
+        if (g_minClicks)
+            for (size_t i = 0; i < v.size(); ++i)
+                if ((!coinOn || popCount32((uint32_t)v[i].coins) == popCount32((uint32_t)v[best].coins))
+                    && v[i].presses < v[best].presses)
+                    best = i;
         return v[best];
     }
 
@@ -643,6 +655,7 @@ struct SearchResult {
 struct LayerWork {
     std::vector<State> cur, nxt;
     CellMap seen;
+    std::vector<uint32_t> fewExtra;  // --minclicks: the cells' third survivors, by ordinal
     std::vector<ShardMap> shards;   // parallel dedupe (KeyRec, ShardMap above)
     std::vector<uint64_t> kidKeys;  // compact copy of kids[i].key (8 B strides
                                     // instead of pulling the whole Child in)
@@ -798,6 +811,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
     auto& checkWanted = e.in.checkWanted;
     auto& arenaMode = store.arenaMode;
     auto& seen = work.seen;
+    auto& fewExtra = work.fewExtra;
     auto& shards = work.shards;
     auto& kidKeys = work.kidKeys;
     auto& kidFlag = work.kidFlag;
@@ -1052,7 +1066,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 groupDx.push_back(k);
         }
 
-        auto emit = [&](State s, const State& from, uint8_t action, uint64_t k) {
+        auto emit = [&](State s, const State& from, uint8_t action, uint64_t k, uint32_t ord) {
             auto finish = [&](State& stored) {
                 arena.push_back(Node{from.parent | ((uint32_t)action << 31)});
                 if (checkWanted) arenaMode.push_back(s.mode);
@@ -1076,12 +1090,17 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 // solution, and saying so HERE rather than filtering afterwards
                 // is what makes the search look for the other one instead of
                 // reporting the first thing that got to the end.
-                if (rules.reached(s) && (!solved || rules.prefer(s.tight, goalState.tight))) {
+                // --minclicks takes the goal from every live child instead (phase 2 below).
+                if (!g_minClicks && rules.reached(s) && (!solved || rules.prefer(s, goalState))) {
                     solved = true;
                     goalState = s;
                 }
             };
             Slots& sl = seen.at(k);
+            if (g_minClicks) {
+                uint32_t& f = seen.fo[(size_t)(&sl - seen.vals.data())];
+                if (f == kNone || s.presses < kids[f].s.presses) f = ord;
+            }
             if (sl.hi < 0) {
                 nxt.push_back(State{});
                 sl.hi = sl.lo = (int)nxt.size() - 1;
@@ -1534,6 +1553,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 auto pressedFrom = [&](const Child& rel) {
                     Child k = rel;
                     k.s.action = 1;
+                    if (g_minClicks && p.action != 1 && k.s.presses < 0xffff) ++k.s.presses;
                     if (g_minPulse > 1 || g_wavePulse > 1)   // --wavepulse reads edgeAge too
                         k.s.edgeAge = (p.action != 1)
                                           ? 0 : (uint8_t)std::min(254, (int)p.edgeAge + 1);
@@ -1681,6 +1701,27 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
         //      (rules.reached), the smallest ordinal breaking ties -- the state
         //      the serial loop would have ended up holding.
         const size_t qfBefore = nxt.size();   // --qfoldwatch: this group's survivors start here
+        // --minclicks: a live child into `into` with its own arena node -- a cell's third survivor
+        // or the goal, which both dedupe paths below take from every live child (Slots::fo, KeyRec::fo).
+        auto adoptKid = [&](uint32_t i, State& into) {
+            const State& from = cur[gidx[i >> 1]];
+            const uint8_t action = (uint8_t)(i & 1);
+            arena.push_back(Node{from.parent | ((uint32_t)action << 31)});
+            if (checkWanted) arenaMode.push_back(kids[i].s.mode);
+            into = kids[i].s;
+            into.parent = (uint32_t)(arena.size() - 1);
+            into.action = action;
+        };
+        // ...and the third survivors themselves, after the group's own slots, in the order the cells
+        // were first seen: the same order from either path.
+        auto pushFewExtra = [&]() {
+            for (uint32_t i : fewExtra) {
+                nxt.push_back(State{});
+                adoptKid(i, nxt.back());
+            }
+            g_fewestKept += (long long)fewExtra.size();
+            fewExtra.clear();
+        };
         const bool parDedupe = pool && !dbgHere && g_threads > 1
                                && kids.size() >= 4096;
         if (parDedupe) {
@@ -1705,11 +1746,13 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                     if (ri == kNone) {
                         ri = (uint32_t)sm.recs.size();
                         sm.recs.push_back(KeyRec{k, i, kNone, i, i, vy, vy, 0});
+                        if (g_minClicks) sm.fo.push_back(i);
                         evKind[i] = (uint8_t)(1 + si);
                         evRec[i] = ri;
                         accepted = true;
                     } else {
                         KeyRec& r = sm.recs[ri];
+                        if (g_minClicks && kids[i].s.presses < kids[sm.fo[ri]].s.presses) sm.fo[ri] = i;
                         // the comparisons mirror emit() exactly, including the
                         // float->double promotion of `vy + 1e-9`
                         if ((double)vy > (double)r.hiVy + 1e-9) {
@@ -1735,19 +1778,19 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                         }
                     }
                     // Same test as the serial path (rules.reached): keep the
-                    // roomiest goal state this shard saw rather than its first.
-                    // `goalTight` starts at 0xffff, so with the score off the
-                    // first one wins and nothing after it can tie-break past it.
+                    // roomiest goal state this shard saw rather than its first
+                    // (betterGoal's order). The first is taken outright, and with
+                    // the score off nothing after it can tie-break past it.
                     // Asked when the layer is already solved too: the serial path
                     // replaces a goal with a roomier one, and the merge below
                     // decides against the one held. This test used to read x
                     // alone, and only while unsolved -- no frame, no coins -- so a
                     // big layer could take a goal the serial path would refuse.
-                    if (accepted && rules.reached(kids[i].s)
+                    // --minclicks: from every live child, as the serial path takes it.
+                    if ((accepted || g_minClicks) && rules.reached(kids[i].s)
                         && (sm.goalOrd == kNone
-                            || rules.prefer(kids[i].s.tight, sm.goalTight))) {
+                            || rules.prefer(kids[i].s, kids[sm.goalOrd].s))) {
                         sm.goalOrd = i;
-                        sm.goalTight = kids[i].s.tight;
                     }
                 }
             });
@@ -1763,6 +1806,10 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 ShardMap& sm = shards[(size_t)evKind[i] - 1];
                 const KeyRec& r = sm.recs[evRec[i]];
                 evKind[i] = 0;   // leave the array clean for the next group
+                if (g_minClicks && i == r.aOrd
+                    && kids[sm.fo[evRec[i]]].s.presses
+                           < std::min(kids[r.hiIdx].s.presses, kids[r.loIdx].s.presses))
+                    fewExtra.push_back(sm.fo[evRec[i]]);
                 uint32_t src;
                 if (r.bOrd == kNone) src = r.hiIdx;   // never split: hi == lo
                 else if (i == r.aOrd) src = r.bWasHi ? r.loIdx : r.hiIdx;
@@ -1775,24 +1822,22 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 nxt.back().parent = (uint32_t)(arena.size() - 1);
                 nxt.back().action = action;
             }
+            pushFewExtra();
             {
-                // Across shards, the same rule as within one: roomiest first,
-                // the smaller ordinal breaking ties. With the score off every
+                // Across shards, the same rule as within one: roomiest first
+                // (betterGoal), the smaller ordinal breaking ties. With the score off every
                 // tight is 0, no candidate is ever "roomier", and this reduces
                 // to min(goalOrd). Against a goal already held, the serial
                 // path's rule: only a roomier one replaces it.
                 uint32_t g = kNone;
-                uint16_t gt = 0xffff;
                 for (size_t si = 0; si < nsh; ++si) {
                     const uint32_t o = shards[si].goalOrd;
                     if (o == kNone) continue;
-                    const uint16_t ot = shards[si].goalTight;
-                    if (g == kNone || ot < gt || (ot == gt && o < g)) {
+                    if (g == kNone || rules.prefer(kids[o].s, kids[g].s)
+                        || (!rules.prefer(kids[g].s, kids[o].s) && o < g))
                         g = o;
-                        gt = ot;
-                    }
                 }
-                if (g != kNone && (!solved || rules.prefer(gt, goalState.tight))) {
+                if (g != kNone && (!solved || rules.prefer(kids[g].s, goalState))) {
                     const State& from = cur[gidx[g >> 1]];
                     const uint8_t action = (uint8_t)(g & 1);
                     arena.push_back(
@@ -1808,6 +1853,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
             continue;   // next speed group -- skips the serial phase 2
         }
         // ---- phase 2: dedupe and record (serial, in order) ------------------
+        uint32_t fewGoal = kNone;   // --minclicks: the best live child that reached the goal
         for (size_t i = 0; i < kids.size(); ++i) {
             const Child& kid = kids[i];
             if (!kid.valid) continue;
@@ -1858,7 +1904,23 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                                 (int)c.flip, (int)c.grounded, (int)s.held,
                                 (int)dead, why, two);
                 }
-                if (!dead) emit(c, s, (uint8_t)input, kid.key);
+                if (!dead) emit(c, s, (uint8_t)input, kid.key, (uint32_t)i);
+                if (!dead && g_minClicks && rules.reached(c)
+                    && (fewGoal == kNone || rules.prefer(c, kids[fewGoal].s)))
+                    fewGoal = (uint32_t)i;
+            }
+        }
+        if (g_minClicks) {
+            for (uint32_t ti : seen.touched) {
+                const Slots& sl = seen.vals[ti];
+                const uint32_t f = seen.fo[ti];
+                if (kids[f].s.presses < std::min(nxt[(size_t)sl.hi].presses, nxt[(size_t)sl.lo].presses))
+                    fewExtra.push_back(f);
+            }
+            pushFewExtra();
+            if (fewGoal != kNone && (!solved || rules.prefer(kids[fewGoal].s, goalState))) {
+                adoptKid(fewGoal, goalState);
+                solved = true;
             }
         }
         if (qfHere) qfoldAccount(qfBefore);
@@ -2071,6 +2133,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                         std::memcpy(a.fireB, b.fireB, sizeof(a.fireB));
                         a.trigT = b.trigT;
                         a.tight = b.tight;
+                        a.presses = b.presses;   // --minclicks' count, a route property like tight
                         // ...and the sprite angle (rot / rotNeg / rotStep), which the key
                         // leaves out too; named when it is the difference.
                         const bool rotDiff = a.rot != b.rot || a.rotNeg != b.rotNeg
@@ -2927,8 +2990,8 @@ inline int searchBeam(E& e, const Rules& rules, SearchResult& out) {
                 kid.s.parent = s.parent;
                 cand.push_back(Cand{kid.s, (uint8_t)input, rules.score(kid.s)});
                 if (rules.reached(kid.s)
-                    && (goalAt < 0 ? !solved || rules.prefer(kid.s.tight, goalState.tight)
-                                   : rules.prefer(kid.s.tight, cand[(size_t)goalAt].s.tight)))
+                    && (goalAt < 0 ? !solved || rules.prefer(kid.s, goalState)
+                                   : rules.prefer(kid.s, cand[(size_t)goalAt].s)))
                     goalAt = (long long)cand.size() - 1;
             }
         }
