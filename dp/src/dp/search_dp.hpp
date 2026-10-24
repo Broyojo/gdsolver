@@ -2338,7 +2338,7 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                 const size_t take = std::min(v.size(), fair);
                 if (take == v.size()) {
                     keepIdx.insert(keepIdx.end(), v.begin(), v.end());
-                } else if (g_minClicks && take > 0) {
+                } else if (g_minClicks && !bandClass && take > 0) {
                     // --minclicks: the stride below, but each window [i, i + stride) gives its
                     // fewest-press member (a cell by its fewest, under the cell cap; the first on a
                     // tie) instead of its first. The cap still samples the class the way it does,
@@ -2346,6 +2346,9 @@ inline int searchLayers(E& e, const Rules& rules, SearchResult& out) {
                     // Without it the cap is blind to presses and drops the third survivors the
                     // dedupe kept (lv1 in the loop: cap 125 on 7,786 layers, and the plan pressed
                     // 542 times against 536 without the flag).
+                    // Not under --coins (bandClass is coinOn): there a coin comes before a press, and
+                    // a window's fewest-press member is the one that skips a coin's climb -- lv1 with
+                    // Coins reached the end with 2/3 for 17 rounds, the coin baseline taking 3/3 in 0.
                     const double stride = (double)v.size() / (double)take;
                     for (double i = 0; (size_t)i < v.size(); i += stride) {
                         const size_t end = std::min(v.size(), (size_t)(i + stride));
